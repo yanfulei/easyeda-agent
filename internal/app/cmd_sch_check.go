@@ -319,8 +319,13 @@ func renderCheckReport(rep checkReport, w io.Writer) {
 	if s.MarkerOverlaps > 0 {
 		fmt.Fprintln(w, "→ marker overlap: net markers cover a part/each other — stagger the labels or re-run autoconnect with more offset")
 	}
-	if s.MissingPartitions > 0 {
-		fmt.Fprintln(w, "→ missing-partition: 多器件页没画功能分区框/电路说明(铁律#15) — `sch zones set`→`sch zone-draw`(整纸版式 --mode partition)画区框,每模块 `sch note` 加 1~3 行说明")
+	// 交付三件套共用一个聚合计数槽,所以**提示行不能读那个槽** —— 读了就会在只有
+	// missing-titleblock(图签写入当前禁用,必然长亮)的页上印出「→ missing-partition:
+	// 没画功能分区框」,引着人反复去查明明画好的框。2026-08-17 已经把汇总行改成
+	// missing-deliverable,这一行是同一处错漏下来的另一半(issue #181「恒报 2」)。
+	// 逐条明细带真实类型,提示行按真实类型分别给。
+	for _, line := range missingDeliverableHints(rep.Findings) {
+		fmt.Fprintln(w, line)
 	}
 	if s.NoteOutsideZones > 0 {
 		fmt.Fprintln(w, "→ note-outside-zone: 登记的说明飘在自己分区框外 — 按明细 `sch prim-delete` 旧说明后重跑 `sch note --zone <区>`(自动落点落说明带,带高已按多行说明预留),再 `sch zone-draw --mode partition` 重画框")

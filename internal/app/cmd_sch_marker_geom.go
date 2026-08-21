@@ -662,6 +662,9 @@ const schPartitionMinParts = 6
 // left un-partitioned (exactly the lapse this backstops). Title-block fields are NOT
 // free text (they live on the sheet), so a bare, un-annotated page reads as 0.
 // Best-effort: a text.list failure returns nil (never masks the electrical findings).
+//
+// 「这页有几个框」的证据来自 sch_check_partition.go(画布优先、本地记账兜底)——
+// 只读记账的旧口径会对**画布上明明有框**的页恒报 missing-partition,根因见那里。
 func partitionFinding(cfg *appConfig, window string, comps []layoutComp, stderr io.Writer) []*checkFinding {
 	parts := 0
 	for _, c := range comps {
@@ -677,24 +680,8 @@ func partitionFinding(cfg *appConfig, window string, comps []layoutComp, stderr 
 		fmt.Fprintf(stderr, "sch check: partition-check skipped — text.list failed: %v\n", err)
 		return nil
 	}
-	rects, labels := schZoneFrameCounts(cfg, window)
-	return partitionFindingFor(parts, rects, labels, schTextCount(res.Result))
-}
-
-// schZoneFrameCounts 读**工具自己的绘制记账**:平台不提供矩形枚举接口,画过的区框
-// 只有我们记得(workflow 的 SchZoneFrameIdsByPage)。返回(矩形数, 区名标签数)。
-func schZoneFrameCounts(cfg *appConfig, window string) (rects, labels int) {
-	_, _, docUUID, _, st, _, err := loadSchGroupsContext(cfg, window)
-	if err != nil || st == nil {
-		return 0, 0
-	}
-	if f := st.SchZoneFrameIdsByPage[docUUID]; f != nil {
-		return len(f.Rects), len(f.Texts)
-	}
-	if f := st.SchZoneFrameIds; f != nil && (f.DocumentUUID == "" || f.DocumentUUID == docUUID) {
-		return len(f.Rects), len(f.Texts)
-	}
-	return 0, 0
+	ev := schPartitionPageEvidence(cfg, window, parseZoneMoveTexts(res.Result))
+	return partitionFindingForZones(parts, ev.Frames(), ev.Labels(), schTextCount(res.Result), ev.Zones)
 }
 
 // titleBlockFinding 判图签有没有填。**这是交付件不是装饰**:图纸标题、设计者、板名
@@ -770,16 +757,29 @@ func schCircuitNoteCount(freeTexts, zoneLabels int) int {
 }
 
 func partitionFindingFor(parts, frameRects, labelTexts, textCount int) []*checkFinding {
+	return partitionFindingForZones(parts, frameRects, labelTexts, textCount, 0)
+}
+
+// partitionFindingForZones 是真正的纯核。zones = 本页登记的功能模块数(虚拟组/认领),
+// 它**只影响报文**:已归组说明「区分好了、就差画框」,该给的下一步与「一片散件」
+// 完全不同(而「给不出能执行的下一步」正是本仓的复发病)。归组本身不免检 ——
+// 铁律#15 要的是框,SKILL 明写 block-apply 不自动画框、必须补。
+func partitionFindingForZones(parts, frameRects, labelTexts, textCount, zones int) []*checkFinding {
 	if parts < schPartitionMinParts {
 		return nil
 	}
 	var out []*checkFinding
 	if frameRects == 0 {
+		msg := fmt.Sprintf("%d 个器件的页没有功能分区框 — 铁律#15:`sch zones set` → `sch zone-draw`(整纸版式 `--mode partition`);交付前必须有", parts)
+		if zones > 0 {
+			msg = fmt.Sprintf("%d 个器件的页已分成 %d 个功能模块(虚拟组/认领)但一个分区框都没画 — 铁律#15:`sch zone-draw --mode partition`;"+
+				"若 `sch zone-plan` 报 partitionOverlap,先 `sch zone-arrange --apply` 拉开各区或把模块拆到下一页,再画", parts, zones)
+		}
 		out = append(out, &checkFinding{
 			Type:    "missing-partition",
 			Level:   "warn",
 			Count:   parts,
-			Message: fmt.Sprintf("%d 个器件的页没有功能分区框 — 铁律#15:`sch zones set` → `sch zone-draw`(整纸版式 `--mode partition`);交付前必须有", parts),
+			Message: msg,
 		})
 	}
 	if notes := schCircuitNoteCount(textCount, labelTexts); notes == 0 {
