@@ -62,7 +62,7 @@ typed CLI 操作嘉立创EDA专业版的原理图——每个动作可观测、�
 
 | 能力 | 命令 | 说明 |
 |---|---|---|
-| 逐项设计检查 | `sch check` | 平台 DRC 只给聚合数,check 从图元重建逐项 finding:悬空脚/几何-网表错配/导线交叉/压引脚/零长线/悬空线/重合标志/压图签/标志互压/**多器件页未分区**(missing-partition,铁律#15 机械兜底)/**netport 竖排折叠**(folded-net-label) |
+| 逐项设计检查 | `sch check` | 平台 DRC 只给聚合数,check 从图元重建逐项 finding:悬空脚/几何-网表错配/导线交叉/压引脚/零长线/悬空线/重合标志/压图签/标志互压/**多器件页未分区**(missing-partition,铁律#15 机械兜底;**证人是画布**:认页上的区标题文本——与 `zone-draw` 生成标题同一个函数——绘制记账仍读,两者**取大**,所以换机器/清 state/`--project` 名字不一致导致记账丢失时不再恒报;口径未放宽,真没画框照报)/**netport 竖排折叠**(folded-net-label) |
 | 桥接检测 | `sch bridge-check` | 树粒度:共线合并短路 BRIDGE / 孤儿桩 ORPHAN(单线视角看不全的盲区) |
 | 官方 DRC | `sch drc` | SDK 门(可能仅聚合) |
 | S5 一条龙门 | `sch gate` | 固定顺序 layout-lint→check→bridge-check→drc 出一张报告;`--strict` 全部 WARN 也拦;`verdict=blocked`=检查器没跑成≠板子有问题 |
@@ -72,7 +72,7 @@ typed CLI 操作嘉立创EDA专业版的原理图——每个动作可观测、�
 | 能力 | 命令 | 说明 |
 |---|---|---|
 | 浏览/查找 | `easyeda blocks ls/show/search` | 离线,20 块/11 类目;块携带 internal_nets/ports/parts/pcb_layout/silk 多维知识 |
-| 一键实例化 | `sch block-apply` | 放件+内部连线+端口绑定+落位避让+失败补偿回滚;带 `schematic_layout` 模板的块按人审过的几何落 |
+| 一键实例化 | `sch block-apply` | 放件+内部连线+端口绑定+落位避让+失败补偿回滚;带 `schematic_layout` 模板的块按人审过的几何落。`--spec <s0.json>` 落块后自动回填真实位号;`--max-attempts N`(默认 3)在同一失败签名重复 N 次时**动手之前**停手,组比整页还大时报 `page-too-small`(停手问用户,不自动分页) |
 | 模板反推 | `sch extract-layout` | 真板摆好的实例 → 反向导出块模板 JSON(「摆好一次→固化」数据管线) |
 
 ### 7. 导出与视图

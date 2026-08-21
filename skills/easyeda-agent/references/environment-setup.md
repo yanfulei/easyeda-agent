@@ -58,6 +58,27 @@ easyeda update --version 0.25.0      # 钉版本(离线场景也可用它跳过 
 
 > `--check` 从不写盘;非 `--check` 形态只碰 CLI 二进制和 skill 目录,**永不动 EasyEDA 工程**。
 
+### 版本一致性门(硬拒,分级是非对称的)—— issue #181
+
+`easyeda health` 的报文里现在有一块 **`versionGate`**(`verdict` + 逐组件
+`findings[].{severity,reason,fix}`),人话摘要与它同源。**任何派发 typed action 的命令**
+在本进程第一次派发前判一次(`sync.Once`,复合命令不会重复刷屏);判据复用那次已经
+发生的 `/health` 报文,**零额外往返**。`health` / `version` / `update` / `daemon start`
+**都不经过这道门** —— 门拦住你的时候,诊断和修复路径照样能用。
+
+| 组件 | 判据 | 为什么这么分 | 修法 |
+|---|---|---|---|
+| **daemon** | **任何差异都拒(含 patch)** | 它和 CLI 是同一份二进制、同一个版本号,发版时必然相等;不等只可能是**「老进程没重启」**这一种意外,修复代价≈0。而漏判的代价是**污染之后每一条排查**(「明明修过的 bug 又复现」——因为跑的是旧 daemon)。「这一版是纯文档发布、行为没变」不是豁免理由:版本不等就是「老进程在跑」的事实,下一版可能就有差异 | 开发中(air):切到跑 `make dev` 的终端,任何 `.go` 改动它都会自动重建+重启;它退了就重开一个。**别手动 kill air 下的 daemon**(会卡死连接器)。非开发:直接 `easyeda daemon start`(自动接管 60832 上的旧进程,不必先 kill)。确认:`easyeda health` 的 version == `easyeda version` |
+| **connector** | 差 **minor 及以上 → 拒**;仅差 **patch → 只警告不拦** | 它走**另一条分发渠道**(jlc-ext 无发布 API,每次发版靠人工重投),「市场版落后一点」是多数用户的**常态**,而修复代价高(卸载→重导→**完全退出重启 EasyEDA**,可能丢未存盘编辑)。对常态化的 patch 落后一律拒 = 工具对多数人不可用;而 minor 以上意味着连接器可能**根本没有**这版 CLI 要调的 handler,静默走偏比打断更贵 | 同上表 `connector: behind` 行(下载同版 `.eext` → 先卸载旧的 → 导入 → 完全退出重启 EasyEDA) |
+| 任一侧非 clean release tag | **不做硬判定**(dev 戳豁免) | `make dev` 的 git-describe 戳(`v1.1.1-19-g…-dirty`)的 semver core 是**旧 tag**,不代表真实代码水位 | 唯一例外:两边都是 dev 戳但**戳串不同** → warn(不拦)—— 那不是 false flag,是两个不同构建的实锤,多半是 daemon 没跟上最近一次重建 |
+
+**逃生口**:全局 flag `--skip-version-check`,或 `EASYEDA_SKIP_VERSION_CHECK=1`
+(给加不了 flag 的调用方:脚本 / MCP 适配层 / CI)。放行仍会把错位打到 stderr,并写
+一行审计 `cli.version_check.skip`(伪动作名,**不污染真实动作的调用统计**,可 grep)。
+
+> **撞上这道门时的正确反应**:先对版本,**别改电路、别怀疑「工具坏了」**。这道门存在
+> 的全部理由就是——上报者烧掉一整轮排查,正是因为没人告诉他「你跑的是旧 daemon」。
+
 ## 1. 打开 web 编辑器 + 目标工程(chrome-devtools MCP)
 
 桌面客户端没开时,web 编辑器 `https://pro.lceda.cn/editor` 是完全等价的宿主

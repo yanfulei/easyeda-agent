@@ -54,11 +54,11 @@ S0 设计方案书 → S1 图纸/分页💾 → S2 模块编组 → S3 按组摆
 
 | 步 | 做什么 | 固定命令 | 过门判据(不过不进下一步) |
 |---|---|---|---|
-| S0 | 方案书:选块选型、网名表、分页计划、架构决策 | `blocks ls/search/show` → spec 写盘 → `easyeda spec validate` | validate 无 ERROR;milestone 档经用户确认 |
+| S0 | 方案书:选块选型、网名表、分页计划、架构决策 | `blocks ls/search/show` → spec 写盘 → `easyeda spec validate`(落块后位号回填走 `easyeda spec backfill … --write`,或 `block-apply --spec`) | validate 无 ERROR;milestone 档经用户确认 |
 | S1 | 图纸/分页 reconcile 到模块计划 | `sch pages` → `page-rename`/`page-new`/`page-delete` → `sch sheet-geometry --json` | 页集合=模块计划;每页有 A4 sheet 💾 |
 | S2 | 分区规划(只规划不落子) | 块路径读虚拟组;手工页 `sch zones set` → `sch zone-plan --json` | 六项 validation 全 0 **且 `labelScopeDegraded=false`**(降级=判据验不了,不是"没问题") |
-| S3 | 按组摆放(块优先;命中块 S3+S4 一条命令) | `sch block-apply <id> --bind 端口=网名` / `sch autolayout --engine template` / `sch place`+`modify` | `sch gate --only layout-lint,clusters` 无 ERROR 💾 |
-| S3′ | **分区收敛(按需)**:分区拥挤 / `partitionOverlap`>0 / 重整已放置页 | `sch zone-arrange`(纯规划,唯一解;phase B = 边归属+多层货架+回溯)→ `--apply`(断言①②+假失败清创+分级回滚+**断言③落地复判**) | verdict=pass 且断言①②③绿(③ = 落地实测框 vs 规划框偏差 ≤ gutter、区框零重叠、**无成员探出图纸**、**retain 区几何未被改动**、**无自由落点 pin**)。**断言③红时不要「多跑几遍」** —— 桩线伸展已统一为一把尺,再跑一轮只会追尾(真机 4 轮取证:每轮 dry-run pass、落地必重叠);按复判表定位是哪个区胖了。注意「规划框 = 落地框上界」**只在模型内成立**(同一份 pin 坐标+桩长),真机 MCU_IO 六区实测偏差 +141/+126/+82/+56/+26/+10,断言③ 的职责就是把不成立的那几次报出来。报「N 只 pin 走了自由落点」= 计划根本没覆盖那几只脚,它们的方向/桩长不在规划里,先看是不是有 pin 靠普通导线/netlabel 连着。`blocked` 时先看 phase A 那一栏收敛了没(**排不下的是形状不是面积**)——phase A 现在会**域感知选形**(候选先比可排布档位、再比「本页有几条通道装得下」,平局才回到原有紧凑序),所以 `zones[].mode` 尾巴会直说它选了什么形态、为什么;读到「没有一个装得进任何通道」就是真的要拆(**别去调纸张/带高**),再考虑 `page-new` 拆页 —— A4-only,不换纸。phase A 行首的 `↩` = **「不得变差」门回退了这一区**(收敛会让它在本页**更难排**,于是保留原形;理由在 `zones[].retainWhy`)—— 那是保护不是故障,**别去改 A4 尺寸/带高绕开它**,要么把该区拆小要么拆页;门比的是**三档可排布性**(`2` 有落点 / `1` 只被图签挡 / `0` 连可用域都装不下),掉档才回退 —— 所以「原形也排不下」不等于放行,`1 → 0` 照样拦(2026-08-20 第二轮真机 `449×737 → 244×863` 就是从首版那个单布尔判据里漏掉的);两个形状都是 `0` 档时门不拦,phase B 报「纸面放不下」= 真的要拆。`↩` 区在 `--apply` 里受**刚体不变式**硬门保护(逐 pin 比对方向/桩长/类型,不一致就拒绝整页、画布零改动) |
+| S3 | 按组摆放(块优先;命中块 S3+S4 一条命令) | `sch block-apply <id> --bind 端口=网名 --spec <s0.json>`(`--spec` 顺手回填位号)/ `sch autolayout --engine template` / `sch place`+`modify` | `sch gate --only layout-lint,clusters` 无 ERROR 💾。⛔ 报 `page-too-small` = **停手问用户**(独立成页/继续分页/收小组),工具不自动分页;人肉重试由 `--max-attempts`(默认 3)机械叫停 |
+| S3′ | **分区收敛(按需)**:分区拥挤 / `partitionOverlap`>0 / 重整已放置页 | `sch zone-arrange`(纯规划,唯一解;phase B = 边归属+多层货架+回溯)→ `--apply`(断言①②+假失败清创+分级回滚+**断言③落地复判**) | verdict=pass 且断言①②③绿(③ = 落地实测框 vs 规划框偏差 ≤ gutter、区框零重叠、**无成员探出图纸**、**retain 区几何未被改动**、**无自由落点 pin**)。**断言③红时不要「多跑几遍」** —— 桩线伸展已统一为一把尺,再跑一轮只会追尾(真机 4 轮取证:每轮 dry-run pass、落地必重叠);按复判表定位是哪个区胖了。**这条现在有机械兜底**:`block-apply`/`destagger`/`group-move` 的 `--max-attempts`(默认 3,跨调用失败签名台账)会在同一个结果第 3 次出现时**停手并给结论**,画布零改动;而一旦读到 `page-too-small` 就**别再做任何几何微调**,直接进拆页决策(见 S3 停点)。注意「规划框 = 落地框上界」**只在模型内成立**(同一份 pin 坐标+桩长),真机 MCU_IO 六区实测偏差 +141/+126/+82/+56/+26/+10,断言③ 的职责就是把不成立的那几次报出来。报「N 只 pin 走了自由落点」= 计划根本没覆盖那几只脚,它们的方向/桩长不在规划里,先看是不是有 pin 靠普通导线/netlabel 连着。`blocked` 时先看 phase A 那一栏收敛了没(**排不下的是形状不是面积**)——phase A 现在会**域感知选形**(候选先比可排布档位、再比「本页有几条通道装得下」,平局才回到原有紧凑序),所以 `zones[].mode` 尾巴会直说它选了什么形态、为什么;读到「没有一个装得进任何通道」就是真的要拆(**别去调纸张/带高**),再考虑 `page-new` 拆页 —— A4-only,不换纸。phase A 行首的 `↩` = **「不得变差」门回退了这一区**(收敛会让它在本页**更难排**,于是保留原形;理由在 `zones[].retainWhy`)—— 那是保护不是故障,**别去改 A4 尺寸/带高绕开它**,要么把该区拆小要么拆页;门比的是**三档可排布性**(`2` 有落点 / `1` 只被图签挡 / `0` 连可用域都装不下),掉档才回退 —— 所以「原形也排不下」不等于放行,`1 → 0` 照样拦(2026-08-20 第二轮真机 `449×737 → 244×863` 就是从首版那个单布尔判据里漏掉的);两个形状都是 `0` 档时门不拦,phase B 报「纸面放不下」= 真的要拆。`↩` 区在 `--apply` 里受**刚体不变式**硬门保护(逐 pin 比对方向/桩长/类型,不一致就拒绝整页、画布零改动) |
 | S4 | 通道布线(块外的连线) | `sch autoconnect`(电源/地/netport)/ `sch wire`(信号) | 无穿件压线 💾 |
 | S5 | 校验门(机械真值) | 逐页 `sch gate --strict --doc <页>` + 全工程 `sch nets --strict` + `sch reconcile` | 每页 verdict=pass;无网名变体/单引脚网;意图对账无差异 |
 | S6 | 调整闭环 | 照 gate 报告「下一步」修 → 重跑 gate | verdict=pass → `sch save` 确认 `saved:true` 💾 |
@@ -136,6 +136,26 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
   easyeda spec show     .easyeda/s0-<project>.json            # 看「工具实际读到的」归一化结果
   ```
 
+  **位号回填进流程,别再「每次落块回头改 json」**(#181):`modules[].parts` 写的是
+  **designator 字符串**,而平台会在 create 时按它自己的全局位号重编(计划 C1 → 落地
+  C11,issue #144),我们照实回读 remap —— 画布和虚拟组都是 C11,只有手写的 spec 还是
+  C1。**位号对不上不会报错**,只会让 `zones set --spec`、partition 打分、连接器规则
+  **静默少算一个模块**,报告照样绿。两条路二选一:
+
+  ```bash
+  easyeda sch block-apply <块id> --spec .easyeda/s0-<project>.json   # 落块后自动回填
+  easyeda spec backfill .easyeda/s0-<project>.json --project <project>          # 事后补;默认只预览
+  easyeda spec backfill .easyeda/s0-<project>.json --project <project> --write  # 落盘
+  ```
+
+  **完全离线**(事实来源是 workflow 里的持久虚拟组,不需要连接器/不需要开 EasyEDA)。
+  匹配规则**声明优先于猜测**:模块写了 `block` 就按块 id 认它的虚拟组(含全部功能子群),
+  没写就按「组名末段 == 模块的 `zone` 或 `name`」;同一个块被两个模块声明 = 歧义,
+  **两个都跳过并报出来**(不替你做设计决定)。写入是**外科手术**:只替换
+  `modules[i].parts` 那一段字节,键序/缩进/未知字段/notes 结构一个都不动
+  (整包 Unmarshal→Marshal 会静默丢掉它们);任一模块定位不到就**整体拒写**
+  (半改的 spec 比没改的危险)。
+
   判定口径刻意宽松以兼容既有 spec:**ERROR** = 写了但写错(枚举外的 zone/kind/facing、flow 里重复或不存在的阶段、自相矛盾的 internal/facing);**WARN** = 缺了会让某维测不了;**INFO** = 能力降级。**既有 spec 全部继续能读**,缺新字段只报 WARN/INFO,不会一夜作废。
 - **过门条件**:上面这份 spec 已经**过用户确认、落成了文件、并且 `easyeda spec validate` 无 ERROR**(与 `autolayout --spec` 文件同样对待——写到磁盘,可在后续阶段被引用,不是只停留在对话记录里);不再是「每个器件归到了某个模块」这么单薄。这正是「里程碑确认」模式的第一个确认点;若当前是「逐步确认」模式,同样在这里停住等确认(见「交互模式」一节);「全自动」模式下按已有 spec 或默认推荐值直接产出文件,不阻塞。
 
@@ -178,8 +198,16 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
   —— 跑 `sch zone-arrange --apply` 重排,或 `sch group-move` 挪件;调 `--gutter` 治不了。
   反过来:`zone-arrange` 断言③绿的页,一定画得出来。
 - **机械兜底(别靠记忆)**:`sch check` 有 **`missing-partition`** 检查项——多器件页
-  (parts ≥ 6)若 `sch text.list` == 0(既没区名框也没说明)报 WARN,
-  `sch gate --strict` 会因此 FAIL,挡下未分区的板。看到它就补「画框 + 写说明」再交付。
+  (parts ≥ 6)没有分区框就报 WARN,`sch gate --strict` 会因此 FAIL,挡下未分区的板。
+  看到它就补「画框 + 写说明」再交付。
+  **判据的证人改成了画布(#181,流程不变)**:认框靠页上那条**区标题文本**
+  (内容恒为模块名拼接 `A / B`,与 `zone-draw` 生成标题用**同一个函数**;`sch check`
+  本来就拉了整页 `text.list`,认框零新增 I/O),本地绘制记账仍读,**两个证人取大**。
+  所以「换机器 / 清了 `~/.easyeda-agent` / `--project` 前后写的名字不一样导致读了
+  另一份 state」这三条记账丢失路径,不再造成**画布上明明有框、check 永远说没有**的
+  恒报。**口径没有放宽**:真没画框的页照报——有虚拟组**不免检**(铁律#15 要的是框,
+  组只影响报文措辞),认出的区标题也会同时计进区名标签,不会顺手把 `missing-note`
+  静默关掉。(挂账:`sch zones status` / `sch status` 仍只读记账。)
 - **过门条件**:每个组有明确的目标矩形(已认领),组间预留通道(分区不重叠);
   模块太多就拆到下一页,而不是挤压本页。
 
@@ -214,6 +242,35 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
 - **优先级铁律**:命中块 → `block-apply`;有 spec → `--engine template`;都没有才 `official`,
   且**成品/已连线页一律别用它**。
 - **摆完可自评质量**:`easyeda sch layout-score` 给布局可读性打五维分(标签折叠/标签反向/外围贴核心/长链挤压/版面整洁),低分维的归因**自带填好真实位号坐标的 fix 命令,照抄执行即可修**;它是诊断视角不是门(无 `--min-score` 永远 exit 0),门仍是下面的 layout-lint + check。
+- **⛔ 停点:`page-too-small` = 停下来问用户,工具不自动分页(#181,S2/S3 都可能撞到)**。
+  `sch block-apply` 落块后的虚拟组体检、以及 `sch clusters` 的 **`pageTooSmall`** 字段 /
+  `BLOCKED page-too-small` 行,说的都是同一件事:**这个块/组本身就比整页可用区大**。
+  - 判据没造新尺:直接调 `zone-plan` 在用的 `fitsAroundCorner`,可用区 = **实测**图框
+    bbox 内缩 + 按实测长宽比匹配出的图签 keep-out(所以 A4 横版和 A3 天然不同)。
+    形状是 **L 形不是矩形**(图签占右下角):框有两条活路——① 待在图签**左侧**的窄长条
+    (宽 ≤ leftW,高不限);② 绕到图签**上方**的整幅(宽不限,高 ≤ aboveH)。两条都不
+    成立才判 `page-too-small`。量不出可用区、或一个位号都没匹配上时**不下结论**
+    (猜出来的 `fits` 会掩盖掉要报的那句话)。
+  - **它和 `out-of-sheet`(探出图纸)是两种病**:那个是「摆得不好」,挪一挪能解;
+    这个是「装不下」,**再挪、再压 `--per-row`、再调 margin/gutter 都不会让它变小**。
+    读到它就**立刻停止几何微调**——继续微调正是复盘里 8+ 轮、~40% 活跃时间的来源。
+  - **分页是设计决策,工具只停手不建页**:把三条出路摊给用户拍板 ——
+    ① **独立成页**(`sch page-new --name <页名>` 后在新页 `block-apply`);
+    ② **继续分页**(把本页其余模块搬走,腾出整幅给它);
+    ③ **把组收小**(`sch clusters` 看「组高 vs 本体高」:被自己**竖排 marker** 撑大的脚用
+    `sch disconnect --pin X:n` + `sch connect --pin X:n --direction left|right` 改标签朝向
+    —— 实测本体 21 高的电容组高 134,改横向后 58)。**A4-only,不建议换纸**(平台也没有改
+    图纸尺寸的 API)。
+- **别人肉重试:`--max-attempts`(默认 3)会替你停手(#181)**。`sch block-apply` /
+  `sch destagger` / `sch group-move` 各带一本**跨调用**的收敛台账
+  (`~/.easyeda-agent/workflow/converge-<project>.json`,与工作流状态同目录但独立文件),
+  只记**失败签名**:签名相同 = 原地打转 +1,签名一变(重叠 3→1、换了落点)或成功即
+  **清零** —— 真在往前推的人永远撞不到上限。撞上限时命令**在任何 mutation 之前**停,
+  **画布零改动**,并复述那句可执行的下一步(上一轮实测量到 `page-too-small` 时,连第一次
+  都不放行)。`--max-attempts 0` 关掉上限(确认还要再试一次时才用)。
+  代码里**没有无界循环**,这个上限治的是**人/agent 的重复调用**。
+- **`sch destagger` 跑满 `--max-rounds` 的三档判词别混**:有进展→加轮数(不是停手)/
+  一个都搬不动→停手换手段 / 被逐条跳过→按 `skips` 的理由处理。
 - **💾 过门条件**:进入 S4 前跑 **`easyeda sch gate --only layout-lint,clusters --doc <页>`**
   (此时还没连线,电气三关跑了没意义;`--strict` 留到 S5 交付门,S3 阶段先把**硬伤**清零:
   重叠、引脚重合、出图纸)。**只看 layout-lint 是不够的** —— 它默认排除全部非 part
@@ -279,8 +336,9 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
     合并成一个大框,于是 `zone-arrange --apply` 断言③ 全绿(逐区框零重叠)的页面,
     `zone-plan` 反而报重叠、`zone-draw` 拒绝画框(真机 MCU_IO)。合并那条路已删 ——
     重叠只会如实报出来,修法是 `sch zone-arrange --apply` 重排或 `sch group-move` 挪件。
-    框的有无读**工具自己的绘制记账**(平台不提供矩形枚举接口);`sch clear` 会同时作废
-    该页的记账,免得清了页而判据还以为画过。
+    框的有无有**两个证人,取大**(#181):页上的**区标题文本**(画布直接证据,平台不
+    提供矩形枚举接口,标题是唯一能反认的痕迹)+ 工具自己的**绘制记账**;`sch clear` 会
+    同时作废该页的记账,免得清了页而判据还以为画过。
 
 ### S4 — 通道布线(留距离,别压元件)
 - **做什么**:在组**摆放并过完 S3 几何门之后**再布线——信号走元件间的**空通道**,不要让导线压在元件或外围上。
@@ -308,7 +366,7 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
    | # | stage | 阻塞判据 |
    |---|---|---|
    | 1 | `layout-lint` | **器件本体**的 `overlap` / `pin-coincidence`;strict 下 spacing、off-grid、**out-of-sheet**、缺失/畸形几何、sheet check `unavailable` 同样阻断 |
-   | 2 | `clusters` | **虚拟组体积**(器件 + 只挂在它自己引脚上的 marker/桩线/文字):组间**图元级**重叠、组探出图纸可用区;strict 下组间过近也阻断 |
+   | 2 | `clusters` | **虚拟组体积**(器件 + 只挂在它自己引脚上的 marker/桩线/文字):组间**图元级**重叠、组探出图纸可用区;strict 下组间过近也阻断。另出 **`pageTooSmall`** 字段(文本模式 = `BLOCKED page-too-small` 行):这一组**本身比整页还大** —— 与 out-of-sheet **是两种病**(那个挪一挪能解,这个挪多少次都不会变),读到它去 S3 的 `page-too-small` 停点,别继续微调 |
    | 3 | `check` | fatal / error 级 finding(悬空脚、导线交叉/穿脚、网络标识不一致、零长/悬挂线、`duplicate-net-marker`、`titleblock-overlap`、`marker-overlap`) |
 
    > `marker-overlap` 一片时**别直接 `sch modify` 挪标识坐标**(会把它挪脱导线端点 → 断网)。

@@ -53,7 +53,7 @@ EasyEDA tooling.
 
 扫读式硬约束,任何模式都不问用户、不商量。违反 = 返工或坏板。每条带 `→` 指到细节文件。
 
-1. **窗口操作前先 `easyeda health`** — 否则打到错窗口 / 无连接器。→ environment-setup.md
+1. **窗口操作前先 `easyeda health`** — 否则打到错窗口 / 无连接器;它带 `versionGate` 判定块,**版本错位时后续动作当场被拒**(拒绝消息自带修法;明知故犯:`--skip-version-check` / `EASYEDA_SKIP_VERSION_CHECK=1`,会写审计)。撞门先对版本,别怀疑电路或工具坏了。→ environment-setup.md §0.5
 2. **只用 typed `easyeda` action** — 只有无对应 typed action **且**用户明确接受 debug 路径时才 `debug.exec_js`。
 3. **mutate 前先 inspect** — 放/移/连/同步/存之前先读 doc/页/器件/引脚/板层/网络/规则,别盲改;破坏性操作(clear/delete/bulk import)先确认。
 4. **无图纸不摆放/布线** — 找不到 sheet 立即停,让用户建/批准 A4(默认 A4)。→ design-flow S1
@@ -68,6 +68,7 @@ EasyEDA tooling.
 13. **电气 clearance ≠ 手焊可达性** — P2 先持久化装配档案:`pcb stage set-assembly --profile hand-solder`(默认/下限40mil;大焊盘烙铁通道60mil);`layout-lint --gate` 有任何 tight pair 即失败,任何器件四面被围、无一侧 ≥60mil 烙铁通道(no-access)也失败;未过门不得确认布局。→ design-flow P2/P6 · issue #99
 14. **阶段门禁机械强制,不必预读细则** — 布线前、布线后各一道门,未过一律被拒(daemon 在 /action 层也拦,raw 调用绕不过)。撞上去的拒绝消息**自带下一条该跑的命令**,照做即可。切入/恢复会话:`workflow status --reconcile` → `workflow advance`。→ design-flow P6(含 force 分级 #132)/P10
 15. **原理图必须分页分区 + 每模块电路说明,默认必做**(「最小/单页」不是借口)— ①分页(页名=功能名)②`sch zones set`+`zone-draw` 画区框(**单页小板也要画**)③每模块 1~3 行 `sch note`。⚠ 手工 `block-apply`/`sch place` **不自动画框**,必须补 ②③。机械兜底:`sch check` 的 `missing-partition` + `sch gate --strict` 会挡下。→ design-flow S1–S3
+16. **「探出图纸」≠「比图纸还大」** — 前者挪一挪能解;后者(`page-too-small`)挪多少次都没用,必须换手段,且**分页是设计决策 → 停手问用户**(工具不自动分页)。别人肉重试:`--max-attempts`(默认 3)会替你停手。→ design-flow S3
 
 ## ② 流程停点 + 档位默认 + 块地图速查
 
@@ -82,6 +83,7 @@ EasyEDA tooling.
 | ① S0 方案书 | 进 S1 前 | 架构/叠层/地策略/接口取向每条摊选项+坑+推荐让用户拍板;**必须落成磁盘文件**才算过门,不能停在对话里 |
 | ② sch→PCB 前 | 原理图完成 | 逐页 **`easyeda sch gate --strict --doc <page>` 出 `verdict=pass`**(一条命令跑完 layout-lint→check→bridge-check→drc 四关,顺序与阻塞判据固定在代码里,别自己拼)+ pin→net 黄金表对齐(gate 判不了「接对没有」,只判「接得合不合法」);**`verdict=blocked` 是检查器没跑成,不是板子有问题——先修 health/doc 再重跑,别去改电路**;DRC 聚合 WARN 必须审阅并报告；**多页/多模块板还需确认分区框+区名标注已画**(`sch zones status` 看认领、`sch zone-draw` 补画——手工摆放路径不会像 `autolayout --apply` 那样自动画,容易漏)**+每模块电路说明已放**(`sch note` 放、`sch text-list` 核——分区框只命名,说明才让人读懂) → design-flow S5 |
 | ③ 发板/交付前 | 导出制造 | 交付摘要说清偏差(降级决策/遗留 WARN) |
+| S2/S3 `page-too-small` | 块/组比整页可用区还大 | 工具只停手不建页:摊给用户拍板 ①独立成页 ②继续分页 ③改标签朝向收小组(A4-only 不换纸)→ design-flow S3 |
 | P2 摆放前 | 布局起手 | 先问单/双面布局 + 焊接工艺;立即用 `pcb stage set-assembly` 落盘,手焊默认 `min-gap=40mil`/大焊盘通道 `60mil` |
 | P2 边缘接口件 | 端子/USB/SD/排针/按键/IPEX | 朝向 + 边序 = 装配体验,agent 猜不了,**必须用户确认**;先 `blocks show` 读块 placement 摊给用户 |
 | P2 分档落状态 | 每档摆完确认后 | **`pcb stage confirm-tier <1-4> --parts …` 逐档落盘**(#125 机械化):档1孔→档2边缘件→档3主芯片+RF→档4卫星(缺省=其余);跳档被拒、动某档件只作废该档及其后;四档未齐 `confirm-layout` 拒绝封章 |
@@ -98,7 +100,7 @@ EasyEDA tooling.
 | 布线档 | 按 layout-lint ratsnest 密度选 | 稀疏(交叉<100)→ `route-short`;**稠密 → 请用户点原生自动布线(默认)**;全 headless 才 Freerouting(`pcb autoroute`,兜底,**不顶替默认**)。交出去前先跑 ↓P7 迷你清单 |
 | 摆放优先级 | 孔 → 边缘件 → 主芯片+RF → 卫星件 | 只有卫星件交 auto-place;孔最先放 + 锁定 |
 | 图纸 / 板框 | A4 / compact | 无尺寸信息时 compact;compact 时主芯片按**紧凑网格**播种(模块中心距≈包络+300~400mil,别撒 2000mil 外),摆位/判尺寸**只信 `pcb list --include-bbox` 实测 bbox**(含 courtyard,常比封装大 40%+),不猜标称 → design-flow P1/P2 |
-| 原理图组织 | **功能分区+电路说明默认必做**:≥2 个功能模块就分区(`sch zones set`→`sch zone-draw`;`autolayout --apply` 自动画);模块多/页挤 → **分页**(每页一个功能域:电源/主控/接口…,跨页 `net_port` 同名同网);**每模块配 1~3 行电路说明**(`sch note`:作用+关键参数,如「LDO: 5V→3V3 1A」「BOOT: GPIO0 拉低进烧录」) | 用户反馈:成品图没分区没说明=可读性差。单页单模块小板可免分页,但**区名框+电路说明仍要画**;说明文字放模块框下/旁,不压电路(放完 `sch layout-lint` 核) → design-flow S1–S3 · schematic-layout-conventions.md |
+| 原理图组织 | **分页+区框+说明,见铁律 15** | 分页 = 每页一个功能域(电源/主控/接口…),跨页 `net_port` 同名同网;`autolayout --apply` 自动画框;说明写作用+关键参数(「LDO: 5V→3V3 1A」「BOOT: GPIO0 拉低进烧录」),放模块框下/旁不压电路 → design-flow S1–S3 · schematic-layout-conventions.md |
 | GND 内层 | `power-planes --gnd-plane` → 终态 PLANE | SIGNAL 铺→翻 PLANE→rebuild,不停在 SIGNAL |
 | `pour-fit --replace` | **true(会清跨层同网 pour)** | 顶/底 GND pour 要显式 `--replace=false` |
 | 线宽档(net-class) | 按角色:信号=live默认 / 支线(3V3/1V8)10 / 主干(+5V)15 / 大电流(VBUS/VIN)20mil | `pcb net-classes` 查当前表;`route-short` 自动按角色给宽;偏细电源线被 `pcb check` **width-under-spec** 逮(§7.8) |
