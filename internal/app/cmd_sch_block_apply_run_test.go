@@ -190,7 +190,7 @@ func TestRunBlockApplyOverlapStopsBeforeWiringAndRollsBack(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "layout verification found 1 overlap") {
 		t.Fatalf("err=%v, want hard overlap failure", err)
 	}
@@ -271,7 +271,7 @@ func TestRunBlockApplyReadOrParseFailureStopsBeforeWiring(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-				blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+				blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err=%v, want %q", err, tc.want)
 			}
@@ -320,7 +320,7 @@ func TestRunBlockApplyPinCoincidenceStopsBeforeWiring(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "0 overlap(s) and 1 pin coincidence") {
 		t.Fatalf("err=%v, want hard pin-coincidence failure", err)
 	}
@@ -364,7 +364,7 @@ func TestRunBlockApplyRollbackSurvivorReportsPartialState(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "PARTIAL STATE") {
 		t.Fatalf("err=%v, want explicit partial state", err)
 	}
@@ -405,7 +405,7 @@ func TestRunBlockApplyMissingPlacedIDDoesNotGuessRollbackTarget(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "PARTIAL STATE") {
 		t.Fatalf("err=%v, want explicit partial state", err)
 	}
@@ -598,7 +598,7 @@ func TestRunBlockApplyAdoptsTheComponentAPlaceTimeoutLeftBehind(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "connector did not respond") {
 		t.Fatalf("err=%v, want the place failure surfaced", err)
 	}
@@ -658,7 +658,7 @@ func TestRunBlockApplyPlaceThatNeverLandedAdoptsNothing(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", in,
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "connector did not respond") {
 		t.Fatalf("err=%v, want the place failure surfaced", err)
 	}
@@ -717,7 +717,7 @@ func TestRunBlockApplyWithoutPreplaceSnapshotRefusesToGuess(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runBlockApply(cfg, "w1", "led_indicator_gpio", bapInput{},
-		blockApplyPartsFixture(t), false, true, &stdout, &stderr)
+		blockApplyPartsFixture(t), false, true, 0, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("want the place failure surfaced")
 	}

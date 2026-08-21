@@ -127,28 +127,59 @@ type destaggerRunReport struct {
 	RollbackSurvivors []string `json:"rollbackSurvivors,omitempty"`
 	OverlapsBefore    int      `json:"overlapsBefore"`
 	OverlapsAfter     int      `json:"overlapsAfter"`
+	// Converged / Verdict 是 #181 第三份复盘补上的那个洞:此前跑满 --max-rounds
+	// 还剩 N 处重叠,和"一轮就归零"打印的是**同一句话**(`已搬迁 M 个 marker(R 轮)`),
+	// 读的人分不出"做完了"和"没做完"—— 于是只能再跑一遍,再跑一遍还是同一句话。
+	// **无 omitempty**:false 被抹掉的话又变回分不清。
+	Converged bool   `json:"converged"`
+	Verdict   string `json:"verdict,omitempty"`
 }
 
 // runSchDestagger 是命令主体。单页作用域:桩线只能从激活页读(--all-pages 系
 // 列的已知边界),跨页整理请逐页切 `doc switch` 后各跑一次。
-func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMoves int, eps float64, asJSON bool, stdout, stderr io.Writer) error {
+func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMoves, maxAttempts int, eps float64, asJSON bool, stdout, stderr io.Writer) error {
 	rep := destaggerRunReport{Applied: apply}
 
-	comps, wires, err := fetchDestaggerGeometry(cfg, window)
+	comps, wires, pageUUID, err := fetchDestaggerGeometry(cfg, window)
 	if err != nil {
 		return err
+	}
+	// 收敛台账:destagger 的"次数"有两层 —— 一次调用里的 --max-rounds(进程内),
+	// 和**反复调用同一条命令**(进程外)。复盘里烧掉时间的是后者,所以这道门必须
+	// 在动手之前查,而且只在 --apply 路径上查(dry-run 是纯计算,不该被历史拦住)。
+	ckey := schConvergeKey{Op: "destagger", Page: pageUUID}
+	if apply && maxAttempts > 0 {
+		if stop := schConvergeGate(cfg.project, ckey, maxAttempts); stop != nil {
+			return stop
+		}
 	}
 	plan := planDestagger(comps, wires, eps)
 	rep.Plan = plan
 	rep.OverlapsBefore = plan.OverlapsBefore
 
 	if !apply || len(plan.Moves) == 0 {
+		// **一个都搬不动却还有重叠**是最该说话的一档,而它恰好走的是这条早退路径:
+		// 此前只打一句计划摘要,读起来像"没什么可做的",于是人再跑一遍、再跑一遍。
+		// 判决在这里就要下(--apply 语境下),并且要说清"再跑没用、换什么手段"。
+		rep.OverlapsAfter = plan.OverlapsBefore
+		rep.Converged = rep.OverlapsAfter == 0
+		if apply && !rep.Converged {
+			rep.Verdict = destaggerStuckVerdict(rep, maxRounds)
+		}
 		if !asJSON {
 			fmt.Fprintf(stdout, "%s\n", destaggerPlanSummary(plan))
 			renderDestaggerPlan(stdout, plan)
 			if len(plan.Moves) > 0 {
 				fmt.Fprintf(stdout, "\n只算不动 —— 加 --apply 落地(每轮自动 sch check 复验,电气项恶化即整批回滚)\n")
 			}
+			if rep.Verdict != "" {
+				fmt.Fprintf(stdout, "verdict: %s\n", rep.Verdict)
+			}
+		}
+		if apply && maxAttempts > 0 && !rep.Converged {
+			schConvergeNoteFailure(cfg.project, ckey,
+				schConvergeSignature(fmt.Sprintf("marker-overlap:%d", rep.OverlapsAfter), "moved:0"),
+				nil, rep.Verdict, maxAttempts, stderr)
 		}
 		return emitDestaggerJSON(stdout, asJSON, rep)
 	}
@@ -161,7 +192,7 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 
 	for round := 1; round <= maxRounds; round++ {
 		if round > 1 {
-			comps, wires, err = fetchDestaggerGeometry(cfg, window)
+			comps, wires, _, err = fetchDestaggerGeometry(cfg, window)
 			if err != nil {
 				return err
 			}
@@ -189,7 +220,7 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 		}
 		rep.Moved = append(rep.Moved, batch...)
 
-		compsAfter, _, ferr := fetchDestaggerGeometry(cfg, window)
+		compsAfter, _, _, ferr := fetchDestaggerGeometry(cfg, window)
 		if ferr != nil {
 			return ferr
 		}
@@ -220,6 +251,15 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 		}
 	}
 
+	// ── 收敛判决:跑完 ≠ 做完(#181 第三份复盘)──────────────────────────────
+	//
+	// 此前落到这里只打一句「已搬迁 M 个 marker(R 轮)」,跑满上限还剩 N 处重叠与
+	// 一轮归零是同一句话。判据必须把两者分开,而且**说清下一步是什么**。
+	rep.Converged = rep.OverlapsAfter == 0
+	if !rep.Converged {
+		rep.Verdict = destaggerStuckVerdict(rep, maxRounds)
+	}
+
 	if !asJSON {
 		fmt.Fprintf(stdout, "已搬迁 %d 个 marker(%d 轮);marker-overlap %d → %d,电气项无恶化\n",
 			len(rep.Moved), rep.Rounds, rep.OverlapsBefore, rep.OverlapsAfter)
@@ -227,8 +267,52 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 			fmt.Fprintf(stdout, "跳过 %d 个(见 --json 的 skips:not-a-stub/stub-too-long/diagonal-stub/no-free-slot)\n",
 				len(rep.Plan.Skips))
 		}
+		if rep.Verdict != "" {
+			fmt.Fprintf(stdout, "verdict: %s\n", rep.Verdict)
+		}
+	}
+	// 记账:签名 = 剩余重叠数 + 搬迁数。两者都没动 = 原地打转;有一个动了 = 有进展,
+	// 自动清零(destagger 一次只搬 1 个是默认行为,连着跑本来就是正常用法 ——
+	// 上限拦的是"跑了也不动"的那种)。
+	if apply && maxAttempts > 0 {
+		if rep.Converged {
+			schConvergeNoteSuccess(cfg.project, ckey)
+		} else {
+			schConvergeNoteFailure(cfg.project, ckey,
+				schConvergeSignature(fmt.Sprintf("marker-overlap:%d", rep.OverlapsAfter),
+					fmt.Sprintf("moved:%d", len(rep.Moved))),
+				nil, rep.Verdict, maxAttempts, stderr)
+		}
 	}
 	return emitDestaggerJSON(stdout, asJSON, rep)
+}
+
+// destaggerStuckVerdict 把「没收敛」折成一句能执行的下一步。
+//
+// 三种没收敛,出路完全不同 —— 混成一句「还剩 N 处重叠」等于什么都没说:
+//   - **轮数用完**:还在往前走,加 --max-rounds 就行;
+//   - **规划为空**(还有重叠但一个都不敢动):候选位全被占,再跑多少遍都一样,
+//     必须换手段(改标签朝向 / 挪件 / 拆页);
+//   - **全被跳过**:每个都有具体理由(no-free-slot / stub-too-long / …),照理由修。
+func destaggerStuckVerdict(rep destaggerRunReport, maxRounds int) string {
+	if rep.OverlapsAfter <= 0 {
+		return ""
+	}
+	if rep.Rounds >= maxRounds && len(rep.Moved) > 0 {
+		return fmt.Sprintf("未收敛:%d 轮上限用完,还剩 %d 处 marker 重叠(本轮确实在往前走:已搬 %d 个)"+
+			"—— 下一步:`sch destagger --apply --max-rounds %d` 继续,或直接看 --json 的 skips",
+			maxRounds, rep.OverlapsAfter, len(rep.Moved), maxRounds*2)
+	}
+	if len(rep.Plan.Moves) == 0 {
+		return fmt.Sprintf("**停手**:还剩 %d 处 marker 重叠,但规划一个可搬的都找不到(候选位全被占)"+
+			"—— **再跑一遍 destagger 不会有别的结果**。换手段:"+
+			"① 改标签朝向 —— `sch disconnect --pin X:n` + `sch connect --pin X:n --direction left|right`;"+
+			"② 挪件腾地 —— `sch group-move --group <组>`;"+
+			"③ 这一页本来就塞不下 —— `sch clusters --strict` 看是不是有组比整页可用区还大,是就拆页。",
+			rep.OverlapsAfter)
+	}
+	return fmt.Sprintf("未收敛:还剩 %d 处 marker 重叠,%d 个搬迁被跳过(理由见 --json 的 skips)"+
+		"—— 按理由逐条处理,不要盲目重跑", rep.OverlapsAfter, len(rep.Plan.Skips))
 }
 
 // destaggerKernelRound 把一批 marker 搬迁折成**一次内核调用**(ADR-0004):
@@ -301,20 +385,22 @@ func destaggerHostPin(comps []layoutComp, x, y float64) (desig, pin string, ok b
 
 // fetchDestaggerGeometry 拉一次判定所需的全部几何:带 bbox+pins 的图元表 + 线
 // (pins 供宿主 pin 反查,内核端子重建要按位号:pin 号点名)。
-func fetchDestaggerGeometry(cfg *appConfig, window string) ([]layoutComp, []schGroupWire, error) {
+// 第四个返回值是活页 documentUuid(响应信封的 context),给收敛台账按页记账用;
+// 取不到时是空串,台账退化成整工程一本账,绝不因此报错。
+func fetchDestaggerGeometry(cfg *appConfig, window string) ([]layoutComp, []schGroupWire, string, error) {
 	res, err := requestAction(cfg, "schematic.components.list", window, map[string]any{"includeBBox": true, "includePins": true})
 	if err != nil {
-		return nil, nil, fmt.Errorf("components.list 失败: %w", err)
+		return nil, nil, "", fmt.Errorf("components.list 失败: %w", err)
 	}
 	comps, perr := parseLayoutComps(res.Result)
 	if perr != nil {
-		return nil, nil, perr
+		return nil, nil, "", perr
 	}
 	wires, werr := fetchSchWirePolylinesStable(cfg, window, "")
 	if werr != nil {
-		return nil, nil, fmt.Errorf("导线读取失败(没有桩线几何就无法安全搬迁): %w", werr)
+		return nil, nil, "", fmt.Errorf("导线读取失败(没有桩线几何就无法安全搬迁): %w", werr)
 	}
-	return comps, wires, nil
+	return comps, wires, schActionDocUUID(res), nil
 }
 
 func renderDestaggerPlan(w io.Writer, p destaggerPlan) {
@@ -343,7 +429,7 @@ func emitDestaggerJSON(stdout io.Writer, asJSON bool, rep destaggerRunReport) er
 // newSchDestaggerCommand builds `sch destagger` — issue #171 的修复侧。
 func newSchDestaggerCommand(cfg *appConfig, window *string, stdout, stderr io.Writer) *cobra.Command {
 	var apply, dryRun, asJSON bool
-	var maxRounds, maxMoves int
+	var maxRounds, maxMoves, maxAttempts int
 	var eps float64
 	c := &cobra.Command{
 		Use:   "destagger",
@@ -381,7 +467,7 @@ func newSchDestaggerCommand(cfg *appConfig, window *string, stdout, stderr io.Wr
 			if maxRounds < 1 {
 				return fmt.Errorf("--max-rounds must be ≥ 1")
 			}
-			return runSchDestagger(cfg, *window, apply, maxRounds, maxMoves, eps, asJSON, stdout, stderr)
+			return runSchDestagger(cfg, *window, apply, maxRounds, maxMoves, maxAttempts, eps, asJSON, stdout, stderr)
 		},
 	}
 	c.Flags().BoolVar(&apply, "apply", false, "落地搬迁(默认只算不动);每轮自动 sch check 复验,电气项恶化即整批回滚")
@@ -390,5 +476,8 @@ func newSchDestaggerCommand(cfg *appConfig, window *string, stdout, stderr io.Wr
 	c.Flags().IntVar(&maxMoves, "max-moves", 1, "每轮最多落地几个搬迁(默认 1 —— 逐个落地+逐个复验最安全;EasyEDA 的导线自动合并会让同批后续搬迁的规划过时,实测整批落地会撞出 multi-net-wire 且回滚不干净)。0 = 不限,冒险整批走")
 	c.Flags().IntVar(&maxRounds, "max-rounds", 1, "最多迭代几轮(每轮重新拉几何重新规划;marker-overlap 归零即提前收敛)")
 	c.Flags().Float64Var(&eps, "overlap-eps", schMarkerOverlapEps, "重叠判定阈值,与 sch check 同义(小于它的边缘擦碰不算)")
+	c.Flags().IntVar(&maxAttempts, "max-attempts", schConvergeDefaultMaxAttempts,
+		"**跨调用**上限:同一页连续多少次 --apply 得到同一个结果(剩余重叠数与搬迁数都没动)后停手并给结论(0 = 不限)。"+
+			"与 --max-rounds 是两件事 —— 那个管一次调用里迭代几轮,这个管你把这条命令重跑了几遍")
 	return c
 }

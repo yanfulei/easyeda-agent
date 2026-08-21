@@ -228,6 +228,10 @@ type bapInput struct {
 	OriginY  float64
 	Spacing  float64
 	PerRow   int
+	// SpecPath 非空时,落块+归组之后自动把真实位号回填进这份 S0 spec 的
+	// modules[].parts(#181:位号漂移每次都要人回头改 json)。纯执行侧字段,
+	// 规划不读它。
+	SpecPath string
 	Bind     map[string]string // PORT → host net
 	KindOver map[string]string // NET → flag kind override
 	// Layout is the block's schematic_layout template (nil → fallback grid).
@@ -475,10 +479,7 @@ func bapResolveOrigin(in bapInput, offsets map[string]bapRoleOffset, half func(s
 	var usable layoutBBox
 	var oversize bool
 	if in.Sheet != nil {
-		usable = layoutBBox{
-			MinX: in.Sheet.MinX + sheetEdgeMinGap, MinY: in.Sheet.MinY + sheetEdgeMinGap,
-			MaxX: in.Sheet.MaxX - sheetEdgeMinGap, MaxY: in.Sheet.MaxY - sheetEdgeMinGap,
-		}
+		usable = schUsableArea(*in.Sheet)
 		// **块比图纸还大时不许让 inBounds 连坐掉避让**:此时它恒 false,96 个候选
 		// 全否决 → 回落原坐标 → 压在已有器件上 → wiring 前硬门整单回滚。也就是
 		// 说「放不下」会被升级成「连躲都不躲」,比不加边界约束更差。
@@ -554,9 +555,13 @@ func bapResolveOrigin(in bapInput, offsets map[string]bapRoleOffset, half func(s
 		why := "与已有器件重叠"
 		switch {
 		case oversize:
+			// **估算都装不下 = 一定装不下**(估算的半高是写死的下限,见 bapBlockRect)。
+			// 所以这一档可以直接下 page-too-small 的结论,措辞与实测口径共用同一个
+			// advice 生成器 —— 同一件事在估算侧和实测侧必须说同一句话,否则用户会
+			// 以为是两个不同的问题各修一遍。
 			bw, bh := bboxSize(rect)
-			uw, uh := bboxSize(usable)
-			why = fmt.Sprintf("与已有器件重叠;另注:本块估算 %.0f×%.0f 大于图纸可用区 %.0f×%.0f,已只按器件避让、不判图纸边界(换大图纸/拆页/给块加 schematic_layout 模板)", bw, bh, uw, uh)
+			f := schPageFitFromEstimate(strings.TrimPrefix(in.Block.ID, "block."), bw, bh, usable, in.TitleBlock)
+			why = "与已有器件重叠;另注:" + f.Advice + "(本次已只按器件避让、不判图纸边界)"
 		case inBounds != nil:
 			why = "与已有器件重叠或超出图纸可用区"
 		}

@@ -1073,6 +1073,7 @@ netflag 桩线占用的 x),把所有引脚点当作**点障碍**绕行,画完必
 	{
 		var idsRaw, groupRef, groupsRaw string
 		var dx, dy float64
+		var groupMoveMaxAttempts int
 		c := &cobra.Command{
 			Use:   "group-move",
 			Short: "Translate components+wires together as one rigid assembly (dx,dy) — by --ids or persistent --group/--groups",
@@ -1141,7 +1142,7 @@ pull fresh ids before any follow-up mutation on it.`,
 				// 多组必须一次调用整体移动(逐组 move 会撕裂共享导线,ADR-0004
 				// Decision 2 推论)。--ids 是裸图元模式,调用方自己负责,保持原语义。
 				if len(groupRefs) > 0 {
-					return groupsMoveRebuild(cfg, window, groupRefs, dx, dy, stdout, stderr)
+					return groupsMoveRebuild(cfg, window, groupRefs, dx, dy, groupMoveMaxAttempts, stdout, stderr)
 				}
 				var ids []string
 				{
@@ -1190,6 +1191,9 @@ pull fresh ids before any follow-up mutation on it.`,
 		c.Flags().StringVar(&groupsRaw, "groups", "", "多个持久组一次整体移动 — CSV: g2,g3(同块多子组必须一次调用,逐组 move 会撕裂共享导线;可与 --group 并用取并集)")
 		c.Flags().Float64Var(&dx, "dx", 0, "X translation (mil)")
 		c.Flags().Float64Var(&dy, "dy", 0, "Y translation (mil)")
+		c.Flags().IntVar(&groupMoveMaxAttempts, "max-attempts", schConvergeDefaultMaxAttempts,
+			"**跨调用**上限(仅 --group/--groups):同一个组连续多少次得到同一个失败结果(位移被钳到 0 等)后停手并给结论(0 = 不限)。"+
+				"组本身比整幅可用区还大时,拒绝消息会换成真话(独立成页/拆页),而不是那条走不通的「减小位移试试」")
 		sch.AddCommand(c)
 	}
 

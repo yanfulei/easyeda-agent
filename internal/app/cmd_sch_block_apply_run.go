@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"sort"
@@ -387,11 +388,19 @@ func parseKV(items []string, flag string) (map[string]string, error) {
 // C1-C10. tagPages makes the connector visit every page (and restore the original)
 // before the scan, which loads them; the remaining drift is caught by the
 // post-place designator read-back in runBlockApply.
-func existingDesignators(cfg *appConfig, window string) (map[string]bool, error) {
+// 第二个返回值是**这次读到的活页 documentUuid**(响应信封里的 context)。收敛台账
+// (sch_converge_ledger.go)按页记账 —— 同一个块在 P1 放不下、在空白的 P2 上完全
+// 可能放得下,那正是「独立成页」这条出路的意义,所以页身份不能省。取不到时返回空串,
+// 台账退化成"整个工程一本账",不报错(诊断数据不该挡活)。
+func existingDesignators(cfg *appConfig, window string) (map[string]bool, string, error) {
 	res, err := requestAction(cfg, "schematic.components.list", window,
 		map[string]any{"allPages": true, "tagPages": true})
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	docUUID := ""
+	if res.Context != nil {
+		docUUID = strings.TrimSpace(res.Context.DocumentUUID)
 	}
 	out := map[string]bool{}
 	raw, _ := res.Result["components"].([]any)
@@ -404,7 +413,7 @@ func existingDesignators(cfg *appConfig, window string) (map[string]bool, error)
 			out[strings.ToUpper(d)] = true
 		}
 	}
-	return out, nil
+	return out, docUUID, nil
 }
 
 // bapPlacedDesignator digs the authoritative designator out of a
@@ -722,7 +731,7 @@ func failBlockApplyAfterPlacement(cfg *appConfig, window string, man *bapManifes
 
 // runBlockApply is the command core.
 func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPath string,
-	dryRun, asJSON bool, stdout, stderr io.Writer) error {
+	dryRun, asJSON bool, maxAttempts int, stdout, stderr io.Writer) error {
 
 	// ADR-0004 Decision 4: dry-run 必须纯计算 —— 机械保证,Mutates 派发直接被拒。
 	if dryRun {
@@ -763,8 +772,9 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	// preplaceIDs 是「本命令开跑前页面上有哪些器件」。nil = 没读到 → 收编停用
 	// (没有它就分不清「新出现」和「本来就在」,按坐标猜等于允许误删)。
 	var preplaceIDs map[string]bool
+	pageUUID := ""
 	if !dryRun || window != "" || cfg.project != "" {
-		if in.Existing, err = existingDesignators(cfg, window); err != nil {
+		if in.Existing, pageUUID, err = existingDesignators(cfg, window); err != nil {
 			if !dryRun {
 				return err
 			}
@@ -780,6 +790,27 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 		// findSlot 的 inBounds 传成 nil,于是"最近的空位"可以落在图纸外
 		// (实测 J_USB→x=-20、R6→y=880 而图纸上界 825)。issue #180 Fix B。
 		in.Sheet = sheetBBox
+	}
+
+	// ── 次数上限 + 落块前的「这一页根本放不下」停手(#181 第三份复盘,最大卡点)──
+	//
+	// 位置很讲究:**在 planBlockApply 之前、任何 mutating action 之前**。停手的全部
+	// 价值就在于画布零改动 —— 停在放了一半的地方比不停更糟。
+	//
+	// 两道门,判据不同:
+	//   ① 上一轮**实测**量出 page-too-small(见 bapBlockPageFit)→ 立刻停。测量是
+	//      证据,不需要第二次;这就是「落块前用实测 bbox 判断」在"没落地就没实测"
+	//      这个死结下唯一诚实的解法 —— 用上一轮的实测。
+	//   ② 同一个失败签名连续 maxAttempts 次 → 停,并复述那句可执行的下一步。
+	ckey := schConvergeKey{Op: "block-apply", Page: pageUUID, Target: b.ID}
+	if !dryRun && maxAttempts > 0 {
+		if fit := schConvergeFitFor(cfg.project, ckey); fit != nil && fit.TooBig() {
+			return fmt.Errorf("停手:上一轮已**实测**量过这一块在本页放不下 —— %s\n"+
+				"(画布未改动。确认要再放一次:加 `--max-attempts 0`)", fit.Advice)
+		}
+		if stop := schConvergeGate(cfg.project, ckey, maxAttempts); stop != nil {
+			return stop
+		}
 	}
 
 	plan, err := planBlockApply(in)
@@ -999,6 +1030,13 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 			fmt.Fprintf(stderr, "layout ✗ overlap %s ↔ %s (%.0f×%.0f) — fix with `sch modify`/`sch autoplace-free`, then `sch layout-lint`\n",
 				f.A, f.B, f.OvX, f.OvY)
 		}
+		// 记账:同一个「N 处重叠 + M 处引脚重合」反复出现 = 原地打转。数值不粗化 ——
+		// 重叠数是小整数,3→2 是真进展,该清零。
+		schConvergeNoteFailure(cfg.project, ckey,
+			schConvergeSignature(fmt.Sprintf("overlap:%d", overlaps), fmt.Sprintf("pin-coincidence:%d", coincidences)),
+			nil, "先按上面逐条 findings 改块原点/模板(`--at` 换落点、`sch autoplace-free`),"+
+				"或改用 `sch block-apply --per-row` 换排布;仍是同一个数就说明这一页塞不下,该拆页。",
+			maxAttempts, stderr)
 		return failBlockApplyAfterPlacement(cfg, window, &man, created, nil, nil,
 			fmt.Errorf("layout verification found %d overlap(s) and %d pin coincidence(s)",
 				overlaps, coincidences),
@@ -1081,13 +1119,41 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	// 于是 marker 互相压、去耦被标签罩住、簇探出图纸的页,它照样报 0 overlap —— 一路
 	// 假绿到交付。判定不失败整单(器件与连线都已落地,版面问题是可后修的),但必须
 	// 出现在 stderr 和 manifest 里,并指出用哪条命令 gate。
-	bapReportClusters(cfg, window, &man, stderr)
+	fit := bapReportClusters(cfg, window, &man, stderr)
 
 	// 9. 归组 —— ADR-0003 的第一步产物必须是**一个刚体**,不是一堆散件。
 	// 次序在这里而不是更早:组的 bbox 必须已经包含连线和 marker(放件→连线→
 	// 挂 marker→封组),上层(zone tidy / zone-plan)拿到的刚体尺寸才是真实占地,
 	// 也才不需要另算「四侧引出通道」。
 	bapRegisterGroup(cfg, window, plan, &man, stderr)
+
+	// 9b. 收敛台账结账。**必须在归组之后**:组名是 fit 报告里那个"谁"的来源,
+	// 也是下一轮停手消息里能直接喂给 `sch group-move` 的抓手。
+	//
+	// 记账的判据是「这次跑完,画面还有没有那个治不好的毛病」:
+	//   - 实测 page-too-small → 记账(带上实测框,下一轮据此**落块前**就停手);
+	//   - 干净 → 销账。销账是硬要求:不销的话,一次历史失败会永久拦住这个块。
+	if !dryRun && maxAttempts > 0 {
+		if fit != nil && fit.TooBig() {
+			schConvergeNoteFailure(cfg.project, ckey,
+				// 尺寸粗化到 10:实测框会随 marker 的一两个单位抖动,不粗化就等于
+				// 每次签名都不同、上限永远撞不到。10 远小于"差多少才算有进展"。
+				schConvergeSignature(fmt.Sprintf("page-too-small:%.0fx%.0f",
+					math.Round(fit.W/10)*10, math.Round(fit.H/10)*10)),
+				fit, fit.Advice, maxAttempts, stderr)
+		} else if man.OK == "applied" && man.Reconciled {
+			schConvergeNoteSuccess(cfg.project, ckey)
+		}
+	}
+
+	// 9c. spec 位号回填(#181 第三份复盘第 3 条:「每次落块回头改 json」)。
+	//
+	// 必须在归组**之后**:组表就是回填的事实来源(它记的是 remap 后的真实位号)。
+	// 失败一律降级成一行警告 —— 器件与连线都已落地,一个外部 json 没同步上不该
+	// 把这次 apply 判成失败;但也绝不能沉默,漂移的位号会让分区判据静默少算模块。
+	if !dryRun && strings.TrimSpace(in.SpecPath) != "" {
+		bapBackfillSpec(cfg, in.SpecPath, stderr)
+	}
 
 	// 10. 统一收尾:状态已经全部固化(连线尽力、对账已做、组已封),**先出 manifest**,
 	// 再按严重程度决定退出码。顺序很重要 —— 调用方即使拿到非零退出码,也必须能从
@@ -1264,9 +1330,10 @@ func emitBapManifest(m bapManifest, asJSON bool, stdout io.Writer) error {
 func newSchBlockApplyCmd(cfg *appConfig, window *string, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		at, instance, partsPath string
+		specPath                string
 		binds, kinds            []string
 		spacing                 float64
-		perRow                  int
+		perRow, maxAttempts     int
 		dryRun, asJSON          bool
 	)
 	c := &cobra.Command{
@@ -1357,10 +1424,10 @@ idempotent per pin — an already-connected pin is skipped rather than re-flagge
 			}
 			in := bapInput{
 				Instance: instance, OriginX: x, OriginY: y,
-				Spacing: spacing, PerRow: perRow, Bind: bind, KindOver: kindOver,
+				Spacing: spacing, PerRow: perRow, Bind: bind, KindOver: kindOver, SpecPath: specPath,
 				AtExplicit: cmd.Flags().Changed("at"),
 			}
-			return runBlockApply(cfg, *window, args[0], in, partsPath, dryRun, asJSON, stdout, stderr)
+			return runBlockApply(cfg, *window, args[0], in, partsPath, dryRun, asJSON, maxAttempts, stdout, stderr)
 		},
 	}
 	c.Flags().StringVar(&at, "at", "400,300", "origin coordinate x,y for the first part")
@@ -1372,8 +1439,13 @@ idempotent per pin — an already-connected pin is skipped rather than re-flagge
 	c.Flags().StringArrayVar(&kinds, "kind", nil, "override a net's flag kind: --kind LED_CTRL=netport (repeatable)")
 	c.Flags().StringVar(&instance, "instance", "", "instance id used to name internal nets (default: the first allocated designator, e.g. LED1 → LED1_N2)")
 	c.Flags().StringVar(&partsPath, "parts", "", "path to standard-parts.json (auto-detected if omitted)")
+	c.Flags().StringVar(&specPath, "spec", "", "落块后把真实位号自动回填进这份 S0 spec 的 modules[].parts"+
+		"(平台会在 create 时重编位号,spec 里的旧位号会让分区判据静默少算模块;等价于事后跑 easyeda spec backfill --write)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "plan and print without placing or wiring")
 	c.Flags().BoolVar(&asJSON, "json", false, "emit the instance manifest as JSON")
+	c.Flags().IntVar(&maxAttempts, "max-attempts", schConvergeDefaultMaxAttempts,
+		"同一个块在同一页连续得到同一个失败结果多少次之后停手并给结论(0 = 不限)。"+
+			"结果签名一变(重叠数变了、换了落点)就重新计数,所以真有进展永远撞不到上限")
 	return c
 }
 

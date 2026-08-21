@@ -27,14 +27,17 @@ import (
 // groupMoveRebuild 平移一个持久虚拟组(单组入口,groupsMoveRebuild 的薄封装)。
 func groupMoveRebuild(cfg *appConfig, window, groupRef string, dx, dy float64,
 	stdout, stderr io.Writer) error {
-	return groupsMoveRebuild(cfg, window, []string{groupRef}, dx, dy, stdout, stderr)
+	// maxAttempts=0:这是**内部**入口(group-arrange 逐组落位走它)。跨调用次数
+	// 上限只该管人反复敲的那条命令 —— 给内部编排记账会让一次正常的多组排布
+	// 在第 4 个组上被自己的历史拦住。
+	return groupsMoveRebuild(cfg, window, []string{groupRef}, dx, dy, 0, stdout, stderr)
 }
 
 // groupsMoveRebuild 平移一个或多个持久虚拟组 —— **一次内核调用整体移动**
 // (ADR-0004 Decision 2 推论:同块多子组逐组 move 必撕裂共享导线;内核输入是
 // 刚体集合,多组并成一个集合天然支持)。规划(边界收拢)自己做,执行只准调
 // schMoveKernel(快照→删证→移动→重连→对账,失败自动恢复)。
-func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy float64,
+func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy float64, maxAttempts int,
 	stdout, stderr io.Writer) error {
 
 	pinned, win, docUUID, _, st, _, err := loadSchGroupsContext(cfg, window)
@@ -106,6 +109,34 @@ func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy
 	//     requested/applied 双份输出;钳到接近 0 = 位移意图已丢失,**动画布之前**
 	//     直接拒绝执行。
 	clampRep := groupMoveClampReport{RequestedDX: dx, RequestedDY: dy, AppliedDX: dx, AppliedDY: dy}
+	// pageFit 是「这个组在这一页到底装不装得下」的实测判决(sch_page_fit.go)。
+	// 它在钳位**之前**就算好,因为钳位的拒绝理由要用它:一个比整页可用区还大的组,
+	// 往哪个方向挪都会被钳,而「撞图纸边,减小位移试试」这句建议对它**永远无效**
+	// —— #181 第三份复盘 8+ 轮手工收敛里,相当一部分就烧在这条走不通的建议上。
+	ckey := schConvergeKey{Op: "group-move", Page: docUUID, Target: groupLabel}
+	var pageFit *schPageFit
+	if box, ok := groupOccupancy(comps, wires, memberSet); ok {
+		if sheet := sheetBBoxOf(comps); sheet != nil {
+			ko, provisional := titleBlockKeepout(sheet)
+			if provisional {
+				ko = nil // 猜出来的图签框不参与装配判决(与下面的收拢同口径)
+			}
+			f := judgeSchPageFit(groupLabel, box, schUsableArea(*sheet), ko)
+			pageFit = &f
+		}
+	}
+	if maxAttempts > 0 {
+		if stop := schConvergeGate(cfg.project, ckey, maxAttempts); stop != nil {
+			return stop
+		}
+	}
+	// **组比整页还大不构成拒绝理由**:调用方可能就是想把它往左推一点让主体露出来,
+	// 而那次平移是能落地的。判决只用来把下面钳位拒绝时的措辞从「减小位移试试」
+	// (对超尺寸组是一条走不通的建议)换成真话。少做一件事比多做一件事安全 ——
+	// 拒绝一次本来能成功的移动是行为回归,而回归比噪音贵。
+	if pageFit != nil && pageFit.TooBig() {
+		fmt.Fprintf(stderr, "⚠ %s\n", pageFit.Advice)
+	}
 	if box, ok := groupOccupancy(comps, wires, memberSet); ok {
 		if sheet := sheetBBoxOf(comps); sheet != nil {
 			// 收拢用**整页可用区**,图签 keepout 单独按相交判(见 clampDeltaAvoidingKeepout)。
@@ -136,9 +167,20 @@ func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy
 	// 钳到接近 0 = 请求的位移没实现,**在任何 mutation 之前**拒绝(不是先挪 2 个
 	// 单位再说没执行)。非零退出,报错给出路。
 	if clampRep.Refused {
-		return fmt.Errorf("group-move 未执行:requestedΔ=(%.0f,%.0f) 被钳到 appliedΔ=(%.0f,%.0f),接近 0(%s)—— 目标位移撞图纸边,画布未改动;可先挪走挡路对象(先移让路的组/区:`sch group-move`、`sch zone move`)或减小位移",
+		// 建议必须跟着事实走:组本身就比整幅大时,「减小位移试试」是一条**走不通**的
+		// 建议 —— 复盘里 8+ 轮手工收敛,相当一部分就烧在照着走不通的建议反复试。
+		next := "可先挪走挡路对象(先移让路的组/区:`sch group-move`、`sch zone move`)或减小位移"
+		if pageFit != nil && pageFit.TooBig() {
+			next = pageFit.Advice
+		}
+		if maxAttempts > 0 {
+			schConvergeNoteFailure(cfg.project, ckey,
+				schConvergeSignature("clamp-refused", strings.Join(clampRep.Axes, ";")),
+				pageFit, next, maxAttempts, stderr)
+		}
+		return fmt.Errorf("group-move 未执行:requestedΔ=(%.0f,%.0f) 被钳到 appliedΔ=(%.0f,%.0f),接近 0(%s)—— 目标位移撞图纸边,画布未改动;%s",
 			clampRep.RequestedDX, clampRep.RequestedDY, clampRep.AppliedDX, clampRep.AppliedDY,
-			strings.Join(clampRep.Axes, ";"))
+			strings.Join(clampRep.Axes, ";"), next)
 	}
 	if dx == 0 && dy == 0 {
 		fmt.Fprintln(stdout, "✓ 组已在可用区内且无需移动(零位移,未改动画布)")
@@ -156,6 +198,10 @@ func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy
 		moveKernelOpts{Label: "group-move", Stdout: stdout, Stderr: stderr})
 	if kerr != nil {
 		return kerr
+	}
+	// 真挪成了就销账 —— 不销的话,历史上那几次被钳的记录会一直拦着这个组。
+	if maxAttempts > 0 {
+		schConvergeNoteSuccess(cfg.project, ckey)
 	}
 	for _, line := range groupMoveResultLines(groupLabel, len(rep.Moved), clampRep) {
 		fmt.Fprintln(stdout, line)

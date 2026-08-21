@@ -20,7 +20,7 @@ import (
 	"github.com/zhoushoujianwork/easyeda-agent/internal/spec"
 )
 
-func newSpecCmd(stdout, stderr io.Writer) *cobra.Command {
+func newSpecCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "spec",
 		Short: "Validate and inspect the S0 design proposal (S0 spec)",
@@ -30,6 +30,7 @@ func newSpecCmd(stdout, stderr io.Writer) *cobra.Command {
 	}
 	c.AddCommand(newSpecValidateCmd(stdout, stderr))
 	c.AddCommand(newSpecShowCmd(stdout))
+	c.AddCommand(newSpecBackfillCmd(cfg, stdout, stderr))
 	return c
 }
 

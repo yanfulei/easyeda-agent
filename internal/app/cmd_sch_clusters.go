@@ -73,6 +73,27 @@ type schClusterReport struct {
 	Findings []schClusterFinding `json:"findings"`
 	Sheet    *layoutBBox         `json:"sheetUsable,omitempty"`
 	Unowned  int                 `json:"unownedMarkers,omitempty"`
+	// TooBig 是**本身就比这一页大**的组(sch_page_fit.go)。与 findings 里的
+	// out-of-sheet 是两种病:那个挪一挪能解,这个挪多少次都不会变(#181 第三份
+	// 复盘 8+ 轮的根源)。分开一个字段,读的人才不会把两者当同一件事。
+	TooBig []schPageFit `json:"pageTooSmall,omitempty"`
+}
+
+// schClustersTooBig 挑出「组本身比这一页还大」的那几个。
+//
+// keepout 传**未膨胀**的图签矩形:虚拟组只是「器件 ∪ 它自己的 marker」,不带
+// 区名带/说明带,膨胀会让它凭空严格一档(把"挪一挪能解"误判成"这一页放不下")。
+func schClustersTooBig(cs []schCluster, usable, keepout *layoutBBox) []schPageFit {
+	if usable == nil {
+		return nil // 量不出可用区就不下结论(猜出来的 fits 会掩盖掉真问题)
+	}
+	var out []schPageFit
+	for _, c := range cs {
+		if f := judgeSchPageFit(c.Designator, c.Box, *usable, keepout); f.TooBig() {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // buildSchClusters 是纯函数核心:从实测几何算出每个器件的虚拟组体积。
@@ -404,20 +425,27 @@ func runSchClusters(cfg *appConfig, window string, minGap float64, asJSON, stric
 		fmt.Fprintf(stderr, "warn: 读不到导线(%v)—— 桩线不计入组体积,marker 仍按最近引脚归属\n", werr)
 	}
 	clusters, unowned := buildSchClusters(comps, wires)
-	var usable *layoutBBox
+	var usable, keepout *layoutBBox
 	if sheet := sheetBBoxOf(comps); sheet != nil {
-		usable = &layoutBBox{
-			MinX: sheet.MinX + sheetEdgeMinGap, MinY: sheet.MinY + sheetEdgeMinGap,
-			MaxX: sheet.MaxX - sheetEdgeMinGap, MaxY: sheet.MaxY - sheetEdgeMinGap,
-		}
+		u := schUsableArea(*sheet)
+		usable = &u
+		keepout, _ = titleBlockKeepout(sheet)
 	}
+	// 逐组的装配判决:哪几个组**本身就比这一页大**。
+	//
+	// 为什么在 clusters 这条命令上做:out-of-sheet 只说「探出图纸可用区」,读起来
+	// 像"挪一挪";而 #181 第三份复盘那 8+ 轮里,真正的病是**挪不动**。这条命令是
+	// page-too-small 建议里指过来的那一条(「看组高 vs 本体高」),它必须能自己
+	// 回答"到底是摆得不好还是根本装不下"。
+	oversized := schClustersTooBig(clusters, usable, keepout)
 	// 带上功能子群信息:块内「去耦贴电源脚」这类紧贴是设计要求,不该报 tight。
 	var same schSameGroupFn
 	if _, _, docUUID, _, st, _, gerr := loadSchGroupsContext(cfg, window); gerr == nil {
 		same = schSameGroupFromState(st, docUUID)
 	}
 	findings := judgeSchClustersWith(clusters, usable, minGap, same)
-	report := schClusterReport{Clusters: clusters, Findings: findings, Sheet: usable, Unowned: unowned}
+	report := schClusterReport{Clusters: clusters, Findings: findings, Sheet: usable, Unowned: unowned,
+		TooBig: oversized}
 
 	if asJSON {
 		enc := json.NewEncoder(stdout)
@@ -451,6 +479,11 @@ func runSchClusters(cfg *appConfig, window string, minGap float64, asJSON, stric
 			case "tight":
 				fmt.Fprintf(stdout, "  WARN   tight         %s ↔ %s   间隙 %.0f < %.0f\n", f.A, f.B, f.Gap, minGap)
 			}
+		}
+		for _, f := range oversized {
+			// 与 out-of-sheet 分开成一行、措辞完全不同:那一条是"挪一挪",这一条是
+			// "挪不动"。混在一起就等于没报。
+			fmt.Fprintf(stdout, "  BLOCKED page-too-small  %s\n", f.Advice)
 		}
 	}
 
@@ -517,32 +550,45 @@ func newSchClustersCmd(cfg *appConfig, window *string, stdout, stderr io.Writer)
 // marker/桩线)。**只报不拦**:器件与连线此刻都已落地,版面问题是可后修的,把它变成
 // 整单失败反而会诱导重跑一遍(而 apply 不幂等)。但它必须出现 —— 这一类问题
 // `layout-lint` 默认根本看不见(非 part 图元全被排除),不报就是假绿。
-func bapReportClusters(cfg *appConfig, window string, man *bapManifest, stderr io.Writer) {
+func bapReportClusters(cfg *appConfig, window string, man *bapManifest, stderr io.Writer) *schPageFit {
 	res, err := requestAction(cfg, "schematic.components.list", window,
 		map[string]any{"includeBBox": true, "includePins": true})
 	if err != nil {
 		fmt.Fprintf(stderr, "warn: 虚拟组体检读不到几何(%v)—— 请手动跑 `easyeda sch clusters`\n", err)
-		return
+		return nil
 	}
 	comps, perr := parseLayoutComps(res.Result)
 	if perr != nil {
 		fmt.Fprintf(stderr, "warn: 虚拟组体检解析失败(%v)—— 请手动跑 `easyeda sch clusters`\n", perr)
-		return
+		return nil
 	}
 	wires, _ := fetchSchWirePolylines(cfg, window, "") // 读不到就只按 marker 归属算
 	clusters, _ := buildSchClusters(comps, wires)
 	var usable *layoutBBox
-	if sheet := sheetBBoxOf(comps); sheet != nil {
-		usable = &layoutBBox{
-			MinX: sheet.MinX + sheetEdgeMinGap, MinY: sheet.MinY + sheetEdgeMinGap,
-			MaxX: sheet.MaxX - sheetEdgeMinGap, MaxY: sheet.MaxY - sheetEdgeMinGap,
-		}
+	var keepout *layoutBBox
+	sheet := sheetBBoxOf(comps)
+	if sheet != nil {
+		u := schUsableArea(*sheet)
+		usable = &u
+		// 图签 keep-out 传**未膨胀**的:膨胀带(titleBlockSafety)是分区框的区名带/
+		// 说明带留白,虚拟组不带任何带 —— 用它会凭空严格一档,把"挪一挪能解"误判成
+		// "这一页放不下"(那正是本判据要防的反向错误)。
+		keepout, _ = titleBlockKeepout(sheet)
 	}
 	// minGap 0:这一步只报硬伤(重叠 / 出图纸),过近留给 `sch clusters --strict`。
 	findings := judgeSchClusters(clusters, usable, 0)
+	// **本次落的这个块,整组量下来到底装不装得进这一页** —— 这一句是 #181 第三份
+	// 复盘的最大卡点(legacy 块真实高 700–840,反复 8+ 轮手工收敛)缺的那句话。
+	// 此前这里最多报「探出图纸可用区」,读起来像"挪一挪",于是人就真的去挪了 8 轮;
+	// 而高度比整页可用高还大时,**挪多少次都没用**。判定用实测 bbox(铁律)。
+	fit := bapBlockPageFit(clusters, man, usable, keepout)
+	if fit != nil && fit.TooBig() {
+		man.Warnings = append(man.Warnings, fit.Advice)
+		fmt.Fprintf(stderr, "clusters ✗ %s\n", fit.Advice)
+	}
 	if len(findings) == 0 {
 		fmt.Fprintf(stderr, "clusters ✓ %d 个虚拟组:0 重叠 / 0 出图纸(器件 + 它自己的 marker/桩线)\n", len(clusters))
-		return
+		return fit
 	}
 	for _, f := range findings {
 		var w string
@@ -560,6 +606,61 @@ func bapReportClusters(cfg *appConfig, window string, man *bapManifest, stderr i
 	}
 	fmt.Fprintf(stderr, "clusters: %d 个组、%d 处硬伤 —— 详情与门禁跑 `easyeda sch clusters --strict`\n",
 		len(clusters), len(findings))
+	return fit
+}
+
+// bapBlockPageFit 量**本次落的这个块**在这一页的处境。
+//
+// 口径:取本实例全部位号所触及的虚拟组(cluster = 器件 ∪ 它自己的 marker/桩线)的
+// **并集框** —— 这才是这块真正占的地。只看单个器件 bbox 会系统性低估:复盘里那些
+// 700–840 高的块,一半的高是竖排 marker 撑出来的。
+//
+// 返回 nil 的两种情形都必须是"不下结论",而不是"没问题":页面没有图框(量不出
+// 可用区),或本实例的位号一个都没匹配上 cluster(读回来的几何与 manifest 对不上)。
+// 装配判据宁可沉默也不许猜 —— 猜出来的 fits 会直接掩盖掉这次要报的那句话。
+func bapBlockPageFit(clusters []schCluster, man *bapManifest, usable, keepout *layoutBBox) *schPageFit {
+	if usable == nil || man == nil {
+		return nil
+	}
+	mine := map[string]bool{}
+	for _, p := range man.Placed {
+		if d := strings.TrimSpace(p.Designator); d != "" {
+			mine[strings.ToUpper(d)] = true
+		}
+	}
+	if len(mine) == 0 {
+		return nil
+	}
+	var box layoutBBox
+	first := true
+	for _, c := range clusters {
+		if !mine[strings.ToUpper(strings.TrimSpace(c.Designator))] {
+			continue
+		}
+		// c.Box 是「本体 ∪ 归属 marker ∪ 归属桩线」—— 组真正占的地,不是器件 bbox。
+		if first {
+			box, first = c.Box, false
+			continue
+		}
+		box = schUnionBBox(box, c.Box)
+	}
+	if first {
+		return nil
+	}
+	name := strings.TrimSpace(man.GroupName)
+	if name == "" {
+		name = strings.TrimPrefix(strings.TrimSpace(man.BlockID), "block.")
+	}
+	f := judgeSchPageFit(name, box, *usable, keepout)
+	return &f
+}
+
+// schUnionBBox 是两框的包络。
+func schUnionBBox(a, b layoutBBox) layoutBBox {
+	return layoutBBox{
+		MinX: math.Min(a.MinX, b.MinX), MinY: math.Min(a.MinY, b.MinY),
+		MaxX: math.Max(a.MaxX, b.MaxX), MaxY: math.Max(a.MaxY, b.MaxY),
+	}
 }
 
 // judgeSchClusters 是不带分组信息的旧签名(纯几何,同组不豁免)。
