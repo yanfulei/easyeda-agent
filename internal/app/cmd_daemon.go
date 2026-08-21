@@ -165,10 +165,20 @@ func newDaemonHealthCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command
 				portStart: portStart,
 				portEnd:   portEnd,
 			})
+			// Attach the version-consistency verdict — the same judgement that
+			// refuses a mismatched dispatch (version_gate.go), so `health` is
+			// where you SEE it instead of first tripping over it mid-flow.
+			if result.Found != nil {
+				rep := versionGateFromHealth(result.Found.Raw)
+				result.VersionGate = &rep
+			}
 			enc := json.NewEncoder(stdout)
 			enc.SetIndent("", "  ")
 			if err := enc.Encode(result); err != nil {
 				return fmt.Errorf("encode health: %w", err)
+			}
+			if result.VersionGate != nil {
+				fmt.Fprintln(stderr, versionGateSummary(*result.VersionGate))
 			}
 			if result.Found == nil {
 				return errActionFailed // daemon absent; response already printed

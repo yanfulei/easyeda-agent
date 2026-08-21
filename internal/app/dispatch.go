@@ -49,6 +49,11 @@ type appConfig struct {
 	// forceUnsafe escalates forceReason past a fully-unconfirmed mechanical
 	// skeleton (issue #132) — set only by --force-unsafe.
 	forceUnsafe bool
+	// skipVersionCheck disarms the CLI↔daemon↔connector version consistency gate
+	// (--skip-version-check, or EASYEDA_SKIP_VERSION_CHECK=1). Every bypass of a
+	// BLOCKING verdict writes a `cli.version_check.skip` audit row — see
+	// version_gate.go.
+	skipVersionCheck bool
 	// staleReadReason is the ONE-CALL write-then-read opt-in past the daemon's
 	// STALE_READ gate. It is NOT bound to any flag and must never be set on the
 	// shared config: the only legal way to set it is staleReadOptIn(), which
@@ -765,6 +770,14 @@ func postAction(cfg *appConfig, action, window string, payload any, timeout time
 		return nil, fmt.Errorf("no easyeda-agent daemon found on %s:%s (start it with `easyeda daemon start`)", cfg.host, scan.Ports)
 	}
 
+	// 版本一致性门(issue #181):CLI / daemon / connector 错位会让**后续每一条
+	// 排查都染上噪音**(改好的 bug 在旧 daemon 上照样复现)。判据用的就是上面这
+	// 次 /health 扫描的报文 —— 零额外往返;每进程只判一次;`easyeda health` /
+	// `version` / `update` 不走这条路,所以诊断与修复路径不会被自己拦死。
+	if err := checkVersionGate(cfg, scan.Found.Raw, os.Stderr); err != nil {
+		return nil, err
+	}
+
 	body := map[string]any{"action": action}
 	// Identify this client process for audit attribution and the daemon's
 	// concurrent-writer advisory (issue #108).
@@ -876,11 +889,17 @@ type hostPortOptions struct {
 }
 
 type healthResult struct {
-	Status  string          `json:"status"`
-	Host    string          `json:"host"`
-	Ports   string          `json:"ports"`
-	Found   *daemonHealth   `json:"found,omitempty"`
-	Checked []checkedHealth `json:"checked"`
+	Status string        `json:"status"`
+	Host   string        `json:"host"`
+	Ports  string        `json:"ports"`
+	Found  *daemonHealth `json:"found,omitempty"`
+	// VersionGate is the CLI↔daemon↔connector consistency verdict, filled in by
+	// the `health` command (not by scanHealth — the dispatch path computes its
+	// own copy). It is the same judgement that refuses a mismatched dispatch,
+	// so `health` answers "will my next command be blocked, and how do I fix
+	// it" without the user having to trip the gate first.
+	VersionGate *versionGateReport `json:"versionGate,omitempty"`
+	Checked     []checkedHealth    `json:"checked"`
 }
 
 type checkedHealth struct {

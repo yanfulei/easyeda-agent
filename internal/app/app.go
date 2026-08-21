@@ -75,6 +75,8 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		"daemon port range (start-end)")
 	root.PersistentFlags().StringVar(&cfg.project, "project", "",
 		"route by project name/uuid instead of --window (survives windowId churn)")
+	root.PersistentFlags().BoolVar(&cfg.skipVersionCheck, "skip-version-check", false,
+		"run even when CLI / daemon / connector versions disagree (audited escape hatch; also EASYEDA_SKIP_VERSION_CHECK=1)")
 	root.PersistentFlags().StringVar(&cfg.doc, "doc", "",
 		"pin every mutating action to this schematic page / PCB (uuid or name): the CLI switches to it and confirms via live document.current before editing, refusing rather than land the edit on whatever page is foreground — removes the doc-switch race")
 
@@ -92,7 +94,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newSchCmd(cfg, stdout, stderr),
 		newPcbCmd(cfg, stdout, stderr),
 		newWorkflowCmd(cfg, stdout, stderr),
-		newSpecCmd(stdout, stderr),
+		newSpecCmd(cfg, stdout, stderr),
 		newBoardCmd(cfg, stdout, stderr),
 		newViewCmd(cfg, stdout, stderr),
 		newBomCmd(cfg, stdout, stderr),
