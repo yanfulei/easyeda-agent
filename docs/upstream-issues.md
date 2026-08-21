@@ -2,23 +2,25 @@
 
 > 我们向官方 `easyeda/pro-api-sdk` 提交 / 跟踪的 issue 全量进度,方便后续回顾。
 > 每条记录:挡住我们哪条能力线 → 官方最后回应 → 当前状态 → 我方 workaround / 待办。
-> **最后核对:2026-07-07。** 更新方式见 memory `upstream-issues-watchlist`(每次任务分析必查)。
+> **最后核对:2026-08-22。** 更新方式见 memory `upstream-issues-watchlist`(每次任务分析必查)。
 >
-> 本地 EDA:**web 版(嘉立创EDA专业版 / JLCEDA Pro)**,版本 **3.2.148**(编译 2026-06-01)。
+> 本地 EDA:**web 版(嘉立创EDA专业版 / JLCEDA Pro)**,版本 **3.2.149.88089769**(2026-08-22 实测)。
 > 版本 API:`eda.sys_Environment.getEditorCurrentVersion()`。
 
 ## 汇总表
 
 | # | 我方? | 提交 | 主题 | 状态 | 官方最后回应 | 我方 workaround / 待办 |
 |---|:---:|---|---|---|---|---|
-| [#27](https://github.com/easyeda/pro-api-sdk/issues/27) | 跟评 | 04-17(butterfly2sea) | sch DRC `includeVerboseError` 返回 boolean 与类型不符 | **open** | `includeVerboseError` 已在 **EDAv4.2** 支持,等升级(07-06) | 等 v4.2;到手后 `sch check` 去掉几何重建([[schematic-drc-aggregate-only]]) |
+| [#27](https://github.com/easyeda/pro-api-sdk/issues/27) | 跟评 | 04-17(butterfly2sea) | sch DRC `includeVerboseError` 返回 boolean 与类型不符 | **open** | `includeVerboseError` 已在 **EDAv4.2** 支持,等升级(07-06);**另一用户 07-31 追问「一个月了 v4.2 还没见到」,官方未再回** | 等 v4.2;到手后 `sch check` 去掉几何重建([[schematic-drc-aggregate-only]])。**v4.2 迟迟不落 web 通道,别把任何能力押在它身上** |
 | [#28](https://github.com/easyeda/pro-api-sdk/issues/28) | ✅ | 06-29 | `pcb_Document.autoRouting` 运行时 undefined(@alpha) | **CLOSED / completed** | 已在 **EDA v3.2.150** 添加(07-06) | **卡版本**:本地 web 3.2.148 < 3.2.150,`autoRouting` 仍 undefined → 升级后再 probe,可用则回收 Freerouting 外包 |
 | [#29](https://github.com/easyeda/pro-api-sdk/issues/29) | ✅ | 06-29 | `getDsnFile` 导出 DSN 丢禁止区域 keep-out | **CLOSED / wontfix** | EDA 无 Keepout 层,DSN 用 **SMD 游离焊盘**表禁布区=正解;挡不住布线去 `easyeda-pcb-router` 扩展反馈(07-06) | 天线 keepout **每层独立 region** 校验([[pcb-antenna-keepout]])保留;单层游离焊盘挡不住多层净空,不依赖此链路 |
 | [#30](https://github.com/easyeda/pro-api-sdk/issues/30) | ✅ | 07-03 | `sch_Netlist.getNetlist()` 悬空引脚下无限卡死 | **CLOSED / completed**,`seems like AI` | `getNetlist()` 是 v2.2 接口、**v3 已移除(@deprecated)**,用 `getNetlistFile()`;**并训:AI 提单请人工校对文档**(07-06) | 早已改用 `getNetlistFile()`([[programmatic-schematic-no-netlist]]),无剩余动作 |
 | [#31](https://github.com/easyeda/pro-api-sdk/issues/31) | ✅ | 07-03 | 4 层板 track↔via 不连通,DRC 恒报 Connection Error | **CLOSED / not_planned** | 线上无法复现,只报网表不匹配;要原样代码(07-07) | **我方误诊,已闭环**:真机复测证明 track↔via 会连通(真身是 pour stale,pour-rebuild 即复原);删 via-bond 规则 + via-hop bondFill 改 opt-in,回帖关单([[pcb-via-track-bond-rules]]) |
-| [#32](https://github.com/easyeda/pro-api-sdk/issues/32) | ✅ | 07-03 | PLANE 生成后新异网 via 不挖 anti-pad,重建铺铜不修复 | **open** | 官方零回复(仅我方补充挖槽同理,07-03) | `pcb check` **via-crosses-plane** 规则 + 修法(删 via 走外层 / doc reload + pour-rebuild)保留 |
-| [#33](https://github.com/easyeda/pro-api-sdk/issues/33) | ✅ | 07-03 | API 放置焊盘 number 读回 null + DRC 无结构化明细 | **open** | 零回复 | pad-number 恒 1 条 Netlist Error 白名单 + net degree 机械自证保留 |
-| [#34](https://github.com/easyeda/pro-api-sdk/issues/34) | ✅ | 07-06 | 新建未重载 PCB 的 reflow 用创建时规则快照 | **open**,`seems like AI` + `help wanted` | 无文字回复,仅打标签(07-07) | `drc-rules-set` + `doc reload` + 二次 `pour-rebuild` 4 步配方([[pour-reflow-divergence-and-rules-api]])保留 |
+| [#32](https://github.com/easyeda/pro-api-sdk/issues/32) | ✅ | 07-03 | PLANE 生成后新异网 via 不挖 anti-pad,重建铺铜不修复 | **open** | Xieguangyuan(07-08):**这是预期行为** —— 需在 PCB 设置里勾选**「自动重建铺铜区域」**(附截图) | `pcb check` **via-crosses-plane** 规则 + 修法保留;**待办**:查该设置有无 API,能否在 `power-planes` 流程里自动开 |
+| [#33](https://github.com/easyeda/pro-api-sdk/issues/33) | ✅ | 07-03 | API 放置焊盘 number 读回 null + DRC 无结构化明细 | **open** | Xieguangyuan(07-08):**内部最新 3.2 已无此问题**,等新版上线后复测 | pad-number 恒 1 条 Netlist Error 白名单 + net degree 机械自证保留;**待办**:本地 3.2.149 复测 |
+| [#34](https://github.com/easyeda/pro-api-sdk/issues/34) | ✅ | 07-06 | 新建未重载 PCB 的 reflow 用创建时规则快照 | **open**,`seems like AI` + `help wanted` | Xieguangyuan(07-08):**线上最新版已无此问题**,并附「覆写当前设计规则.js」官方示例 | 4 步配方([[pour-reflow-divergence-and-rules-api]])保留;**待办**:对照官方示例核对我们的规则覆写调用形状 |
+| [#35](https://github.com/easyeda/pro-api-sdk/issues/35) | ✅ | 07-07 | **开放「组合 / 多通道复用(Reuse Block / Group ID / Channel ID)」读写 API** | **open**,`enhancement` + `seems like AI` | **零文字回复**,仅 07-08 打标签 | `schematic.group.move` 无状态虚拟分组([[easyeda-native-group-no-api]])顶着;**08-22 于 3.2.149 复验:三扇门仍全关**(读 3 路全失败 / 写静默丢弃 / `lib_Cbb.search('')`=0) |
+| [#36](https://github.com/easyeda/pro-api-sdk/issues/36) | ✅ | 07-24 | `sch_PrimitiveText.delete` 返回成功但未入持久化事务,存盘重开文字复活 | **open** | 零回复 | 删文字后必须**存盘再回读**验证,不信 delete 回执 |
 
 ## 待定项(已登记,**未**提交)
 
