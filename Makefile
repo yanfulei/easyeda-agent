@@ -155,6 +155,18 @@ endif
 	@echo "  syncing skill version to $(VERSION)..."
 	@# SKILL.md 的 metadata.version 不会被 clawhub/gh 自动更新 —— 不同步就漂移。
 	python3 scripts/sync-skill-version.py $(VERSION:v%=%)
+	@# 上面两步会改工作区(extension.json / package.json / SKILL.md)。**必须在打 tag
+	@# 之前提交**,否则 tag 指向的 commit 里版本号还是旧的 —— v1.1.1 就这么发出去过:
+	@# .eext 产物是 1.1.1(bump 在打包之前),但 `git show v1.1.1:extension/extension.json`
+	@# 是 1.1.0,从 tag 检出源码构建会得到落后一个 patch 的连接器。
+	@if ! git diff --quiet -- extension/extension.json extension/package.json skills/easyeda-agent/SKILL.md; then \
+		echo "  committing version sync..."; \
+		git add extension/extension.json extension/package.json skills/easyeda-agent/SKILL.md && \
+		git commit -q -m "chore(release): sync version files to $(VERSION)" && \
+		echo "    committed"; \
+	else \
+		echo "  version files already in sync"; \
+	fi
 	npm --prefix extension run typecheck
 	npm --prefix extension run build
 	@echo "  compiling CLI..."
