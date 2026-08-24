@@ -57,7 +57,7 @@ EasyEDA tooling.
 2. **只用 typed `easyeda` action** — 只有无对应 typed action **且**用户明确接受 debug 路径时才 `debug.exec_js`。
 3. **mutate 前先 inspect** — 放/移/连/同步/存之前先读 doc/页/器件/引脚/板层/网络/规则,别盲改;破坏性操作(clear/delete/bulk import)先确认。
 4. **无图纸不摆放/布线** — 找不到 sheet 立即停,让用户建/批准 A4(默认 A4)。→ design-flow S1
-5. **PCB mutation(rip-up/route/delete/via/track)后先 `easyeda doc reload` 再读/判/DRC** — **机械强制**:不 reload 就读,daemon 直接拒(`STALE_READ`)并告诉你下一步该跑什么;同网 Connection Error 暴增先 `pour-rebuild`,不是真断。→ pcb.md「PCB mutation → doc reload 门」
+5. **PCB mutation(rip-up/route/delete/via/track)后先 `easyeda doc reload` 再读/判/DRC** — **机械强制**:不 reload 就读,daemon 直接拒(`STALE_READ`)并告诉你下一步该跑什么;同网 Connection Error 暴增先 `pour-rebuild`,不是真断。**正常修法永远是 `doc reload`**;确需读旧状态才用逃生口 `--force-stale-read "<理由>"`(入审计、只放 PCB 读、解不开布线门;**不是** `--force`——那是布线阶段门)。→ pcb.md「PCB mutation → doc reload 门」
 6. **判对错只看 `list/check/drc/layout-lint/layout-score`,不看截图** — 截图会 stale/blank;data 有内容但截图空 = 窗口没渲染(切前台),不是设计错。(`layout-score` 是**诊断视角不是门**——门只有 `layout-lint --gate` 一个;且它的 `skipped` 维是「没测」不是「满分」。)`pcb drc/check` 这类重画布计算**需 PCB 在前台**,超时=切前台**单发一次、绝不循环重试**(重发被 `ACTION_BUSY` 拒)。**录制/演示模式例外**:截图变交付物 → design-flow 录制/演示模式。
 7. **每过一个阶段门显式 `save`(sch/PCB)** — place/wire/modify 只改内存,autosave 只兜底;整板每 ~10 件 save 一次。→ design-flow S 段 💾
 8. **手工连任何已知外围前先查块库 `easyeda blocks`**(离线,无需 daemon/窗口)— `blocks ls` 看全量,照抄验证过的块只重绑端口。**查不到 → 起草 `block-gap` issue;块用出问题(脚名不符/拓扑错/停产)→ 起草 `block-bug` issue 带证据 —— 都必须经用户确认后才 `gh issue create`,绝不自动上报**。→ ② 块地图速查 · standard-blocks-contributing.md §七

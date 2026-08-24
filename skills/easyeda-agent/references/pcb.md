@@ -622,7 +622,7 @@ rip-up / route / delete / via / track / pour 这类 mutation 之后,
 ```
 STALE_READ: pcb.components.list —— PCB 自 pcb.line.create 后未 reload,读到的是旧引擎状态。
 下一步: easyeda doc reload --project <name>
-(绕过: --force-reason "<理由>",入审计)
+(绕过: --force-stale-read "<理由>",入审计)
 ```
 
 - **修法就一条**:`easyeda doc reload --project <name>`(它自己会先 save,不丢改动)。
@@ -634,7 +634,8 @@ STALE_READ: pcb.components.list —— PCB 自 pcb.line.create 后未 reload,读
   —— 这些不脏化枚举,不会 arm 这道门。
 - **`pcb snapshot` 不被拦**(它是画布的照片,不是枚举),但仍会带 `staleRisk` 提示。
   注意:截图发白/发旧的修法是**把窗口切前台**,不是 reload——两回事。
-- **绕过**:`--force-reason "<理由>"`。只授权本次调用,**入审计**
+- **绕过**:`--force-stale-read "<理由>"`(**不是** `--force` —— 那是布线阶段门 #132,
+  两者互不相干别混用)。只授权本次调用,**入审计**
   (审计里记成 `daemon.stale_read.force`),窗口仍然是脏的,下一条无 force 的读照样被拒。
 
 > 为什么升成硬门:49 天 171554 条审计记录里,这条规则此前只发一句非阻塞警告,
