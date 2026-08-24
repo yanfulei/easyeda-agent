@@ -157,7 +157,7 @@ func TestBapBackfillSpec_WindowRouteBackfills(t *testing.T) {
 	cfg, d := newSbwDaemon(t, `{"uuid":"66458be3-x","name":"ceshi","friendlyName":"ceshi"}`)
 
 	var errBuf strings.Builder
-	bapBackfillSpec(cfg, "w1", path, &errBuf)
+	bapBackfillSpec(cfg, "w1", path, schPageIdentity{}, &errBuf)
 
 	if got := strings.Join(sbwParts(t, path), ","); got != "C11,U3" {
 		t.Fatalf("--window 路由没有真的回填,parts=%v\nstderr:\n%s", got, errBuf.String())
@@ -186,14 +186,14 @@ func TestBapBackfillSpec_WindowAndProjectResolveSameKey(t *testing.T) {
 	pathWin := sbwWriteSpec(t)
 	cfgWin, dWin := newSbwDaemon(t, `{"uuid":"66458be3-x","name":"ceshi","friendlyName":"ceshi"}`)
 	var winErr strings.Builder
-	bapBackfillSpec(cfgWin, "w1", pathWin, &winErr)
+	bapBackfillSpec(cfgWin, "w1", pathWin, schPageIdentity{}, &winErr)
 
 	// ② --project 路由:cfg.project 直接给名字。
 	pathProj := sbwWriteSpec(t)
 	cfgProj, dProj := newSbwDaemon(t, `{"uuid":"66458be3-x","name":"ceshi","friendlyName":"ceshi"}`)
 	cfgProj.project = "ceshi"
 	var projErr strings.Builder
-	bapBackfillSpec(cfgProj, "", pathProj, &projErr)
+	bapBackfillSpec(cfgProj, "", pathProj, schPageIdentity{}, &projErr)
 
 	winParts := strings.Join(sbwParts(t, pathWin), ",")
 	projParts := strings.Join(sbwParts(t, pathProj), ",")
@@ -233,7 +233,7 @@ func TestBapBackfillSpec_UnresolvableProjectHintIsRunnable(t *testing.T) {
 	cfg, _ := newSbwDaemon(t, "") // project.current 直接失败
 
 	var errBuf strings.Builder
-	bapBackfillSpec(cfg, "w1", path, &errBuf)
+	bapBackfillSpec(cfg, "w1", path, schPageIdentity{}, &errBuf)
 	out := errBuf.String()
 
 	if strings.Contains(out, "--project  ") || strings.Contains(out, "--project --write") {

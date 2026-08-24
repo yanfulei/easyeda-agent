@@ -194,7 +194,7 @@ func TestRunSpecBackfill_EndToEndOffline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, patched, err := runSpecBackfill(path, "ceshi")
+	res, patched, err := runSpecBackfill(path, "ceshi", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestRunSpecBackfill_EndToEndOffline(t *testing.T) {
 		t.Fatalf("落盘的位号不对:%v", probe.Modules[0].Parts)
 	}
 	// 再跑一遍必须是无变化(幂等)—— 否则每次落块都会产生一次假 diff。
-	res2, _, err := runSpecBackfill(path, "ceshi")
+	res2, _, err := runSpecBackfill(path, "ceshi", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestRunSpecBackfill_NoProjectIsAnActionableError(t *testing.T) {
 	if err := os.WriteFile(path, []byte(specFixture), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := runSpecBackfill(path, "")
+	_, _, err := runSpecBackfill(path, "", "")
 	if err == nil || !strings.Contains(err.Error(), "--project") {
 		t.Fatalf("缺 --project 时的报错要直接给出下一步,got %v", err)
 	}
@@ -249,7 +249,7 @@ func TestRunSpecBackfill_NoGroupsWarnsInsteadOfSilentNoop(t *testing.T) {
 	if err := os.WriteFile(path, []byte(specFixture), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, _, err := runSpecBackfill(path, "nosuch")
+	res, _, err := runSpecBackfill(path, "nosuch", "")
 	if err != nil {
 		t.Fatal(err)
 	}

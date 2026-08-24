@@ -120,6 +120,13 @@ type schConvergeLedger struct {
 // schConvergeLedgerPath 与 workflow 状态同目录(~/.easyeda-agent/workflow/),
 // 但**是独立文件**:台账是可丢弃的诊断数据,不该和工作流阶段门(会被 confirm /
 // fingerprint 校验)搅在一个 JSON 里 —— 一方写坏不该拖垮另一方。
+//
+// project 必须是 **resolveStageProject 的结果**,不能是裸 cfg.project:`--window`
+// 路由时后者是空串,SanitizeKey("") 落到 `_active.json`,于是所有匿名工程的失败
+// 签名混在同一个桶里 —— 甲工程的 3 次失败会去拦乙工程的第 1 次尝试。账页虽然按
+// documentUuid 分键(跨工程不会撞),但一个共享文件仍然意味着并发写互相覆盖,
+// 以及「这本账到底是谁的」无从回答。用同一个解析函数还顺带保证台账与 workflow
+// 状态落在同一套键上(两处算一次)。
 func schConvergeLedgerPath(project string) string {
 	return filepath.Join(workflow.Dir(), "converge-"+workflow.SanitizeKey(project)+".json")
 }
@@ -321,6 +328,44 @@ func schActionDocUUID(res *actionResult) string {
 		return ""
 	}
 	return strings.TrimSpace(res.Context.DocumentUUID)
+}
+
+// schPageIdentity 是一块画布的工程身份:落文件用的键 + 活体工程 uuid。
+//
+// 两个字段的用途**不同**,不能混:
+//   - Project 是**文件键**(台账 / workflow 状态按它分文件)。人敲的 --project
+//     必须赢,否则他敲得出的名字定位不到自己的状态。
+//   - UUID 是**身份**。名字会被同名重建复用(`ceshi` 删掉重建三次都叫 ceshi),
+//     只有 uuid 能把「这一页记账是谁的」说清楚。
+type schPageIdentity struct {
+	Project string
+	UUID    string
+}
+
+// schPageIdentityOf 从**已经拿到的响应信封**里读工程身份 —— 零额外往返:每条
+// 响应的 context 都带 projectName / projectUuid。
+//
+// 为什么不直接调 resolveStageProject:它在没有 --project 时要发一次
+// `project.current`。对 block-apply 这类动作序有不变式的命令(读引脚会毒化紧随
+// 的 modify,单测钉着"布局门之后不许再有读"),平白插一条读是行为回归。既然
+// 信封里已经有了,就不该再问一遍。
+func schPageIdentityOf(cfg *appConfig, res *actionResult) schPageIdentity {
+	id := schPageIdentity{Project: strings.TrimSpace(cfg.project)}
+	if res == nil || res.Context == nil {
+		return id
+	}
+	id.UUID = strings.TrimSpace(res.Context.ProjectUUID)
+	if id.Project != "" {
+		return id
+	}
+	// --window 路由:没有人敲的名字,信封里的工程名就是最好的键。此前这里落到
+	// 空串 → SanitizeKey("") → `_active.json`,所有匿名工程混在一个桶里。
+	if name := strings.TrimSpace(res.Context.ProjectName); name != "" {
+		id.Project = name
+		return id
+	}
+	id.Project = id.UUID
+	return id
 }
 
 // schConvergeRecords 返回排好序的账页(诊断/测试用,同输入同输出)。

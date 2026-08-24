@@ -112,9 +112,18 @@ type specGroupSource struct {
 // **跨页收集是有意的**:S0 的模块与原理图分页是两个维度(一个模块可能被拆到
 // 两页,或者干脆被移到了别的页)。按页过滤会让「模块搬了页 → 回填悄悄漏掉它」,
 // 而那正是回填要根治的那类静默失效。
-func specCollectGroups(st *workflow.State) []specGroupSource {
+//
+// **但跨页也正是同名重建污染的唯一入口**:状态文件按工程名分文件,`ceshi` 删掉
+// 重建三次就把四个工程的页堆进一个文件;页级读取(GroupsForPage)天然免疫(死
+// 工程的 documentUuid 配不上活页),而这里会把死页的组正常收进来 —— 同一个块在
+// 死页和活页各有一个组,回填就把两页的 members 并起来,写出一份画布上根本不存在
+// 的位号表,全程零报错。所以按 liveUUID 收窄:**已证明属于别的工程**的页不参与。
+// 收窄掉的页必须返回给调用方报出来 —— 静默地少收几页,与静默地多收几页一样坏。
+//
+// liveUUID 为空(离线且文件里也没记过 uuid)时不收窄,行为与收窄前完全一致。
+func specCollectGroups(st *workflow.State, liveUUID string) (sources []specGroupSource, skippedPages []string) {
 	if st == nil {
-		return nil
+		return nil, nil
 	}
 	var out []specGroupSource
 	pages := make([]string, 0, len(st.GroupsByPage))
@@ -123,6 +132,12 @@ func specCollectGroups(st *workflow.State) []specGroupSource {
 	}
 	sort.Strings(pages) // 同输入同输出
 	for _, p := range pages {
+		if !st.PageInScope(p, liveUUID) {
+			if len(st.GroupsByPage[p]) > 0 {
+				skippedPages = append(skippedPages, p)
+			}
+			continue
+		}
 		for _, g := range st.GroupsByPage[p] {
 			if g == nil || len(g.Members) == 0 {
 				continue
@@ -140,7 +155,7 @@ func specCollectGroups(st *workflow.State) []specGroupSource {
 			})
 		}
 	}
-	return out
+	return out, skippedPages
 }
 
 // specMatchGroups 给一个 spec 模块挑出它的事实来源。

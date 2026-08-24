@@ -159,13 +159,25 @@ type Fingerprint struct {
 
 // State is the persisted per-project record.
 type State struct {
-	Project   string            `json:"project"`
-	Confirmed map[Stage]bool    `json:"confirmed"`
-	Assembly  *AssemblyProfile  `json:"assembly,omitempty"`
-	Layout    *GateSummary      `json:"layoutGate,omitempty"`
-	Check     *CheckGateSummary `json:"checkGate,omitempty"`
-	LayoutFP  *Fingerprint      `json:"layoutFingerprint,omitempty"`
-	OutlineFP *Fingerprint      `json:"outlineFingerprint,omitempty"`
+	Project string `json:"project"`
+	// ProjectUUID is the EasyEDA project uuid this state was last bound to.
+	// The FILE is still keyed by name (people type names, and --project must keep
+	// finding their state), but the IDENTITY lives in the data — a project deleted
+	// and re-created under the same name gets a new uuid, and without this field
+	// its page bookkeeping merged into its predecessor's file with zero errors
+	// (7 pages, 4 of them from dead projects, observed on a real ceshi.json).
+	// See identity.go for the full mechanism.
+	ProjectUUID string `json:"projectUuid,omitempty"`
+	// PageOwners maps documentUuid → the project uuid that wrote that page's
+	// bookkeeping ("-"/ForeignOwner = proven NOT to belong to the bound project).
+	// Consumed by the CROSS-PAGE readers only; per-page reads never needed it.
+	PageOwners map[string]string `json:"pageOwners,omitempty"`
+	Confirmed  map[Stage]bool    `json:"confirmed"`
+	Assembly   *AssemblyProfile  `json:"assembly,omitempty"`
+	Layout     *GateSummary      `json:"layoutGate,omitempty"`
+	Check      *CheckGateSummary `json:"checkGate,omitempty"`
+	LayoutFP   *Fingerprint      `json:"layoutFingerprint,omitempty"`
+	OutlineFP  *Fingerprint      `json:"outlineFingerprint,omitempty"`
 	// PowerTracksNets are the power nets `pcb power-planes` DELIBERATELY did not
 	// pour: every inner plane layer was already assigned (GND + the largest power
 	// net), so it routed these as fat tracks instead (its `routedAsTracks`
@@ -222,6 +234,11 @@ type State struct {
 	SchZoneFrameIdsByPage map[string]*SchZoneFrames `json:"schZoneFrameIdsByPage,omitempty"`
 	History               []Event                   `json:"history,omitempty"`
 	UpdatedAt             string                    `json:"updatedAt"`
+
+	// bound is the LIVE project uuid this in-memory state was bound to (see
+	// Bind). Not persisted: it is a fact about this process's window, not about
+	// the file. Page writes stamp PageOwners with it.
+	bound string
 }
 
 // SchZoneClaim is one module's schematic zone claim. Page preserves the source
@@ -278,6 +295,7 @@ func (s *State) SetSchZonesForPage(documentUUID string, z map[string]*SchZoneCla
 		delete(s.SchZonesByPage, documentUUID)
 	} else {
 		s.SchZonesByPage[documentUUID] = z
+		s.stampPage(documentUUID)
 	}
 	s.History = append(s.History, Event{
 		Stage: "sch-zones", At: time.Now().Format(time.RFC3339), Action: "confirm",
@@ -289,6 +307,9 @@ func (s *State) SetSchZonesForPage(documentUUID string, z map[string]*SchZoneCla
 // used by a multi-page S0 spec, where modules[].page resolves to document UUIDs.
 func (s *State) ReplaceSchZonesByPage(z map[string]map[string]*SchZoneClaim) {
 	s.SchZonesByPage = z
+	for page := range z {
+		s.stampPage(page)
+	}
 	s.History = append(s.History, Event{
 		Stage: "sch-zones", At: time.Now().Format(time.RFC3339), Action: "confirm",
 		Note: fmt.Sprintf("%d schematic page zone table(s)", len(z)),
@@ -351,8 +372,14 @@ func (s *State) SetGroupsForPage(documentUUID string, groups []*Group) {
 		if len(s.GroupsByPage) == 0 {
 			s.GroupsByPage = nil
 		}
+		// The owner stamp outlives an empty group table only if some OTHER table
+		// still keys this page — otherwise it is orphan bookkeeping.
+		if len(s.SchZonesByPage[documentUUID]) == 0 && s.SchZoneFrameIdsByPage[documentUUID] == nil {
+			s.forgetPage(documentUUID)
+		}
 	} else {
 		s.GroupsByPage[documentUUID] = groups
+		s.stampPage(documentUUID)
 	}
 	s.History = append(s.History, Event{
 		Stage: "sch-groups", At: time.Now().Format(time.RFC3339), Action: "confirm",

@@ -40,7 +40,10 @@ func groupMoveRebuild(cfg *appConfig, window, groupRef string, dx, dy float64,
 func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy float64, maxAttempts int,
 	stdout, stderr io.Writer) error {
 
-	pinned, win, docUUID, _, st, _, err := loadSchGroupsContext(cfg, window)
+	// project 一路带下来给收敛台账用:台账的文件键必须是 **resolveStageProject 的
+	// 结果**(loadSchGroupsContext 已经算过一次),不能是裸 cfg.project —— 后者在
+	// `--window` 路由时是空串,所有匿名工程会共用 `_active.json` 那一个桶。
+	pinned, win, docUUID, project, st, _, err := loadSchGroupsContext(cfg, window)
 	if err != nil {
 		return err
 	}
@@ -126,7 +129,7 @@ func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy
 		}
 	}
 	if maxAttempts > 0 {
-		if stop := schConvergeGate(cfg.project, ckey, maxAttempts); stop != nil {
+		if stop := schConvergeGate(project, ckey, maxAttempts); stop != nil {
 			return stop
 		}
 	}
@@ -174,7 +177,7 @@ func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy
 			next = pageFit.Advice
 		}
 		if maxAttempts > 0 {
-			schConvergeNoteFailure(cfg.project, ckey,
+			schConvergeNoteFailure(project, ckey,
 				schConvergeSignature("clamp-refused", strings.Join(clampRep.Axes, ";")),
 				pageFit, next, maxAttempts, stderr)
 		}
@@ -201,7 +204,7 @@ func groupsMoveRebuild(cfg *appConfig, window string, groupRefs []string, dx, dy
 	}
 	// 真挪成了就销账 —— 不销的话,历史上那几次被钳的记录会一直拦着这个组。
 	if maxAttempts > 0 {
-		schConvergeNoteSuccess(cfg.project, ckey)
+		schConvergeNoteSuccess(project, ckey)
 	}
 	for _, line := range groupMoveResultLines(groupLabel, len(rep.Moved), clampRep) {
 		fmt.Fprintln(stdout, line)

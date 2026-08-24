@@ -95,11 +95,35 @@ type bapRollbackReport struct {
 	VerifyError           string   `json:"verifyError,omitempty"`
 }
 
-// fetchSchObstacles pulls the ACTIVE page's real part bboxes (best-effort) so
-// the planner can dodge them when picking the block origin.
+// fetchSchObstacles pulls the ACTIVE page's real primitive bboxes (best-effort)
+// so the planner can dodge them when picking the block origin.
 func fetchSchObstacles(cfg *appConfig, window string) []layoutBBox {
 	parts, _, _, _ := fetchSchObstaclesAndKeepout(cfg, window)
 	return parts
+}
+
+// schBlockObstacleBoxes 把一页的实测图元折成落点求解的障碍表 —— **全图元口径**:
+// 器件本体 + marker 的判定盒(本体 ∪ 文字带,markerJudgeBBox,与 `sch check` 的
+// marker-overlap、`sch clusters` 的虚拟组同一个函数)。图纸边框(componentType
+// = sheet)跨满整页,不算障碍(它由 Sheet/inBounds 那条路管)。
+//
+// 为什么必须含 marker(2026-08-20 esp32Mini 实测):U2 的本体只到 x=684,但它的
+// MCU_RX netport 连名字一路探到 x=490;只喂器件本体的话,求解器会把 LED 块放进
+// x=[350,570] 这个"看起来空"的地方,落完 clusters 立刻报「LED1 ↔ U2 图元重叠」。
+// 落点求解与组重叠判定必须是同一把尺,否则改进无法验收 —— 见 bapMarkerHalo。
+//
+// 桩线(marker 与引脚之间那一小段)不单独入表:它整段夹在宿主引脚与 marker 之间,
+// 两端都已在表里;而**跨器件的连线**按 clusters 的定义本来就不计入任何一组的体积
+// (那是组间通道,本该被穿过)。
+func schBlockObstacleBoxes(comps []layoutComp) []layoutBBox {
+	var out []layoutBBox
+	for _, c := range comps {
+		if c.BBox == nil || c.ComponentType == "sheet" {
+			continue
+		}
+		out = append(out, markerJudgeBBox(c))
+	}
+	return out
 }
 
 // fetchSchObstaclesAndKeepout is fetchSchObstacles plus the A4 title-block
@@ -131,15 +155,8 @@ func fetchSchObstaclesAndKeepout(cfg *appConfig, window string) ([]layoutBBox, *
 			break
 		}
 	}
-	kept, _ := filterLayoutComps(comps, false)
-	var out []layoutBBox
-	for _, c := range kept {
-		if c.BBox != nil {
-			out = append(out, *c.BBox)
-		}
-	}
 	tb, _ := titleBlockKeepout(sheet)
-	return out, tb, sheet, snapshot
+	return schBlockObstacleBoxes(comps), tb, sheet, snapshot
 }
 
 // verifyBlockLayout re-reads the page's real bboxes and pins after placement and
@@ -392,16 +409,21 @@ func parseKV(items []string, flag string) (map[string]string, error) {
 // (sch_converge_ledger.go)按页记账 —— 同一个块在 P1 放不下、在空白的 P2 上完全
 // 可能放得下,那正是「独立成页」这条出路的意义,所以页身份不能省。取不到时返回空串,
 // 台账退化成"整个工程一本账",不报错(诊断数据不该挡活)。
-func existingDesignators(cfg *appConfig, window string) (map[string]bool, string, error) {
+func existingDesignators(cfg *appConfig, window string) (map[string]bool, string, schPageIdentity, error) {
 	res, err := requestAction(cfg, "schematic.components.list", window,
 		map[string]any{"allPages": true, "tagPages": true})
 	if err != nil {
-		return nil, "", err
+		return nil, "", schPageIdentity{}, err
 	}
 	docUUID := ""
 	if res.Context != nil {
 		docUUID = strings.TrimSpace(res.Context.DocumentUUID)
 	}
+	// 工程标识**顺带从同一个信封里取**(每条响应都带 context.projectName/Uuid):
+	// 台账文件键与 spec 回填的收窄都要它,而再发一次 `project.current` 会往
+	// block-apply 的动作序里插一条读 —— 这条命令的动作序是有不变式的
+	// (读引脚会毒化紧随的 modify),单测也钉着它。零往返拿到才是对的解法。
+	ident := schPageIdentityOf(cfg, res)
 	out := map[string]bool{}
 	raw, _ := res.Result["components"].([]any)
 	for _, item := range raw {
@@ -413,7 +435,7 @@ func existingDesignators(cfg *appConfig, window string) (map[string]bool, string
 			out[strings.ToUpper(d)] = true
 		}
 	}
-	return out, docUUID, nil
+	return out, docUUID, ident, nil
 }
 
 // bapPlacedDesignator digs the authoritative designator out of a
@@ -773,13 +795,21 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	// (没有它就分不清「新出现」和「本来就在」,按坐标猜等于允许误删)。
 	var preplaceIDs map[string]bool
 	pageUUID := ""
+	// ident 是这块画布的工程身份(名字 + uuid),从第一条响应的信封里白拿。
+	// 台账按它分文件(而不是裸 cfg.project —— `--window` 路由时那是空串,所有
+	// 匿名工程会共用 `_active.json` 一个桶),spec 回填也按它的 uuid 收窄跨页组表。
+	ident := schPageIdentity{Project: strings.TrimSpace(cfg.project)}
 	if !dryRun || window != "" || cfg.project != "" {
-		if in.Existing, pageUUID, err = existingDesignators(cfg, window); err != nil {
+		if in.Existing, pageUUID, ident, err = existingDesignators(cfg, window); err != nil {
 			if !dryRun {
 				return err
 			}
 			fmt.Fprintf(stderr, "warn: could not read the page (%v) — planning against an empty page\n", err)
 			in.Existing = map[string]bool{}
+		}
+		if ident.Project == "" {
+			// 读失败把 ident 清成了零值 —— 人敲的 --project 仍然是权威的键。
+			ident.Project = strings.TrimSpace(cfg.project)
 		}
 		// Existing part bboxes (active page) so the block origin dodges them,
 		// plus the A4 title-block keep-out so a right/bottom origin never lands
@@ -803,12 +833,16 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	//      这个死结下唯一诚实的解法 —— 用上一轮的实测。
 	//   ② 同一个失败签名连续 maxAttempts 次 → 停,并复述那句可执行的下一步。
 	ckey := schConvergeKey{Op: "block-apply", Page: pageUUID, Target: b.ID}
+	// 台账文件键用 ident.Project(--project 优先,否则信封里的工程名),不能是裸
+	// cfg.project:`--window` 路由时后者是空串,workflow.SanitizeKey("") 落到
+	// `_active.json`,所有匿名工程的失败签名混在一个桶里 —— 甲工程连撞三次会去拦
+	// 乙工程的第一次尝试。
 	if !dryRun && maxAttempts > 0 {
-		if fit := schConvergeFitFor(cfg.project, ckey); fit != nil && fit.TooBig() {
+		if fit := schConvergeFitFor(ident.Project, ckey); fit != nil && fit.TooBig() {
 			return fmt.Errorf("停手:上一轮已**实测**量过这一块在本页放不下 —— %s\n"+
 				"(画布未改动。确认要再放一次:加 `--max-attempts 0`)", fit.Advice)
 		}
-		if stop := schConvergeGate(cfg.project, ckey, maxAttempts); stop != nil {
+		if stop := schConvergeGate(ident.Project, ckey, maxAttempts); stop != nil {
 			return stop
 		}
 	}
@@ -1032,7 +1066,7 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 		}
 		// 记账:同一个「N 处重叠 + M 处引脚重合」反复出现 = 原地打转。数值不粗化 ——
 		// 重叠数是小整数,3→2 是真进展,该清零。
-		schConvergeNoteFailure(cfg.project, ckey,
+		schConvergeNoteFailure(ident.Project, ckey,
 			schConvergeSignature(fmt.Sprintf("overlap:%d", overlaps), fmt.Sprintf("pin-coincidence:%d", coincidences)),
 			nil, "先按上面逐条 findings 改块原点/模板(`--at` 换落点、`sch autoplace-free`),"+
 				"或改用 `sch block-apply --per-row` 换排布;仍是同一个数就说明这一页塞不下,该拆页。",
@@ -1135,14 +1169,14 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	//   - 干净 → 销账。销账是硬要求:不销的话,一次历史失败会永久拦住这个块。
 	if !dryRun && maxAttempts > 0 {
 		if fit != nil && fit.TooBig() {
-			schConvergeNoteFailure(cfg.project, ckey,
+			schConvergeNoteFailure(ident.Project, ckey,
 				// 尺寸粗化到 10:实测框会随 marker 的一两个单位抖动,不粗化就等于
 				// 每次签名都不同、上限永远撞不到。10 远小于"差多少才算有进展"。
 				schConvergeSignature(fmt.Sprintf("page-too-small:%.0fx%.0f",
 					math.Round(fit.W/10)*10, math.Round(fit.H/10)*10)),
 				fit, fit.Advice, maxAttempts, stderr)
 		} else if man.OK == "applied" && man.Reconciled {
-			schConvergeNoteSuccess(cfg.project, ckey)
+			schConvergeNoteSuccess(ident.Project, ckey)
 		}
 	}
 
@@ -1155,7 +1189,7 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	// window 必须传下去:`--window` 是一等的路由方式(同名多窗口时 `--project`
 	// 会被 dispatch 拒掉,那时只能用 --window),回填不该在那种场合整个失效。
 	if !dryRun && strings.TrimSpace(in.SpecPath) != "" {
-		bapBackfillSpec(cfg, window, in.SpecPath, stderr)
+		bapBackfillSpec(cfg, window, in.SpecPath, ident, stderr)
 	}
 
 	// 10. 统一收尾:状态已经全部固化(连线尽力、对账已做、组已封),**先出 manifest**,
@@ -1490,12 +1524,16 @@ func bapRegisterGroup(cfg *appConfig, window string, plan bapPlan, man *bapManif
 	if len(members) == 0 {
 		return
 	}
-	pinned, win, docUUID, _, st, groups, err := loadSchGroupsContext(cfg, window)
+	pinned, win, docUUID, project, st, groups, err := loadSchGroupsContext(cfg, window)
 	if err != nil {
 		fmt.Fprintf(stderr, "warn: 归组跳过(取不到页面分组表:%v)—— 器件与连线均已落地,上层布局会把它们当散件;可手工补登:easyeda sch group create --name %q --members %s\n",
 			err, bapGroupName(plan), strings.Join(members, ","))
 		return
 	}
+	// 归组是**写组表**的那一刻,也就是同名重建残留最该被说出来的那一刻:这份
+	// 状态文件里若还堆着另一个同名工程的页,跨页读取(spec 回填)的分母就是脏的。
+	// 只报不删(loadSchGroupsContext 已按活体 uuid 绑定,新写的这一页会盖上正确的戳)。
+	warnForeignPages(project, st, stderr)
 	_ = pinned
 	_ = win
 	roles := map[string]string{}

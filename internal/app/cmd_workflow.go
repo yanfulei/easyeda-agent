@@ -28,7 +28,7 @@ func newWorkflowCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command {
 	var window string
 	wf := &cobra.Command{
 		Use:   "workflow",
-		Short: "Project design-flow state machine: init / status / advance / confirm / reset (issue #97)",
+		Short: "Project design-flow state machine: init / status / advance / confirm / reset / pages (issue #97)",
 		Long: `Per-project persisted workflow over the PCB design flow.
 
 Stages (rank order):
@@ -54,6 +54,7 @@ the marker with the real document, then 'workflow advance' to continue.`,
 	wf.AddCommand(newWorkflowAdvanceCmd(cfg, &window, stdout, stderr))
 	wf.AddCommand(newWorkflowConfirmCmd(cfg, &window, stdout, stderr))
 	wf.AddCommand(newWorkflowResetCmd(cfg, &window, stdout))
+	wf.AddCommand(newWorkflowPagesCmd(cfg, &window, stdout, stderr))
 	return wf
 }
 
@@ -331,11 +332,19 @@ the flow.`,
 		Example: `  easyeda workflow status --project ceshi
   easyeda workflow status --project ceshi --reconcile`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			project := stageKeyBestEffort(cfg, *window)
+			project, uuid, _ := resolveStageIdentity(cfg, *window)
+			if strings.TrimSpace(project) == "" {
+				project = cfg.project
+			}
 			st, err := loadPcbStageState(project)
 			if err != nil {
 				return err
 			}
+			// 身份绑定 + 同名重建体检:状态文件按名字分文件,同名重建会让几个工程
+			// 的页记账堆进一份文件,而症状是**静默的错误数据**(跨页匹配的分母被
+			// 污染),不是报错 —— 所以必须在这里主动说出来。只报不删。
+			bind := st.Bind(uuid)
+			reportStateIdentity(project, bind, stderr)
 			// 质量快照必须在 reconcile 前取:reconcileWorkflow 里的 InvalidateFrom
 			// 会把 st.Layout(连同快照)在内存里清掉,而 diff 的意义正是「与上次
 			// 签字时比」(#167 消费侧)。

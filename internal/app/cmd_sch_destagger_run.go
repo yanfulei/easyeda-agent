@@ -147,9 +147,12 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 	// 收敛台账:destagger 的"次数"有两层 —— 一次调用里的 --max-rounds(进程内),
 	// 和**反复调用同一条命令**(进程外)。复盘里烧掉时间的是后者,所以这道门必须
 	// 在动手之前查,而且只在 --apply 路径上查(dry-run 是纯计算,不该被历史拦住)。
+	// 台账文件键走 stageKeyBestEffort(= resolveStageProject 的结果),不能是裸
+	// cfg.project:`--window` 路由时后者是空串,所有匿名工程会共用 `_active.json`。
+	ledgerProject := stageKeyBestEffort(cfg, window)
 	ckey := schConvergeKey{Op: "destagger", Page: pageUUID}
 	if apply && maxAttempts > 0 {
-		if stop := schConvergeGate(cfg.project, ckey, maxAttempts); stop != nil {
+		if stop := schConvergeGate(ledgerProject, ckey, maxAttempts); stop != nil {
 			return stop
 		}
 	}
@@ -177,7 +180,7 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 			}
 		}
 		if apply && maxAttempts > 0 && !rep.Converged {
-			schConvergeNoteFailure(cfg.project, ckey,
+			schConvergeNoteFailure(ledgerProject, ckey,
 				schConvergeSignature(fmt.Sprintf("marker-overlap:%d", rep.OverlapsAfter), "moved:0"),
 				nil, rep.Verdict, maxAttempts, stderr)
 		}
@@ -276,9 +279,9 @@ func runSchDestagger(cfg *appConfig, window string, apply bool, maxRounds, maxMo
 	// 上限拦的是"跑了也不动"的那种)。
 	if apply && maxAttempts > 0 {
 		if rep.Converged {
-			schConvergeNoteSuccess(cfg.project, ckey)
+			schConvergeNoteSuccess(ledgerProject, ckey)
 		} else {
-			schConvergeNoteFailure(cfg.project, ckey,
+			schConvergeNoteFailure(ledgerProject, ckey,
 				schConvergeSignature(fmt.Sprintf("marker-overlap:%d", rep.OverlapsAfter),
 					fmt.Sprintf("moved:%d", len(rep.Moved))),
 				nil, rep.Verdict, maxAttempts, stderr)

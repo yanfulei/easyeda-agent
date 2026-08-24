@@ -81,20 +81,87 @@ func resolveStageProject(cfg *appConfig, window string) (string, error) {
 	if strings.TrimSpace(cfg.project) != "" {
 		return cfg.project, nil
 	}
+	key, _, err := resolveStageIdentityLive(cfg, window)
+	return key, err
+}
+
+// resolveStageIdentity resolves BOTH halves of the project identity:
+//
+//	key  — the state FILE key. Priority unchanged on purpose: an explicit
+//	       --project string always wins, or people could not locate the state
+//	       they just wrote by the name they typed.
+//	uuid — the LIVE project uuid, which is what makes "same name, different
+//	       project" (a deleted-and-re-created `ceshi`) detectable at all. The
+//	       file name cannot carry that: the name is identical by construction.
+//
+// The uuid is best-effort: when the window cannot be reached (or --project was
+// given and the daemon is down) it comes back empty and every consumer degrades
+// to the pre-identity behaviour (no stamping, no cross-page narrowing) rather
+// than failing. Costs one light `project.current` read — the same probe the
+// daemon uses for liveness — even when --project already pinned the key.
+//
+// Callers that must stay strictly OFFLINE (`easyeda spec backfill --project X`)
+// keep using resolveStageProject and fall back to State.ProjectUUID for scoping.
+func resolveStageIdentity(cfg *appConfig, window string) (key, uuid string, err error) {
+	if strings.TrimSpace(cfg.project) != "" {
+		_, live, lerr := resolveStageIdentityLive(cfg, window)
+		if lerr != nil {
+			// The typed name is authoritative for the key; an unreachable window
+			// only costs us the uuid.
+			return cfg.project, "", nil
+		}
+		return cfg.project, live, nil
+	}
+	return resolveStageIdentityLive(cfg, window)
+}
+
+// resolveStageIdentityLive asks the window who it is (name + uuid).
+func resolveStageIdentityLive(cfg *appConfig, window string) (key, uuid string, err error) {
 	res, err := requestAction(cfg, "project.current", window, nil)
 	if err != nil {
-		return "", fmt.Errorf("resolve project for workflow state: %w", err)
+		return "", "", fmt.Errorf("resolve project for workflow state: %w", err)
 	}
+	uuid = asString(res.Result["uuid"])
 	if name := asString(res.Result["friendlyName"]); name != "" {
-		return name, nil
+		return name, uuid, nil
 	}
 	if name := asString(res.Result["name"]); name != "" {
-		return name, nil
+		return name, uuid, nil
 	}
-	if uuid := asString(res.Result["uuid"]); uuid != "" {
-		return uuid, nil
+	if uuid != "" {
+		return uuid, uuid, nil
 	}
-	return "", fmt.Errorf("resolve project for workflow state: window reports no project identity")
+	return "", "", fmt.Errorf("resolve project for workflow state: window reports no project identity")
+}
+
+// reportStateIdentity prints the identity finding once, if there is one. It is
+// deliberately a REPORT, not an action: auto-clearing would eat real state the
+// day a project merely moved to another team space (new uuid, same work).
+func reportStateIdentity(project string, bind workflow.BindResult, stderr io.Writer) {
+	if stderr == nil {
+		return
+	}
+	if msg := bind.Message(project); msg != "" {
+		fmt.Fprintf(stderr, "⚠️  %s\n", msg)
+	}
+}
+
+// warnForeignPages reports page bookkeeping that is PROVEN to belong to another
+// project (same name, different uuid). Data-driven, so it keeps saying it on
+// every run until the user prunes — unlike the bind-time finding, which is only
+// observable the one time the uuid changes.
+func warnForeignPages(project string, st *pcbStageState, stderr io.Writer) {
+	if stderr == nil || st == nil {
+		return
+	}
+	foreign := st.ForeignPages(st.BoundUUID())
+	if len(foreign) == 0 {
+		return
+	}
+	fmt.Fprintf(stderr, "⚠️  工程状态 %q 里有 %d 页属于别的工程(同名重建的残留:%s)——"+
+		"它们**不参与**跨页匹配(spec 回填 / 分区打分),数据一个字节没动。"+
+		"确认要清掉:`easyeda workflow pages --project %s --prune`\n",
+		project, len(foreign), strings.Join(foreign, ", "), project)
 }
 
 // pullLayoutPoses reads the live placement poses (designator/x/y/rotation/layer)

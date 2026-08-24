@@ -651,7 +651,19 @@ func loadSchGroupsContext(cfg *appConfig, window string) (pinned *appConfig, win
 	if err != nil {
 		return nil, "", "", "", nil, nil, err
 	}
-	project, err = resolveStageProject(pinned, win)
+	// 身份解析走 resolveStageIdentity:文件键仍按名字(--project 优先级不变),
+	// 但同时取回**活体工程 uuid** 并绑定到状态上。绑定有两个后果:此后这一页的
+	// 每次写入都盖上这个 uuid 的归属戳,跨页读取(spec 回填)也能据此把同名重建
+	// 残留的死页挡在分母之外。取不到 uuid(离线/窗口不可达)时退化成旧行为。
+	//
+	// 代价是给了 --project 时多一次 `project.current`(此前那种情况零往返)。
+	// 认这笔账:它是动作目录里最轻的一条读(daemon 自己的存活探测用的就是它),
+	// 换来的是「这一页记账到底属于哪个工程」有了答案 —— 没有它,同名重建的死页
+	// 只能靠人跑 `workflow pages --reap` 才认得出来。
+	// 动作序敏感的命令(block-apply)不走这条:它从已有响应的信封里白拿身份
+	// (schPageIdentityOf),因为那条路上多插一条读本身就是回归。
+	var uuid string
+	project, uuid, err = resolveStageIdentity(pinned, win)
 	if err != nil {
 		return nil, "", "", "", nil, nil, err
 	}
@@ -659,6 +671,7 @@ func loadSchGroupsContext(cfg *appConfig, window string) (pinned *appConfig, win
 	if err != nil {
 		return nil, "", "", "", nil, nil, err
 	}
+	st.Bind(uuid)
 	return pinned, win, docUUID, project, st, st.GroupsForPage(docUUID), nil
 }
 

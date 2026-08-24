@@ -267,6 +267,61 @@ const bapPartMargin = 50
 // footprint keeps from existing parts (mirrors autolayout's PartGap).
 const bapObstacleGap = 20
 
+// ── marker 晕圈:落点判定与组重叠判定必须用同一把尺 ──────────────────────────
+//
+// 一个块落地后占的地**不止器件本体**:autoconnect 随后会给每条网在引脚外面挂一支
+// marker(netflag/netport)+ 一根桩线,四面长出一圈"晕"。`sch clusters` 的判据
+// (L1 虚拟组 = 器件 ∪ 它自己的 marker/桩线)量的就是这一圈,而落点求解从前只量
+// 器件本体 —— **两把尺**。
+//
+// 2026-08-20 esp32Mini 端到端两轮逐字复现的缺陷正是它:MCU_IO 页先落 WROOM 块,
+// U2 本体 x=[684.5,755.5],但它的 MCU_RX netport 连名字带一路探到 x=490;再落 LED
+// 块,螺旋从 (400,300) 起跳一环到 (400,450),此处 LED 块的**本体**矩形
+// x=[350,570] 距 U2 本体还有 114 的余量 —— 本体尺说"没撞",于是落点定案;而 LED 自己
+// 的 LED_GPIO/LED1_N2 端口又往右探到 650,两组的 marker 当场压在一起(clusters 报
+// 「LED1 ↔ U2 图元重叠 6×2」)。同一批里 esp32_autodownload 触发了避让,只是因为它
+// 的本体矩形宽到 670,恰好擦到 U2 的**本体** —— 触发与否全凭本体尺是否碰巧够得着,
+// 这不是避让机制在工作。
+//
+// 收敛成一把尺的做法:
+//   - 障碍侧(已落地的东西)用**实测**全图元 —— schBlockObstacleBoxes 把 marker 的
+//     判定盒(本体 ∪ 文字带,markerJudgeBBox,与 sch check / clusters 同源)也算进去;
+//   - 自己这一侧(还没长出来的 marker)用**估算** —— 即本函数的晕圈半径。
+//
+// 半径口径与 autoconnect 同源,不另拍脑袋:最短桩长 OffsetMin + 一支 netport 的总占地
+// (六边形 31 + 名字 6/字符 + 8,acPortTotalLen),取块内**最长网名**——晕圈外沿由最长
+// 的那一支决定。实测对照:LED 块最长网名 LED_GPIO(8) → 18+87=105,而真机量出来
+// LED_GPIO 端口自 R5 本体边缘外探 95,估算略有余量正好当下限。
+//
+// bapMinNetNameLen 是名字长度的下限:块没声明 default_net 时端口名可能很短
+// (GND/EN),但内部网名走 <INSTANCE>_N<k>,实测 7~8 字符,不能按 3 字符算。
+const bapMinNetNameLen = 8
+
+// bapMarkerHalo 估算块落地后四周 marker/桩线晕圈的半径(见上方大段说明)。
+func bapMarkerHalo(b blocks.Block, instance string, bind map[string]string) float64 {
+	longest := bapMinNetNameLen
+	consider := func(net string) {
+		if n := len(strings.TrimSpace(net)); n > longest {
+			longest = n
+		}
+	}
+	for port, p := range b.Ports {
+		consider(port)
+		consider(p.DefaultNet)
+		consider(bind[port])
+	}
+	consider(instance + "_N99") // 内部网名的口径,见 planBlockApply 的 <INSTANCE>_N<k>
+	return defaultAutoconnectRules().OffsetMin + acPortTotalLen(strings.Repeat("N", longest))
+}
+
+// bapGrow 把一个矩形四面外扩 d(d<=0 时原样返回)。
+func bapGrow(b layoutBBox, d float64) layoutBBox {
+	if d <= 0 {
+		return b
+	}
+	return layoutBBox{MinX: b.MinX - d, MinY: b.MinY - d, MaxX: b.MaxX + d, MaxY: b.MaxY + d}
+}
+
 // bapRoleHalfExtent estimates half a symbol's rendered width by part class. Crude
 // on purpose — real bboxes exist only after placement — but it must not UNDER-shoot,
 // because the grid uses it to decide how far apart to put parts.
@@ -458,19 +513,32 @@ func bapResolveOrigin(in bapInput, offsets map[string]bapRoleOffset, half func(s
 		RequestedX: in.OriginX, RequestedY: in.OriginY,
 		X: in.OriginX, Y: in.OriginY,
 	}
+	// 障碍判定用的是**晕圈矩形**(本体估算 + bapMarkerHalo),不是本体矩形:块落地后
+	// autoconnect 还会在四周长出一圈 marker/桩线,那一圈同样占地,而 `sch clusters`
+	// 的组重叠判据量的正是它。障碍侧则由 schBlockObstacleBoxes 提供**实测**的全图元
+	// 盒(含 marker 的文字带),两侧口径一致 —— 见 bapMarkerHalo 上方的复盘。
+	//
+	// 晕圈**只进障碍判定,不进 inBounds/oversize**:后者问的是"这一块装不装得进图纸",
+	// 是本体几何的问题;把预留的晕圈算进去会让中等块凭空变 oversize,而 oversize 分支
+	// 会**关掉**边界约束 —— 为了更严反而更松,那是净损失。
+	halo := bapMarkerHalo(in.Block, in.Instance, in.Bind)
 	// 间隙判定一律走 boxesGapOverlap:旧代码用 rectGap(欧氏角距,math.Hypot),
 	// 对角方向名义留 20 实际只保证 ~14 单轴 —— 判据必须逐轴。
-	collides := func(b layoutBBox) bool {
-		if in.TitleBlock != nil && boxesGapOverlap(b, *in.TitleBlock, bapObstacleGap) {
-			return true
-		}
-		for _, o := range in.Obstacles {
-			if boxesGapOverlap(b, o, bapObstacleGap) {
+	collidesWith := func(pad float64) func(layoutBBox) bool {
+		return func(b layoutBBox) bool {
+			h := bapGrow(b, pad)
+			if in.TitleBlock != nil && boxesGapOverlap(h, *in.TitleBlock, bapObstacleGap) {
 				return true
 			}
+			for _, o := range in.Obstacles {
+				if boxesGapOverlap(h, o, bapObstacleGap) {
+					return true
+				}
+			}
+			return false
 		}
-		return false
 	}
+	collides := collidesWith(halo)
 	// inBounds/hitsTitle 是 issue #180 三个坑的正解:此前它们给 findSlot 传的是
 	// nil,图纸边界与分区标题带**从未参与搜索**,出界只在事后打 warning(而且比
 	// 的是锚点不是 bbox)。接上之后,"搜出来的空位在图纸外"从构造上不可能。
@@ -524,7 +592,7 @@ func bapResolveOrigin(in bapInput, offsets map[string]bapRoleOffset, half func(s
 				usable.MaxX-usable.MinX, usable.MaxY-usable.MinY)}
 		}
 		return in.OriginX, in.OriginY, origin, []string{
-			"--at 指定的原点与已有器件或标题栏图签重叠 — 按你的坐标照常放置(显式 --at 优先);放完请跑 `sch layout-lint` 确认"}
+			"--at 指定的原点与已有图元(器件本体 / marker 连名字带 / 本块 marker 晕圈)或标题栏图签重叠 — 按你的坐标照常放置(显式 --at 优先);放完请跑 `sch layout-lint` + `sch clusters` 确认"}
 	}
 	w, h := bboxSize(rect)
 	step := math.Max(w, h)/2 + 2*bapObstacleGap
@@ -547,11 +615,35 @@ func bapResolveOrigin(in bapInput, offsets map[string]bapRoleOffset, half func(s
 		if nx, ny, found := bapScanOrigin(in.OriginX, in.OriginY, offsets, half, usable, collides); found {
 			origin.X, origin.Y = nx, ny
 			origin.Relocated = true
-			origin.Reason = "默认原点与已有器件重叠,螺旋步长对本块过粗,已按网格扫描移到最近的合法空位(显式传 --at 可固定原点)"
+			origin.Reason = "默认原点与已有图元(含 marker 连名字带)重叠,螺旋的 8 条射线 × 12 环够不着空位(步长随块放大、方向只有轴向+对角),已按网格扫描移到最近的合法空位(显式传 --at 可固定原点)"
 			return nx, ny, origin, nil
 		}
 	}
 	if !ok {
+		// **降级重试:严格尺找不到 ≠ 放不下。**晕圈是给未来 marker 预留的地,页面一挤
+		// 就可能整页都满足不了;此时退回本体尺再搜一次。两害相权:「marker 会挤一点」
+		// 是 layout-lint/clusters 事后能诊断、group-move 能修的版面问题,而「本体压在
+		// 别人身上」直接撞 wiring 前硬门 → 整单回滚,工作全丢。
+		// 顺序不能反:先严格后降级,才不会因为宽松尺先找到位置就永远用不上严格尺。
+		body := collidesWith(0)
+		if slot2, _, ok2 := findSlotNormalized(rect, cx, cy, step, true, normalize, body, inBounds, nil, nil); ok2 {
+			ncx, ncy := bboxCenter(slot2)
+			nx, ny := snapAnchor(in.OriginX+(ncx-cx)), snapAnchor(in.OriginY+(ncy-cy))
+			origin.X, origin.Y = nx, ny
+			origin.Relocated = true
+			origin.Reason = "默认原点与已有器件重叠,已移到最近的**本体**空位;页面太挤,给本块 marker 预留的晕圈没留住"
+			return nx, ny, origin, []string{fmt.Sprintf(
+				"本块已避开所有器件本体,但整页找不到能同时容下 marker 晕圈(半径 %.0f)的位置 — 放完请跑 `sch clusters` 看组间是否压到,必要时 `sch group-move` 挪开", halo)}
+		}
+		if inBounds != nil {
+			if nx, ny, found := bapScanOrigin(in.OriginX, in.OriginY, offsets, half, usable, body); found {
+				origin.X, origin.Y = nx, ny
+				origin.Relocated = true
+				origin.Reason = "默认原点与已有器件重叠,已按网格扫描移到最近的**本体**空位;页面太挤,给本块 marker 预留的晕圈没留住"
+				return nx, ny, origin, []string{fmt.Sprintf(
+					"本块已避开所有器件本体,但整页找不到能同时容下 marker 晕圈(半径 %.0f)的位置 — 放完请跑 `sch clusters` 看组间是否压到,必要时 `sch group-move` 挪开", halo)}
+			}
+		}
 		why := "与已有器件重叠"
 		switch {
 		case oversize:
@@ -574,7 +666,7 @@ func bapResolveOrigin(in bapInput, offsets map[string]bapRoleOffset, half func(s
 	ny := snapAnchor(in.OriginY + (ncy - cy))
 	origin.X, origin.Y = nx, ny
 	origin.Relocated = true
-	origin.Reason = "默认原点与已有器件重叠,已自动移到最近空位(显式传 --at 可固定原点)"
+	origin.Reason = "默认原点与已有图元(含 marker 连名字带)重叠,已自动移到最近的、连本块 marker 晕圈都放得下的空位(显式传 --at 可固定原点)"
 	return nx, ny, origin, nil
 }
 
