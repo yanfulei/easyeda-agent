@@ -4,7 +4,7 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.1.2] — 2026-08-24
 
 ### Fixed — 超时守卫改由 worker tick 兜底:队首卡死不再拖死整条队列
 
