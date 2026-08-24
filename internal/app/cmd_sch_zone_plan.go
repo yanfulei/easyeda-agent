@@ -94,6 +94,23 @@ type partitionRect struct {
 	// 框上:`sch note` 看到的是「本区还没登记说明」的计划,planner 重算时看到的是
 	// 「已登记」的计划,两边只有都拿基础框当邻居,算出的扩边界才逐字段相同。
 	BaseBBox layoutBBox `json:"baseBBox"`
+	// ContentBBox 是这一区的**内容**(成员 L1 虚拟组体积的并集),即框里那块一寸
+	// 不让的地方。它让「框重叠」这件事可以被分成两种病:内容真交叠(只能挪件)
+	// 与只是版式预留互相顶住(边距可让)。判据据此开出完全不同的方子。
+	ContentBBox layoutBBox `json:"contentBBox"`
+	// Tightened:这一区为了给邻区让路,已经把边距让掉了一部分(收紧到 floor 之前
+	// 那一段)。**降级/让步必须可见**(本仓纪律):框比标准版式窄一圈是有原因的,
+	// 读的人得能看出来是让给了谁,而不是以为算式漂了。
+	Tightened bool `json:"tightened,omitempty"`
+}
+
+// contentRect 返回这一区的内容 bbox(老计划/手写 fixture 没填时回退 BBox ——
+// 那等价于「整框都算内容」,即最保守的一档:不会把真交叠说成边距顶住)。
+func (p partitionRect) contentRect() layoutBBox {
+	if (p.ContentBBox == layoutBBox{}) {
+		return p.BBox
+	}
+	return p.ContentBBox
 }
 
 // baseRect 返回扩边前的框(老数据/手写测试没填 BaseBBox 时回退 BBox)。
@@ -127,6 +144,21 @@ type partitionValidation struct {
 	// ModuleOutsideDetail 逐条说出**是谁**探出了框、超了多少、往哪个方向 ——
 	// 判据的价值不在报数,在给出能执行的下一步(两把尺那条复发病的另一半)。
 	ModuleOutsideDetail []string `json:"moduleOutsideDetail,omitempty"`
+	// PartitionOverlapDetail / TitleBlockDetail 是同一条纪律对另外两项的补齐
+	// (2026-08-24):真机上 `zone-draw` 只报得出 "PartitionOverlap:3 TitleBlockHits:1",
+	// 出路一句笼统的「跑 zone-arrange --apply」—— 那是整页重排,重、有风险、还可能
+	// blocked,于是交付被自己卡死。正本第 8 条要的是 blocked **报出是谁、每条边
+	// 各卡在哪**,所以这里逐对/逐区给出:谁顶谁、重叠多少、以及一条能直接抄去跑的
+	// 最小挪动命令。
+	PartitionOverlapDetail []string `json:"partitionOverlapDetail,omitempty"`
+	TitleBlockDetail       []string `json:"titleBlockDetail,omitempty"`
+}
+
+// counters 是六项计数的稳定短摘要。错误文案用它而不是 %+v:自从 validation 带上
+// 逐条明细,%+v 会把明细在同一行里再抖一遍(明细本来就单独逐行打)。
+func (v partitionValidation) counters() string {
+	return fmt.Sprintf("{SheetOverflow:%d PartitionOverlap:%d TitleBlockHits:%d ModuleOutsideZone:%d LabelCollisions:%d SheetMarginHits:%d}",
+		v.SheetOverflow, v.PartitionOverlap, v.TitleBlockHits, v.ModuleOutsideZone, v.LabelCollisions, v.SheetMarginHits)
 }
 
 func (v partitionValidation) clean() bool {
@@ -244,12 +276,64 @@ func requiredNoteBand(noteH float64) float64 { return noteH + noteGap }
 // 共用同一个函数本体 —— 已经是同一把尺。把宽度也塞进第一遍会让「登记前 note 侧
 // 算出的框」与「登记后 planner 重算的框」再次分家(先右后左扩 vs 对称扩)。
 func partitionFrameRect(content layoutBBox, titleBand, noteBand float64) layoutBBox {
+	return partitionFrameRectPad(content, titleBand, noteBand, partitionContentPad)
+}
+
+// partitionFrameRectPad 是同一个外框函数的**边距参数化**形式 —— 唯一的算式仍然
+// 只有一处,pad 只是它的一个参数。
+//
+// 为什么需要它:框由三块东西撑起来 —— **内容**(成员 L1 体积)、**版式带**(区名带
+// 在顶、说明带在底,正本第 2 条的读图契约)、**边距**(partitionContentPad,纯余量)。
+// 三块的可让性完全不同,而规划器早就在按这个次序让步了:撞图签让、撞纸边让、
+// 「内容一寸不让」。边距是三块里唯一可以让的 —— 收紧的下界由 partitionFrameFloor
+// 给出(它逐边说明了哪三条边让、哪一条不让,不是简单的 pad=0)。
+func partitionFrameRectPad(content layoutBBox, titleBand, noteBand, pad float64) layoutBBox {
 	return layoutBBox{
-		MinX: content.MinX - partitionContentPad,
-		MinY: content.MinY - partitionContentPad - noteBand,
-		MaxX: content.MaxX + partitionContentPad,
-		MaxY: content.MaxY + partitionContentPad + titleBand,
+		MinX: content.MinX - pad,
+		MinY: content.MinY - pad - noteBand,
+		MaxX: content.MaxX + pad,
+		MaxY: content.MaxY + pad + titleBand,
 	}
+}
+
+// partitionFrameFloor 是一个分区框「最多能收到多小」。**三条边可以让,一条不行**,
+// 原因在版式的层次(不是拍的):
+//
+//	左/右:内容外面直接就是边距 → 整块可让,下界 = 内容边(各让 24);
+//	上   :内容 → 边距 → 区名带 → 框顶。让掉边距后区名带整条还在(只是贴住内容顶,
+//	       不再有那 24 的空隙),下界 = 内容顶 + 区名带;
+//	下   :内容 → 边距 → **说明带** → 框底,而说明带的带顶恒钉在「内容下沿 − 边距」
+//	       (zoneNotePins:`sch note` 的落点求解与 planner 重算共用的基准,不随框动)。
+//	       让掉这里的边距只会把带**削薄 24**,一寸空地也让不出来 —— 那是拿版式契约
+//	       换空间。下界 = 第一遍的框底,一寸不让。
+//
+// 收紧永远以它为下界,于是收紧**结构上**不可能造出新的违规:
+//
+//	moduleOutsideZone:框 ⊇ floor ⊇ content ⊇ 每个成员的 L1 体积;
+//	labelCollisions  :floor.MaxY = content.MaxY + 区名带高,带底最多贴到内容顶;
+//	note-outside-zone:floor.MinY = 第一遍框底,说明带高一寸不减。
+func partitionFrameFloor(content layoutBBox, titleBand, noteBand float64) layoutBBox {
+	f := partitionFrameRect(content, titleBand, noteBand)
+	f.MinX = content.MinX
+	f.MaxX = content.MaxX
+	f.MaxY = content.MaxY + titleBand
+	return f // MinY 原样 —— 框底不让
+}
+
+// partitionTitleBandOf 是区名带高的唯一口径:标称带高,但不超过框高的一半
+// (矮框上整块都是标题就不成其为框了)。此前 planPartitions / reserveNoteAreas
+// 各写了一遍同一个 clamp。
+func partitionTitleBandOf(rect layoutBBox, titleBand float64) float64 {
+	if h := rect.MaxY - rect.MinY; titleBand > h/2 {
+		return h / 2
+	}
+	return titleBand
+}
+
+// partitionTitleBBox 是区名带(框顶那一条)的唯一构造。
+func partitionTitleBBox(rect layoutBBox, titleBand float64) layoutBBox {
+	b := partitionTitleBandOf(rect, titleBand)
+	return layoutBBox{MinX: rect.MinX, MinY: rect.MaxY - b, MaxX: rect.MaxX, MaxY: rect.MaxY}
 }
 
 // partitionFrameSize 是同一个函数的尺寸投影(排布器只关心装多大)。
@@ -314,6 +398,7 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 	safe := inflatedTitleKeepout(keepout)
 	groups := partitionGrouping(modules)
 	noteNeeds := make([]partitionNoteNeed, 0, len(groups))
+	floors := make([]layoutBBox, 0, len(groups))
 	for _, grp := range groups {
 		content := modules[grp[0]].BBox
 		for _, i := range grp[1:] {
@@ -386,10 +471,6 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 		if lim := sheet.MaxY - sheetEdgeMinGap; rect.MaxY > lim {
 			rect.MaxY = math.Max(lim, content.MaxY)
 		}
-		band := opts.TitleBand
-		if h := rect.MaxY - rect.MinY; band > h/2 {
-			band = h / 2
-		}
 		names := make([]string, 0, len(grp))
 		for _, i := range grp {
 			names = append(names, modules[i].Name)
@@ -401,12 +482,14 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 		bandTop := math.Min(rect.MaxY, math.Max(rect.MinY, content.MinY-partitionContentPad))
 		// 钉边只有一条(说明带恒在框底):带顶 = 器件区下沿,与带高无关。
 		pins := zoneNotePins{Bottom: bandTop}
+		floors = append(floors, partitionFrameFloor(content, opts.TitleBand, noteBand))
 		plan.Partitions = append(plan.Partitions, partitionRect{
-			Modules:  names,
-			BBox:     rect,
-			BaseBBox: rect,
+			Modules:     names,
+			BBox:        rect,
+			BaseBBox:    rect,
+			ContentBBox: content,
 			// Title band at the visual TOP (large y).
-			TitleBBox: layoutBBox{MinX: rect.MinX, MinY: rect.MaxY - band, MaxX: rect.MaxX, MaxY: rect.MaxY},
+			TitleBBox: partitionTitleBBox(rect, opts.TitleBand),
 			// Note band at the visual BOTTOM (small y) —— 说明就放这儿,框内左下。
 			// **带的定义只有 zoneNoteBand 一个函数**(落点求解与 note-outside-zone
 			// 判据读的是同一条带),这里不许再写一遍字面量。
@@ -415,9 +498,149 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 		})
 		noteNeeds = append(noteNeeds, partitionNoteNeed{W: noteW, H: noteH, Pins: pins})
 	}
+	// 第一遍半:邻框也吃「可让的余量」(见 tightenPartitionFrames)。必须排在
+	// reserveNoteAreas 之前 —— 说明扩边的边界钉在 BaseBBox 上,收紧后的基础框才是
+	// `sch note`(登记前)与 planner(登记后)都能算出的同一个基准。
+	tightenPartitionFrames(plan.Partitions, floors, opts.TitleBand)
 	reserveNoteAreas(&plan, noteNeeds, sheet, keepout, opts, noteObstacles)
 	plan.Validation = validatePartitions(plan, modules, keepout)
 	return plan
+}
+
+// ── 收紧:邻框也吃「可让的余量」(2026-08-24)────────────────────────────────
+//
+// 规划器一直在按同一条规矩让步:**边距/区名带/说明带是我们加的预留,撞上障碍就
+// 缩;内容一寸不让**。图签 keep-out 这么让(rect.MinY 抬到内容下沿),纸边也这么让
+// (四边 clamp 到 sheetEdgeMinGap,但不越过内容)。**唯独邻区不让** —— 于是两个明明
+// 分得开的模块,只因各自的 24 边距 + 30 区名带 + 说明带在中间对撞,就被判
+// partitionOverlap、`zone-draw` 整页拒画,而人得去跑一次整页重排(重操作,还可能
+// blocked)才画得出框。这不是布局的问题,是画框侧对同一条规矩少执行了一处。
+//
+// 收紧只做一件事:**把两区之间的空地按「各拿下界 + 余量对半」分掉**。两区内容沿
+// 某条轴天然分开时,各自的框边收到那个切点(下界是 partitionFrameFloor —— 可让的
+// 边距让完为止,内容与两条版式带一寸不让)。于是:
+//
+//	① 内容之间还有空地 → 让掉的只是边距,框照画,零挪件;
+//	② 内容真的互相压(两轴都交叠)→ 无空地可分,一个字不改,判据照报、画框照拒。
+//
+// 三条不变式(由 partitionFrameFloor 的构造 + 单调收缩保证,见
+// TestTightenFrames_NeverIntroducesAViolation 的随机对照):
+//
+//	· 只缩不涨(每条边都取 min/max 夹在原框内),所以 sheetOverflow /
+//	  sheetMarginHits / titleBlockHits 只会减少,不会新增;
+//	· 框恒 ⊇ floor ⊇ 内容,所以 moduleOutsideZone 不受影响;
+//	· 区名带/说明带一寸不减(框底根本不让,见 partitionFrameFloor),所以
+//	  labelCollisions / 说明装不下不受影响。
+//
+// 代价说清楚:**竖着叠的两区需要 96 单位空地**(边距 24 + 说明带 42 + 区名带 30)
+// 才收得开,横着排的只要 0(48 的边距全可让)。装不下时不硬撑 —— 残留量恰好等于
+// 「还差多少空地」,判据据此报出的最小挪动就是真正的最小值。
+//
+// **框不重叠这条红线不靠本函数**:它由 validatePartitions + partitionDrawGate 守着,
+// 收紧只是把「本来就不该判违规的那一类」还原成合法计划;收不动的照旧 blocked。
+func tightenPartitionFrames(ps []partitionRect, floors []layoutBBox, titleBand float64) {
+	if len(ps) != len(floors) || len(ps) < 2 {
+		return
+	}
+	lim := make([]layoutBBox, len(ps))
+	for i := range ps {
+		lim[i] = ps[i].BBox
+	}
+	for i := 0; i < len(ps); i++ {
+		for j := i + 1; j < len(ps); j++ {
+			if !boxesOverlap(ps[i].BBox, ps[j].BBox) {
+				continue
+			}
+			axis, aFirst, loLim, hiLim := partitionGapSplit(
+				ps[i].contentRect(), ps[j].contentRect(), floors[i], floors[j])
+			lo, hi := i, j
+			if !aFirst {
+				lo, hi = j, i
+			}
+			switch axis {
+			case "x":
+				lim[lo].MaxX = math.Min(lim[lo].MaxX, loLim)
+				lim[hi].MinX = math.Max(lim[hi].MinX, hiLim)
+			case "y":
+				lim[lo].MaxY = math.Min(lim[lo].MaxY, loLim)
+				lim[hi].MinY = math.Max(lim[hi].MinY, hiLim)
+			default:
+				// 内容两轴都交叠:没有空地可分,让不出来 —— 交给判据如实报。
+			}
+		}
+	}
+	for i := range ps {
+		r, f := ps[i].BBox, floors[i]
+		// 每条边:朝内收到 limit,但不越过 floor(预留下界),也绝不外扩(min/max
+		// 夹在原框内 —— 第一遍已经为图签/纸边收过的边不许被这里放回去)。
+		n := layoutBBox{
+			MinX: math.Max(r.MinX, math.Min(f.MinX, lim[i].MinX)),
+			MinY: math.Max(r.MinY, math.Min(f.MinY, lim[i].MinY)),
+			MaxX: math.Min(r.MaxX, math.Max(f.MaxX, lim[i].MaxX)),
+			MaxY: math.Min(r.MaxY, math.Max(f.MaxY, lim[i].MaxY)),
+		}
+		if n == r {
+			continue
+		}
+		ps[i].BBox = n
+		ps[i].BaseBBox = n
+		ps[i].Tightened = true
+		ps[i].TitleBBox = partitionTitleBBox(n, titleBand)
+		ps[i].NoteBBox = zoneNoteBand(n, ps[i].notePins().Bottom)
+	}
+}
+
+// partitionGapSplit 决定这一对沿哪条轴让、各让到哪。
+//
+// **先各自拿够下界,剩下的对半分** —— 不是简单地在空地中点切一刀。中点切法会把
+// 本来有解的情形判成无解:内容相距 80,上区的说明带要 42、下区的区名带要 30
+// (合计 72 ≤ 80,存在合法切点),中点在 40 处,上区够不着(它的下界在 42 处),
+// 于是残留 2 单位重叠、整页照样拒画。改成「下界优先 + 余量对半」之后,只要
+// **存在**合法切点就一定切得出来。
+//
+//	slack = floor(高侧).Min − floor(低侧).Max      // 两个下界之间还剩多少空地
+//	低侧上限 = floor(低侧).Max + max(0,slack)/2
+//	高侧下限 = floor(高侧).Min − max(0,slack)/2
+//
+// slack ≥ 0 时两者恰好落在同一点(切得开);slack < 0 时各自停在自己的下界 ——
+// 此时残留的重叠量正好等于「还差多少空地」,判据据此报出的最小挪动就是真正的
+// 最小值,而不是一个拍出来的数。
+//
+// 轴的选择:内容沿该轴天然分开(有空地或恰好相接)才算候选;两轴都可选时取
+// slack 更大的那条(让掉的边距更少 / 残留更小)。两轴都不可选(内容真交叠)
+// 返回 "" —— 那是挪件才能解决的病。
+//
+// 纯函数、与顺序无关:交换 a/b 只翻转 aFirst,axis 与两个界不变。
+func partitionGapSplit(ca, cb, fa, fb layoutBBox) (axis string, aFirst bool, loLimit, hiLimit float64) {
+	// 一条轴上的判定:内容区间 [caLo,caHi] / [cbLo,cbHi],下界 [faLo,faHi] / [fbLo,fbHi]。
+	split := func(caLo, caHi, cbLo, cbHi, faLo, faHi, fbLo, fbHi float64) (slack, lo, hi float64, first, ok bool) {
+		var floorLoMax, floorHiMin float64
+		switch {
+		case caHi <= cbLo+acOverlapEps: // a 在前(左/下)
+			floorLoMax, floorHiMin, first = faHi, fbLo, true
+		case cbHi <= caLo+acOverlapEps: // b 在前
+			floorLoMax, floorHiMin, first = fbHi, faLo, false
+		default:
+			return 0, 0, 0, false, false
+		}
+		slack = floorHiMin - floorLoMax
+		half := math.Max(0, slack) / 2
+		return slack, floorLoMax + half, floorHiMin - half, first, true
+	}
+	sx, lx, hx, fx, okx := split(ca.MinX, ca.MaxX, cb.MinX, cb.MaxX, fa.MinX, fa.MaxX, fb.MinX, fb.MaxX)
+	sy, ly, hy, fy, oky := split(ca.MinY, ca.MaxY, cb.MinY, cb.MaxY, fa.MinY, fa.MaxY, fb.MinY, fb.MaxY)
+	switch {
+	case okx && oky:
+		if sy > sx {
+			return "y", fy, ly, hy
+		}
+		return "x", fx, lx, hx
+	case okx:
+		return "x", fx, lx, hx
+	case oky:
+		return "y", fy, ly, hy
+	}
+	return "", false, 0, 0
 }
 
 // partitionNoteNeed 是一个分区「已登记说明要占多大地方」的规划输入(与坐标无关)。
@@ -457,10 +680,6 @@ func reserveNoteAreas(plan *partitionPlan, needs []partitionNoteNeed, sheet layo
 		}
 		rect, band, ax, ay, fit := reserveZoneNoteArea(plan.Partitions[i].BBox, n.Pins, n.W, n.H,
 			noteObstacles, sheet, keepout, neighbors, opts.Gutter)
-		titleBand := opts.TitleBand
-		if hgt := rect.MaxY - rect.MinY; titleBand > hgt/2 {
-			titleBand = hgt / 2
-		}
 		plan.Partitions[i].BBox = rect
 		plan.Partitions[i].NoteBBox = band
 		// 求解器的落点原样落进计划:`sch check` 的处方念的就是这一对,不再自己
@@ -468,8 +687,7 @@ func reserveNoteAreas(plan *partitionPlan, needs []partitionNoteNeed, sheet layo
 		// 一张求解器已经拒过的方子。
 		plan.Partitions[i].NoteAnchor = [2]float64{ax, ay}
 		plan.Partitions[i].NoteFits = fit
-		plan.Partitions[i].TitleBBox = layoutBBox{MinX: rect.MinX, MinY: rect.MaxY - titleBand,
-			MaxX: rect.MaxX, MaxY: rect.MaxY}
+		plan.Partitions[i].TitleBBox = partitionTitleBBox(rect, opts.TitleBand)
 	}
 }
 
@@ -588,16 +806,26 @@ func validatePartitionsWithJudge(plan partitionPlan, modules []partitionModule,
 			// 注释既有的设计意图),此前框因包住 marker 而擦线就整个 hard-block,
 			// 与「titleBlockHits 用 CoreBBox」的声明是两把尺。
 			hard := keepout != nil && boxesOverlap(p.BBox, *keepout)
-			if !hard {
-				for _, name := range p.Modules {
-					if core, ok := coreOf[name]; ok && boxesOverlap(core, *safe) {
-						hard = true
-						break
-					}
+			var coreUnion layoutBBox
+			hasCore := false
+			for _, name := range p.Modules {
+				core, ok := coreOf[name]
+				if !ok {
+					continue
+				}
+				if !hasCore {
+					coreUnion, hasCore = core, true
+				} else {
+					coreUnion = layoutBBox{MinX: minF(coreUnion.MinX, core.MinX), MinY: minF(coreUnion.MinY, core.MinY),
+						MaxX: maxF(coreUnion.MaxX, core.MaxX), MaxY: maxF(coreUnion.MaxY, core.MaxY)}
+				}
+				if boxesOverlap(core, *safe) {
+					hard = true
 				}
 			}
 			if hard {
 				v.TitleBlockHits++
+				v.TitleBlockDetail = append(v.TitleBlockDetail, titleBlockHitDetail(p, coreUnion, hasCore, *safe))
 			}
 		}
 		// A frame edge hugging the printed sheet frame reads as a double line.
@@ -610,6 +838,8 @@ func validatePartitionsWithJudge(plan partitionPlan, modules []partitionModule,
 		for j := i + 1; j < len(ps); j++ {
 			if boxesOverlap(ps[i].BBox, ps[j].BBox) {
 				v.PartitionOverlap++
+				v.PartitionOverlapDetail = append(v.PartitionOverlapDetail,
+					partitionOverlapDetail(plan.Sheet, ps[i], ps[j]))
 			}
 		}
 	}
@@ -704,6 +934,121 @@ func overhangText(frame, inner layoutBBox) string {
 		return "边界擦线"
 	}
 	return strings.Join(parts, "、")
+}
+
+// ── blocked 的可执行化(正本第 8 条:报出是谁、每条边各卡在哪、出路是什么)──
+//
+// 真机 2026-08-24:`zone-draw` 拒画只说得出 "PartitionOverlap:3 TitleBlockHits:1",
+// 出路一句「`sch zone-arrange --apply` 重排」。那是整页重排 —— 重、有风险、本身
+// 还可能 blocked(USB_DEBUG 页四条边全被堵),于是两页的交付被卡在这里。下面这组
+// 函数把每一条违规折成**一条能直接抄去跑的最小挪动**。
+
+// partitionZoneName 是这一区在 `--zone` 命名空间里的名字(一区一框,恒为单名;
+// 老数据里的多模块分区退回拼接名,并在提示里如实带出)。
+func partitionZoneName(p partitionRect) string {
+	if len(p.Modules) == 1 {
+		return p.Modules[0]
+	}
+	return strings.Join(p.Modules, " / ")
+}
+
+// zoneMoveStep 把「至少要拉开多少」向上取整到吸附网格 —— 报一个吸不住的数,
+// 等于开了一张抄下来跑不通的方子。
+func zoneMoveStep(need float64) float64 {
+	if need <= 0 {
+		return acSchGrid
+	}
+	return math.Ceil(need/acSchGrid) * acSchGrid
+}
+
+// zoneMoveHint 折出命令行本身。y-UP 在这里必须写出来:正值向上是本仓踩过的坑。
+func zoneMoveHint(zone string, dx, dy float64) string {
+	if dx != 0 {
+		return fmt.Sprintf("`easyeda sch zone move --zone %s --dx %+.0f`", zone, dx)
+	}
+	return fmt.Sprintf("`easyeda sch zone move --zone %s --dy %+.0f`(y-UP:正值向上)", zone, dy)
+}
+
+func shiftBBox(b layoutBBox, dx, dy float64) layoutBBox {
+	return layoutBBox{MinX: b.MinX + dx, MinY: b.MinY + dy, MaxX: b.MaxX + dx, MaxY: b.MaxY + dy}
+}
+
+// zoneSeparationHint 给出「把这一对沿 axis 拉开」的最小挪动:优先挪那个挪完还
+// 留在纸面内的区;两个都会出纸面就如实说这页装不下(拆页才是出路)。
+func zoneSeparationHint(sheet layoutBBox, a, b partitionRect, axis string, need float64) string {
+	step := zoneMoveStep(need)
+	ax, ay := bboxCenter(a.BBox)
+	bx, by := bboxCenter(b.BBox)
+	first, second := a, b
+	if (axis == "x" && bx < ax) || (axis == "y" && by < ay) {
+		first, second = b, a
+	}
+	type cand struct {
+		zone   string
+		dx, dy float64
+		rect   layoutBBox
+	}
+	var cands []cand
+	if axis == "x" {
+		cands = []cand{
+			{partitionZoneName(second), step, 0, shiftBBox(second.BBox, step, 0)},
+			{partitionZoneName(first), -step, 0, shiftBBox(first.BBox, -step, 0)},
+		}
+	} else {
+		cands = []cand{
+			{partitionZoneName(second), 0, step, shiftBBox(second.BBox, 0, step)},
+			{partitionZoneName(first), 0, -step, shiftBBox(first.BBox, 0, -step)},
+		}
+	}
+	for _, c := range cands {
+		if bboxContains(sheet, c.rect) {
+			return fmt.Sprintf("沿 %s 拉开至少 %.0f:%s", axis, step, zoneMoveHint(c.zone, c.dx, c.dy))
+		}
+	}
+	return fmt.Sprintf("沿 %s 需要拉开 %.0f,但两边挪都会出纸面 —— 这一页装不下,出路是拆页或区内收敛(`sch zone-arrange --apply`)",
+		axis, step)
+}
+
+// partitionOverlapDetail 逐对说清:谁顶谁、重叠多少、**是内容真交叠还是版式预留
+// 顶住**(两种病修法不同)、以及最小挪动。
+func partitionOverlapDetail(sheet layoutBBox, a, b partitionRect) string {
+	ox := math.Min(a.BBox.MaxX, b.BBox.MaxX) - math.Max(a.BBox.MinX, b.BBox.MinX)
+	oy := math.Min(a.BBox.MaxY, b.BBox.MaxY) - math.Max(a.BBox.MinY, b.BBox.MinY)
+	cause := "两区的成员体积本身就交叠 —— 不存在既包住各自内容、又互不重叠的一组框,只能挪件"
+	if !boxesOverlap(a.contentRect(), b.contentRect()) {
+		cause = "两区体积并不交叠,顶住的是版式预留(区名带/说明带 + 边距);可让的边距已经对半让到底,仍差这么多"
+	}
+	// 先给省力的那条轴(推得少),另一条附在后面。
+	axes := []string{"x", "y"}
+	needs := map[string]float64{"x": ox, "y": oy}
+	if oy < ox {
+		axes = []string{"y", "x"}
+	}
+	return fmt.Sprintf("区 %q ↔ 区 %q:框重叠 %.0f×%.0f,%s。%s;或%s",
+		partitionZoneName(a), partitionZoneName(b), ox, oy, cause,
+		zoneSeparationHint(sheet, a, b, axes[0], needs[axes[0]]),
+		zoneSeparationHint(sheet, a, b, axes[1], needs[axes[1]]))
+}
+
+// titleBlockHitDetail 说清这一区**哪块东西**压进了图签禁区、压了多深、往哪挪。
+// intruder 取「真正伸进去的那块」:器件本体优先(判据本来就按 CoreBBox 判 hard),
+// 退而求其次是内容并集,再不行才是框。
+func titleBlockHitDetail(p partitionRect, core layoutBBox, hasCore bool, safe layoutBBox) string {
+	intruder, what := p.BBox, "框"
+	if c := p.contentRect(); boxesOverlap(c, safe) {
+		intruder, what = c, "模块体积"
+	}
+	if hasCore && boxesOverlap(core, safe) {
+		intruder, what = core, "器件本体"
+	}
+	up := safe.MaxY - intruder.MinY
+	left := intruder.MaxX - safe.MinX
+	hint := zoneMoveHint(partitionZoneName(p), 0, zoneMoveStep(up))
+	if left > 0 && left < up {
+		hint = zoneMoveHint(partitionZoneName(p), -zoneMoveStep(left), 0)
+	}
+	return fmt.Sprintf("区 %q:%s %s 压进图签安全带 %s(上让 %.0f 或左让 %.0f 即可清空)—— %s",
+		partitionZoneName(p), what, bboxText(intruder), bboxText(safe), math.Max(0, up), math.Max(0, left), hint)
 }
 
 func bboxText(b layoutBBox) string {
@@ -994,7 +1339,7 @@ Draw it with ` + "`sch zone-draw --mode partition`" + `.`,
 			}
 			renderPartitionPlan(plan, stdout)
 			if !plan.Validation.clean() {
-				return fmt.Errorf("zone-plan: validation not clean (%+v)", plan.Validation)
+				return fmt.Errorf("zone-plan: validation not clean %s(逐条修法见上面的 ✗ 行)", plan.Validation.counters())
 			}
 			return nil
 		},
@@ -1332,6 +1677,14 @@ func renderPartitionPlan(plan partitionPlan, w io.Writer) {
 	for _, d := range v.ModuleOutsideDetail {
 		fmt.Fprintf(w, "  ✗ %s\n", d)
 	}
+	// 逐对/逐区的可执行明细与 `zone-draw` 拒画时说的是同一批话(partitionDrawGate
+	// 念的是同一个 Detail 切片)—— 「plan 说的」和「draw 拒的」不许是两套说法。
+	for _, d := range v.PartitionOverlapDetail {
+		fmt.Fprintf(w, "  ✗ %s\n", d)
+	}
+	for _, d := range v.TitleBlockDetail {
+		fmt.Fprintf(w, "  ✗ %s\n", d)
+	}
 	if v.clean() {
 		fmt.Fprintln(w, "✓ plan is clean")
 		return
@@ -1346,8 +1699,8 @@ func renderPartitionPlan(plan partitionPlan, w io.Writer) {
 	// 归组是「一区一框」之后,--gutter 不再影响分区框怎么分,所以这里不能再建议
 	// 「收紧 --gutter」——重叠 = 两个区的体积真的互相压,只有挪件/重排/拆页三条路。
 	fmt.Fprintln(w, "✗ plan has violations — 容量是够的,是摆放/间距问题:"+
-		"`sch zone-arrange --apply` 整页重排、用 `sch group-move` 挪开互相顶住的组,"+
-		"或把模块拆到下一页")
+		"照上面每条 ✗ 给的最小挪动逐条挪(`sch zone move --zone … --dx/--dy`),"+
+		"挪不动再上整页重排 `sch zone-arrange --apply`,或把模块拆到下一页")
 }
 
 // partitionDrawGate 是「这份计划能不能画」的**唯一判据**,两条画框路径
@@ -1361,22 +1714,37 @@ func partitionDrawGate(plan partitionPlan) error {
 	if plan.Validation.clean() {
 		return nil
 	}
+	v := plan.Validation
 	why := ""
-	if len(plan.Validation.ModuleOutsideDetail) > 0 {
-		why = "\n  " + strings.Join(plan.Validation.ModuleOutsideDetail, "\n  ")
+	for _, d := range v.ModuleOutsideDetail {
+		why += "\n  ✗ " + d
 	}
 	if plan.LabelScope.Degraded {
 		why += "\n  ⚠ 标签范围口径降级:" + labelScopeReason(plan.LabelScope)
 	}
-	if plan.Validation.PartitionOverlap > 0 {
-		// 分区框重叠 = 两个区的 L1 体积本身交叠(框由体积撑出来,不裁剪)。
-		// 修法是挪件,不是把框切短、更不是把判据调松。
-		why += fmt.Sprintf("\n  ⚠ %d 对分区框重叠:两个区的成员体积本身就交叠 —— "+
-			"`sch zone-arrange --apply` 重排(它按 gutter 隔开各区),或 `sch group-move` 手工挪开",
-			plan.Validation.PartitionOverlap)
+	if v.PartitionOverlap > 0 {
+		// 分区框重叠 = 收紧(tightenPartitionFrames,边距已经对半让掉)之后**仍然**
+		// 压在一起。逐对报出是谁、重叠多少、是内容真交叠还是版式带顶住,并给一条
+		// 能直接抄去跑的最小挪动 —— 整页重排(`sch zone-arrange --apply`)是最后一档,
+		// 不是唯一一档。
+		why += fmt.Sprintf("\n  ⚠ %d 对分区框重叠(边距已让到底,仍压在一起):", v.PartitionOverlap)
+		for _, d := range v.PartitionOverlapDetail {
+			why += "\n    · " + d
+		}
+		why += "\n    · 一对一对挪不动时再上整页重排:`sch zone-arrange --apply`(它按 gutter 隔开各区),或把模块拆到下一页"
 	}
-	return fmt.Errorf("partition plan has violations %+v — refusing to draw overlapping/out-of-sheet annotations%s",
-		plan.Validation, why)
+	if v.TitleBlockHits > 0 {
+		why += fmt.Sprintf("\n  ⚠ %d 个分区压到图签禁区:", v.TitleBlockHits)
+		for _, d := range v.TitleBlockDetail {
+			why += "\n    · " + d
+		}
+	}
+	if v.SheetOverflow > 0 || v.SheetMarginHits > 0 {
+		why += fmt.Sprintf("\n  ⚠ %d 个分区出纸面 / %d 个贴纸边(< %.0f 单位):内容本体自己贴着图框 —— 把该区往纸面中心挪(`easyeda sch zone move --zone <区> --dx/--dy`)",
+			v.SheetOverflow, v.SheetMarginHits, sheetEdgeMinGap)
+	}
+	return fmt.Errorf("partition plan has violations %s — refusing to draw overlapping/out-of-sheet annotations%s",
+		v.counters(), why)
 }
 
 // runPartitionDraw draws (or clears) the partition frames, persisted per-page.

@@ -772,8 +772,15 @@ func partitionFindingForZones(parts, frameRects, labelTexts, textCount, zones in
 	if frameRects == 0 {
 		msg := fmt.Sprintf("%d 个器件的页没有功能分区框 — 铁律#15:`sch zones set` → `sch zone-draw`(整纸版式 `--mode partition`);交付前必须有", parts)
 		if zones > 0 {
+			// **出路必须是轻的那一条**(2026-08-24):此前这里只写「先 `zone-arrange
+			// --apply` 拉开各区」—— 整页重排是重操作、有风险、本身还可能 blocked,于是
+			// 「画不出框 → check 报没框 → gate FAIL」在真机上把交付卡死了两页。
+			// `zone-plan` 现在逐对报出「谁顶谁 / 还差多少 / 一条 `sch zone move` 命令」,
+			// 先走那条;整页重排降级成最后一档。
 			msg = fmt.Sprintf("%d 个器件的页已分成 %d 个功能模块(虚拟组/认领)但一个分区框都没画 — 铁律#15:`sch zone-draw --mode partition`;"+
-				"若 `sch zone-plan` 报 partitionOverlap,先 `sch zone-arrange --apply` 拉开各区或把模块拆到下一页,再画", parts, zones)
+				"被拒(partitionOverlap / titleBlockHits)就先跑 `sch zone-plan` 看逐条 ✗ —— 它点名是哪两个区顶住、还差多少,"+
+				"并给出一条 `sch zone move --zone <区> --dx/--dy <量>` 的最小挪动;挪完再画,"+
+				"整页重排 `sch zone-arrange --apply` 或拆页是最后一档", parts, zones)
 		}
 		out = append(out, &checkFinding{
 			Type:    "missing-partition",
