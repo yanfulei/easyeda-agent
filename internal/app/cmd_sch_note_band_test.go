@@ -108,8 +108,12 @@ func TestSetZoneNoteSizes_PositionIndependent(t *testing.T) {
 // ── 新 2:note-outside-zone 正负对照 ────────────────────────────────────────
 
 func TestNoteOutsideZoneFindings_PositiveAndNegative(t *testing.T) {
+	// POWER 这一区的带装得下(NoteFits/NoteAnchor 就是求解器的输出,处方直接念它)。
+	powerFrame, powerBand := layoutBBox{236, 502, 671, 754}, layoutBBox{236, 502, 671, 557}
+	px, py, powerFits := scanNoteBand(powerBand, powerFrame, 77, 39, nil, layoutBBox{0, 0, 1170, 825}, nil)
 	parts := []partitionRect{
-		{Modules: []string{"POWER"}, BBox: layoutBBox{236, 502, 671, 754}, NoteBBox: layoutBBox{236, 502, 671, 557}},
+		{Modules: []string{"POWER"}, BBox: powerFrame, NoteBBox: powerBand,
+			NoteAnchor: [2]float64{px, py}, NoteFits: powerFits},
 		{Modules: []string{"MCU"}, BBox: layoutBBox{32, 180, 364, 760}, NoteBBox: layoutBBox{32, 180, 364, 235}},
 	}
 	zones := map[string]*workflow.SchZoneClaim{
@@ -159,8 +163,14 @@ func TestNoteOutsideZoneMessage_ActionableBothWays(t *testing.T) {
 	frame := layoutBBox{236, 373, 671, 754}
 	band := layoutBBox{236, 373, 671, 528}
 	t.Run("带装得下→给算好的落点坐标", func(t *testing.T) {
+		// 处方念的是求解器落进计划的那一对(NoteAnchor/NoteFits),不再自己重算。
+		ax, ay, ok := scanNoteBand(band, frame, 120, 39, nil, layoutBBox{0, 0, 1170, 825}, nil)
+		if !ok {
+			t.Fatal("fixture 失效:这条带本该装得下")
+		}
 		msg := noteOutsideZoneMessage("POWER", zoneMoveText{ID: "t1", X: 250, Y: 435,
-			Content: "SY8089 5V→3V3\n2A 1.5MHz\n输入22uF 输出22uF", FontSize: 10}, frame, band)
+			Content: "SY8089 5V→3V3\n2A 1.5MHz\n输入22uF 输出22uF", FontSize: 10},
+			partitionRect{BBox: frame, NoteBBox: band, NoteAnchor: [2]float64{ax, ay}, NoteFits: true})
 		for _, want := range []string{"--x ", "--y ", "sch note --zone POWER", "prim-delete"} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("缺可执行修法 %q:%s", want, msg)
@@ -170,7 +180,8 @@ func TestNoteOutsideZoneMessage_ActionableBothWays(t *testing.T) {
 	t.Run("带装不下→绝不建议原样重跑", func(t *testing.T) {
 		tiny := layoutBBox{116, 434, 184, 476} // 68 宽的窄带
 		msg := noteOutsideZoneMessage("POWER_IN", zoneMoveText{ID: "t2", X: 50, Y: 400,
-			Content: strings.Repeat("宽", 30), FontSize: 10}, layoutBBox{116, 434, 184, 614}, tiny)
+			Content: strings.Repeat("宽", 30), FontSize: 10},
+			partitionRect{BBox: layoutBBox{116, 434, 184, 614}, NoteBBox: tiny})
 		if !strings.Contains(msg, "别再原样重跑") {
 			t.Errorf("装不下时必须明说别原样重跑(否则就是死循环):%s", msg)
 		}
@@ -188,13 +199,14 @@ func simulateNotePlacement(plan partitionPlan, zone, content string, fontSize fl
 	obstacles []layoutBBox, sheet layoutBBox, keepout *layoutBBox, opts partitionOpts) (
 	wrapped string, rect, band layoutBBox, x, y float64, ok bool) {
 
-	zr, nb, _, matched := matchNotePartition(plan.Partitions, zone)
+	zr, _, _, matched := matchNotePartition(plan.Partitions, zone)
 	if !matched {
 		return "", layoutBBox{}, layoutBBox{}, 0, 0, false
 	}
+	pins := plan.Partitions[notePartitionIndex(plan.Partitions, zone)].notePins()
 	wrapped = wrapNoteContent(content, fontSize, noteWrapWidth(zr.MaxX-zr.MinX))
 	w, h := noteSizeOf(wrapped, fontSize)
-	rect, band, x, y, ok = reserveZoneNoteArea(*zr, nb.MaxY, w, h, obstacles, sheet, keepout,
+	rect, band, x, y, ok = reserveZoneNoteArea(*zr, pins, w, h, obstacles, sheet, keepout,
 		partitionBaseRects(plan.Partitions, zone), opts.Gutter)
 	return wrapped, rect, band, x, y, ok
 }

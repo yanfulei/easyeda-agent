@@ -229,9 +229,15 @@ func TestNoteFlush_NeverOverlapsToStayFlush(t *testing.T) {
 	t.Run("A2 下探被顶死→如实失败,不压上去", func(t *testing.T) {
 		// 器件区几乎贴着纸边下沿:说明带只有 floor..bandTop 这么点,而且被一条
 		// 横跨整条带的占用堵死 —— 再往下就穿出纸边,没有任何合法落点。
+		//
+		// topBlocker 是 2026-08-20 补的:底带走不通时求解器会把说明带翻到**框顶**
+		// (reserveZoneNoteAreaTop),那是一条真实的退路,所以「只堵住下面」已经
+		// 不再是"顶死"。要让这条负对照继续有鉴别力,上下两个方向都得堵死 ——
+		// 否则它测的就不是"如实失败",而是"退路没实现"。
 		mod := partitionModule{Name: "POWER_IN", BBox: layoutBBox{200, 100, 500, 300}}
-		blocker := layoutBBox{100, 0, 600, 92} // 盖住整条带
-		obstacles := []layoutBBox{mod.BBox, blocker}
+		blocker := layoutBBox{100, 0, 600, 92}       // 盖住整条底带
+		topBlocker := layoutBBox{100, 310, 600, 813} // 器件区之上到纸边全被占住
+		obstacles := []layoutBBox{mod.BBox, blocker, topBlocker}
 		plan := planPartitionsWithNotes(sheet, nil, []partitionModule{mod}, opts, obstacles)
 		_, rect, band, x, y, ok := simulateNotePlacement(plan, "POWER_IN", noteContentOf(3), 10, obstacles, sheet, nil, opts)
 		if ok {
@@ -329,7 +335,7 @@ func TestNoteFlush_TooTallReportsWhyAndWhatNext(t *testing.T) {
 	band := layoutBBox{116, 434, 184, 476}
 	msg := noteOutsideZoneMessage("POWER_IN", zoneMoveText{ID: "t2", X: 50, Y: 400,
 		Content:  strings.Repeat("宽", 30) + "\n" + strings.Repeat("宽", 30) + "\n" + strings.Repeat("宽", 30),
-		FontSize: 10}, frame, band)
+		FontSize: 10}, partitionRect{BBox: frame, NoteBBox: band})
 	for _, want := range []string{"装不下", "说明带只有", "缩短文字", "--font-size", "group-move", "别再原样重跑"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("装不下的报文缺 %q:%s", want, msg)
@@ -369,8 +375,7 @@ func TestRuler_NoteBandDefinitionSolverAndCheckAgree(t *testing.T) {
 	}
 
 	// ③ check 的处方必须逐字等于②,而且处方落点必须在**带内**。
-	msg := noteOutsideZoneMessage("MCU", zoneMoveText{ID: "t1", X: 900, Y: 800, Content: content, FontSize: 10},
-		p.BBox, p.NoteBBox)
+	msg := noteOutsideZoneMessage("MCU", zoneMoveText{ID: "t1", X: 900, Y: 800, Content: content, FontSize: 10}, p)
 	m := noteFixHintRe.FindStringSubmatch(msg)
 	if m == nil {
 		t.Fatalf("带装得下时必须给出算好的落点坐标:%s", msg)

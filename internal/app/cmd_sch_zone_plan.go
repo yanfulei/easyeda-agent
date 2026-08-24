@@ -57,14 +57,40 @@ func moduleCoreBBox(m partitionModule) layoutBBox {
 	return m.CoreBBox
 }
 
+// zoneNotePins 是「说明带钉在哪两条边上」的**唯一事实来源**:两条边都由器件区
+// (content)直接算出,随计划落盘。任何消费者(`sch note` 的落点求解、`sch check`
+// 的 note-outside-zone 处方)只**读**它,绝不从框反推 —— 框会为说明横向扩边、
+// 向下下探、向上长高,从扩过的框反推带边就是第二把尺(2026-08-20 真机定案)。
+type zoneNotePins struct {
+	// Bottom 是**底带的带顶** = 器件区下沿(content.MinY - partitionContentPad)。
+	// 框为说明下探时它固定不动 —— 器件区一寸不挤。
+	Bottom float64 `json:"bottom"`
+	// Top 是**顶带的带底** = 器件区上沿(content.MaxY + partitionContentPad)。
+	// 底带走不通(框底顶着图签/纸边/邻框)时,说明带开到框顶,靠向上扩边腾地方。
+	Top float64 `json:"top"`
+	// Title 是框顶留给区名的带高:顶带必须让开它,否则说明会压住区名标签。
+	Title float64 `json:"title"`
+}
+
 // partitionRect is one planned partition: the rectangle, its title band, and the
 // modules assigned to it.
 type partitionRect struct {
 	Modules   []string   `json:"modules"`
 	BBox      layoutBBox `json:"bbox"`
 	TitleBBox layoutBBox `json:"titleBBox"`
-	// NoteBBox 是框内底部留给电路说明的一条带(区名在顶、说明在底,都在框内)。
+	// NoteBBox 是框内留给电路说明的一条带 —— 默认在框底(区名在顶、说明在底),
+	// 框底走不通时翻到框顶、区名带之下(见 reserveZoneNoteAreaTop)。
 	NoteBBox layoutBBox `json:"noteBBox"`
+	// NotePins 是这条带钉住的器件区两沿(+ 区名带高),见 zoneNotePins。
+	NotePins zoneNotePins `json:"notePins"`
+	// NoteAnchor / NoteFits 是**求解器**(reserveZoneNoteArea)算出的落点,由
+	// planner 原样落进计划。`sch check` 的 note-outside-zone 处方直接念它 ——
+	// 处方与落点结构上不可能分家。此前 check 自己按「带底 + 内缩」重算一遍、
+	// 且**只判框/带包含,不判占用与图签禁区**,于是同一次交互里出现过
+	// 「note 说装不下 / check 说已为它留好位置 --x 275 --y 162.5」的当面打架
+	// (2026-08-20 真机,该坐标其实压在图签上)。
+	NoteAnchor [2]float64 `json:"noteAnchor,omitempty"`
+	NoteFits   bool       `json:"noteFits,omitempty"`
 	// BaseBBox 是**为说明扩边之前**的框。扩边界(不许越过哪个邻框)必须钉在基础
 	// 框上:`sch note` 看到的是「本区还没登记说明」的计划,planner 重算时看到的是
 	// 「已登记」的计划,两边只有都拿基础框当邻居,算出的扩边界才逐字段相同。
@@ -77,6 +103,15 @@ func (p partitionRect) baseRect() layoutBBox {
 		return p.BBox
 	}
 	return p.BaseBBox
+}
+
+// notePins 返回这一区的说明带钉边。老计划/手写 fixture 没填 NotePins 时回退到
+// 「带顶 = NoteBBox.MaxY、无顶带」—— 即修复前的行为,不会凭空多出一条顶带。
+func (p partitionRect) notePins() zoneNotePins {
+	if (p.NotePins == zoneNotePins{}) {
+		return zoneNotePins{Bottom: p.NoteBBox.MaxY}
+	}
+	return p.NotePins
 }
 
 // partitionValidation counts every way a plan can be wrong (all should be 0).
@@ -365,6 +400,13 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 		// (器件区一寸不挤)。`sch note` 拿 NoteBBox.MaxY 当带顶复算预留,两边
 		// 因此对得上 —— 带顶若跟着带高走,登记前后就是两个不同的基准。
 		bandTop := math.Min(rect.MaxY, math.Max(rect.MinY, content.MinY-partitionContentPad))
+		// 顶带的钉边(器件区上沿)同样只由 content 推,和带高无关 —— 底带走不通时
+		// 说明带翻到框顶,靠向上扩边腾地方,器件区照样一寸不挤。
+		pins := zoneNotePins{
+			Bottom: bandTop,
+			Top:    math.Max(rect.MinY, math.Min(rect.MaxY, content.MaxY+partitionContentPad)),
+			Title:  opts.TitleBand,
+		}
 		plan.Partitions = append(plan.Partitions, partitionRect{
 			Modules:  names,
 			BBox:     rect,
@@ -375,8 +417,9 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 			// **带的定义只有 zoneNoteBand 一个函数**(落点求解与 note-outside-zone
 			// 判据读的是同一条带),这里不许再写一遍字面量。
 			NoteBBox: zoneNoteBand(rect, bandTop),
+			NotePins: pins,
 		})
-		noteNeeds = append(noteNeeds, partitionNoteNeed{W: noteW, H: noteH, BandTop: bandTop})
+		noteNeeds = append(noteNeeds, partitionNoteNeed{W: noteW, H: noteH, Pins: pins})
 	}
 	reserveNoteAreas(&plan, noteNeeds, sheet, keepout, opts, noteObstacles)
 	plan.Validation = validatePartitions(plan, modules, keepout)
@@ -384,7 +427,10 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 }
 
 // partitionNoteNeed 是一个分区「已登记说明要占多大地方」的规划输入(与坐标无关)。
-type partitionNoteNeed struct{ W, H, BandTop float64 }
+type partitionNoteNeed struct {
+	W, H float64
+	Pins zoneNotePins
+}
 
 // reserveNoteAreas 是规划器的**第二遍**:逐区把框扩到装得下它自己的说明。
 //
@@ -415,7 +461,7 @@ func reserveNoteAreas(plan *partitionPlan, needs []partitionNoteNeed, sheet layo
 				neighbors = append(neighbors, bases[j])
 			}
 		}
-		rect, band, _, _, _ := reserveZoneNoteArea(plan.Partitions[i].BBox, n.BandTop, n.W, n.H,
+		rect, band, ax, ay, fit := reserveZoneNoteArea(plan.Partitions[i].BBox, n.Pins, n.W, n.H,
 			noteObstacles, sheet, keepout, neighbors, opts.Gutter)
 		titleBand := opts.TitleBand
 		if hgt := rect.MaxY - rect.MinY; titleBand > hgt/2 {
@@ -423,6 +469,11 @@ func reserveNoteAreas(plan *partitionPlan, needs []partitionNoteNeed, sheet layo
 		}
 		plan.Partitions[i].BBox = rect
 		plan.Partitions[i].NoteBBox = band
+		// 求解器的落点原样落进计划:`sch check` 的处方念的就是这一对,不再自己
+		// 重算(重算 = 第二把尺)。fit=false 时 check 走「装不下」那档,绝不开
+		// 一张求解器已经拒过的方子。
+		plan.Partitions[i].NoteAnchor = [2]float64{ax, ay}
+		plan.Partitions[i].NoteFits = fit
 		plan.Partitions[i].TitleBBox = layoutBBox{MinX: rect.MinX, MinY: rect.MaxY - titleBand,
 			MaxX: rect.MaxX, MaxY: rect.MaxY}
 	}

@@ -858,18 +858,12 @@ func noteOutsideZoneFindingsFor(parts []partitionRect, zones map[string]*schZone
 		if zc == nil || len(zc.NoteIDs) == 0 {
 			continue
 		}
-		var frame *layoutBBox
-		var band layoutBBox
-		for i := range parts {
-			if strInSlice(parts[i].Modules, name) {
-				frame = &parts[i].BBox
-				band = parts[i].NoteBBox
-				break
-			}
-		}
-		if frame == nil {
+		idx := notePartitionIndex(parts, name)
+		if idx < 0 {
 			continue // 区不在本页分区计划里:没有框可归属(missing-partition 另管)
 		}
+		part := parts[idx]
+		frame := &part.BBox
 		for _, nid := range zc.NoteIDs {
 			t, ok := byID[nid]
 			if !ok {
@@ -887,7 +881,7 @@ func noteOutsideZoneFindingsFor(parts []partitionRect, zones map[string]*schZone
 				Count:       1,
 				At:          &checkPoint{X: t.X, Y: t.Y},
 				BBox:        &b,
-				Message:     noteOutsideZoneMessage(name, t, *frame, band),
+				Message:     noteOutsideZoneMessage(name, t, part),
 			})
 		}
 	}
@@ -898,18 +892,22 @@ func noteOutsideZoneFindingsFor(parts []partitionRect, zones map[string]*schZone
 // 「prim-delete 后重跑 `sch note --zone X`」,而在两种真机情形下它必然死循环:
 // (a) 说明比带宽,重跑落到一模一样的框外坐标;(b) 框只有 68 宽(区里只有一个
 // 2 脚端子),任何可读说明都装不进,于是永远报警。现在 zone-plan 会为说明扩边/
-// 下探,所以第一档修法给的是**算好的落点坐标**(照抄即可,不可能再落回原处);
-// 只有在可扩边界内确实装不下时才给「缩短文字/腾地方」那一档,并说清是哪一维不够。
-func noteOutsideZoneMessage(zone string, t zoneMoveText, frame, band layoutBBox) string {
+// 下探/翻到框顶,所以第一档修法给的是**算好的落点坐标**;只有在可扩边界内确实
+// 装不下时才给「缩短文字/腾地方」那一档,并说清是哪一维不够。
+//
+// **处方不再自己算坐标,而是念求解器落进计划里的那一对(NoteAnchor/NoteFits)。**
+// 这是 2026-08-20 那条用户可见 bug 的另一半根因:处方旧实现按「带底 + 内缩」重算
+// 一遍落点,判定条件却**只有框/带包含** —— 不判占用、不判图签禁区,而落点求解
+// (scanNoteBand → noteSpotFree)三者全判。于是同一次交互里两把尺当面打架:
+// `sch note` 说「装不下,只能落框外」,`sch check` 对同一条说明、同一条带说
+// 「已为它留好位置 --x 275 --y 162.5」—— 而那个坐标压在图签上,求解器早已拒过。
+func noteOutsideZoneMessage(zone string, t zoneMoveText, p partitionRect) string {
+	frame, band := p.BBox, p.NoteBBox
 	head := fmt.Sprintf("区 %q 的说明 %s @(%.0f,%.0f) 在分区框 (%.0f,%.0f)..(%.0f,%.0f) 外",
 		zone, t.ID, t.X, t.Y, frame.MinX, frame.MinY, frame.MaxX, frame.MaxY)
 	w, h := noteSizeOf(t.Content, t.FontSize)
-	// 处方坐标必须**逐字等于**落点求解会给出的贴底坐标(noteFlushAnchorY),而且
-	// 必须落在**带内**——此前按 `band.MinY+h+noteGap` 算并只判框内,于是出现过
-	// 「带 (36,12)..(204,70),处方却给 --y 80」这种把说明放到带外的报文(带的定义
-	// 与处方两把尺)。装不进带就走下面那档「装不下」,不许开一张自己都装不下的方子。
-	tx, ty := snapNote(band.MinX+noteGap), noteFlushAnchorY(band, h)
-	if box := noteAnchorBBox(tx, ty, w, h); bboxContains(band, box) && bboxContains(frame, box) {
+	if p.NoteFits {
+		tx, ty := p.NoteAnchor[0], p.NoteAnchor[1]
 		return fmt.Sprintf("%s — 修法:`sch note --zone %s --text … --x %g --y %g`(说明带 (%.0f,%.0f)..(%.0f,%.0f) 已为它留好位置),"+
 			"或 `sch prim-delete --ids %s` 后重跑不带 --x/--y 的 `sch note --zone %s`;框几何变过就再跑一次 `sch zone-draw --mode partition`",
 			head, zone, tx, ty, band.MinX, band.MinY, band.MaxX, band.MaxY, t.ID, zone)

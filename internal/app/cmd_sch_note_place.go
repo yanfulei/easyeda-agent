@@ -197,6 +197,15 @@ func zoneNoteBand(rect layoutBBox, bandTop float64) layoutBBox {
 		MaxY: math.Min(rect.MaxY, math.Max(rect.MinY, bandTop))}
 }
 
+// zoneTopNoteBand 是**顶带的唯一定义**:框顶、区名带之下、器件区上沿(bandBottom)
+// 之上的那条。与 zoneNoteBand 成对 —— 一个区的说明带只能是这两者之一,谁都不许
+// 在别处再拼一遍字面量。
+func zoneTopNoteBand(rect layoutBBox, bandBottom, titleBand float64) layoutBBox {
+	top := math.Max(rect.MinY, rect.MaxY-titleBand)
+	return layoutBBox{MinX: rect.MinX, MaxX: rect.MaxX, MaxY: top,
+		MinY: math.Min(top, math.Max(rect.MinY, bandBottom))}
+}
+
 // planNoteAnchor 求一个不与任何障碍碰撞的说明锚点。
 //
 // 候选顺序体现「说明属于它那个区」的语义:先贴着区内容的下沿(最常见的读图习惯
@@ -408,15 +417,76 @@ func noteExpandFloorX(rect layoutBBox, blockers []layoutBBox, sheet layoutBBox, 
 	return lim
 }
 
-func noteExpandFloorY(rect layoutBBox, blockers []layoutBBox, sheet layoutBBox, gutter float64) float64 {
+// noteExpandFloorY 是框**向下**扩边的底线。
+//
+// 判据从「blocker 整个在框底之下(b.MaxY <= rect.MinY)」改成「blocker 从框底
+// 之下起头(b.MinY < rect.MinY)」——这是 2026-08-20 那条用户可见 bug 的一半根因:
+// 图签安全带 (438,-30)..(1200,228) 罩住了框底 202,旧判据 `b.MaxY(228) <= 202`
+// 不成立 → 整个 blocker 被**跳过**,底线退化成纸边 12,于是「为说明扩边」把框底
+// 从 202 一路捅到 147,**穿过图签**。zone-plan 自己的 titleBlockHits 当场从 0 变 1
+// (自己撑出来的违规,zone-draw 会拒画),而带内每个候选点又被 noteSpotFree 的
+// 图签禁区全否掉 → 说明被回退链甩到框外 (865,441)。
+//
+// 末尾的 clamp 同样是不变式:**扩边只许向外长,绝不许把框底抬上去**。旧代码允许
+// floor > rect.MinY,调用方一句 `if base < floor { base = floor }` 就能把带底顶到
+// 框底之上,构造出一条负高度的"带"。
+//
+// **图签安全带不再叠 gutter**(第二处两把尺,随机配对测试 rand#131 抓到):
+// inflatedTitleKeepout 已经把裸图签外扩了 titleBlockSafety=30,那就是设计好的
+// 余量,zone-plan 第一遍的抬框(`lift = min(safe.MaxY, …)`)也是照 safe.MaxY 让的。
+// 这里再叠 12 的 gutter,底线就变成 safe.MaxY+12 —— 而它**跨过**了 planner 第一遍
+// 按带高算出的框底(safe.MaxY < 框底 < safe.MaxY+12)。于是同一区、同一条说明:
+// `sch note` 手上的框(带按默认高)在底线之上、够不着 → 翻去顶带;planner 重算的
+// 框(带按登记高)在底线之下、触发 clamp → 底带装得下。两侧给出两个不同的家。
+// 邻框仍留 gutter(那是框与框之间的视觉通道,与图签余量是两回事)。
+func noteExpandFloorY(rect layoutBBox, neighbors []layoutBBox, safe *layoutBBox, sheet layoutBBox, gutter float64) float64 {
 	lim := sheet.MinY + sheetEdgeMinGap
-	for _, b := range blockers {
+	consider := func(b layoutBBox, clear float64) {
 		if b.MaxX <= rect.MinX || b.MinX >= rect.MaxX {
-			continue // 横向不重叠
+			return // 横向不重叠
 		}
-		if b.MaxY <= rect.MinY && b.MaxY+gutter > lim {
-			lim = b.MaxY + gutter
+		if b.MinY >= rect.MinY {
+			return // 整个在框底之上,挡不着向下长
 		}
+		if c := b.MaxY + clear; c > lim {
+			lim = c
+		}
+	}
+	for _, n := range neighbors {
+		consider(n, gutter)
+	}
+	if safe != nil {
+		consider(*safe, 0)
+	}
+	if lim > rect.MinY {
+		lim = rect.MinY // 已经贴着/嵌进 blocker:一寸都不许再下探
+	}
+	return lim
+}
+
+// noteExpandCeilY 是 noteExpandFloorY 的镜像:框**向上**扩边(为顶带腾地方)的
+// 上限。同一套判据、同一条 clamp —— 两个方向分家就是又一把尺。
+func noteExpandCeilY(rect layoutBBox, neighbors []layoutBBox, safe *layoutBBox, sheet layoutBBox, gutter float64) float64 {
+	lim := sheet.MaxY - sheetEdgeMinGap
+	consider := func(b layoutBBox, clear float64) {
+		if b.MaxX <= rect.MinX || b.MinX >= rect.MaxX {
+			return
+		}
+		if b.MaxY <= rect.MaxY {
+			return // 整个在框顶之下,挡不着向上长
+		}
+		if c := b.MinY - clear; c < lim {
+			lim = c
+		}
+	}
+	for _, n := range neighbors {
+		consider(n, gutter)
+	}
+	if safe != nil {
+		consider(*safe, 0)
+	}
+	if lim < rect.MaxY {
+		lim = rect.MaxY
 	}
 	return lim
 }
@@ -427,25 +497,33 @@ func noteExpandFloorY(rect layoutBBox, blockers []layoutBBox, sheet layoutBBox, 
 // 落点,落点必然被框包含,note-outside-zone 结构上不再误报。
 //
 //	rect      : 未为说明扩边前的分区框(内容 ± pad + 标题带 + 按高度预留的带)
-//	bandTop   : 说明带顶 = 器件区下沿(= content.MinY - partitionContentPad)。
-//	            **扩边时它固定不动** —— 器件区一寸不挤,框只向外长。
+//	pins      : 说明带钉住的器件区两沿 + 区名带高(zoneNotePins,由 planner 从
+//	            content 直接算出)。**扩边时它们固定不动** —— 器件区一寸不挤,
+//	            框只向外长。
 //	w,h       : 说明的渲染尺寸(已按框宽折行)
 //	obstacles : 说明不许压的图元(器件 / marker 文字带 / 未登记的自由文本)
 //	neighbors : 其它分区的**基础框**(扩边前),用来定扩边界
 //
-// 两个维度都参与预留:
+// 三个自由度依次用:
 //   - 宽:框宽 < requiredNoteWidth(w) 就横向扩边(先右后左)。窄框(2 脚端子)
 //     结构上装不下任何可读说明,唯一讲得通的策略就是让框为说明扩边。
-//   - 高:带高至少 requiredNoteBand(h);带内被外来图元(邻区桩线/marker)占住时
-//     逐档下探,直到带里有一处可用落点。
+//   - 高(底带):带高至少 requiredNoteBand(h);带内被外来图元(邻区桩线/marker)
+//     占住时逐档下探,直到带里有一处可用落点。
+//   - 高(顶带):框底真的一寸都下探不动时(器件贴着图签/纸边),把说明带翻到
+//     框顶、区名带之下,靠向上扩边腾地方。「说明在框底」只是读图习惯,
+//     「说明待在自己的框里」才是不变式。
 //
 // ok=false = 这一区在可扩边界内结构上装不下这条说明。**调用方必须显式报出来**,
 // 不许静默把说明踢到框外 —— 那正是这次要根治的症状。
-func reserveZoneNoteArea(rect layoutBBox, bandTop, w, h float64, obstacles []layoutBBox,
+func reserveZoneNoteArea(rect layoutBBox, pins zoneNotePins, w, h float64, obstacles []layoutBBox,
 	sheet layoutBBox, keepout *layoutBBox, neighbors []layoutBBox, gutter float64) (outRect, band layoutBBox, ax, ay float64, ok bool) {
 
+	safe := inflatedTitleKeepout(keepout)
+	// blockers 只喂横向扩边(X 方向:邻框与图签安全带同样留 gutter,那条路没出过
+	// 事,原样保留);纵向扩边的两条界另走 noteExpandFloorY/CeilY —— 它们必须区分
+	// 「邻框(留 gutter)」和「图签安全带(自带 titleBlockSafety,不再叠 gutter)」。
 	blockers := append([]layoutBBox(nil), neighbors...)
-	if safe := inflatedTitleKeepout(keepout); safe != nil {
+	if safe != nil {
 		blockers = append(blockers, *safe)
 	}
 	outRect = rect
@@ -459,8 +537,8 @@ func reserveZoneNoteArea(rect layoutBBox, bandTop, w, h float64, obstacles []lay
 		}
 	}
 	// ② 纵向:带高 ≥ requiredNoteBand(h),带内有占用就逐档下探。
-	floor := noteExpandFloorY(outRect, blockers, sheet, gutter)
-	base := math.Min(outRect.MinY, bandTop-requiredNoteBand(h))
+	floor := noteExpandFloorY(outRect, neighbors, safe, sheet, gutter)
+	base := math.Min(outRect.MinY, pins.Bottom-requiredNoteBand(h))
 	// 带底压到底线为止,**不是放弃**:此前 base 可以算到 floor 之下,循环第一档就
 	// `break`,于是「框底被纸边/图签/邻框顶住」的区一次带内扫描都没跑过,直接跌进
 	// 区外走廊 —— 真机 tactile_boot_reset(框底 28,贴着纸边)就是这么落到离框底 52
@@ -473,7 +551,7 @@ func reserveZoneNoteArea(rect layoutBBox, bandTop, w, h float64, obstacles []lay
 	}
 	// 带的定义走**唯一函数**(zoneNoteBand)—— planner 填 NoteBBox、这里下探、
 	// `sch check` 判归属,三处必须是同一条带。
-	bandOf := func(r layoutBBox) layoutBBox { return zoneNoteBand(r, bandTop) }
+	bandOf := func(r layoutBBox) layoutBBox { return zoneNoteBand(r, pins.Bottom) }
 	for k := 0; k <= noteBandDepthSteps; k++ {
 		r := outRect
 		r.MinY = base - float64(k)*noteAnchorStep
@@ -485,10 +563,48 @@ func reserveZoneNoteArea(rect layoutBBox, bandTop, w, h float64, obstacles []lay
 			return r, b, x, y, true
 		}
 	}
+	// ③ 底带走不通 → 顶带。
+	if r, b, x, y, hit := reserveZoneNoteAreaTop(outRect, pins, w, h, obstacles, sheet, keepout, neighbors, safe, gutter); hit {
+		return r, b, x, y, true
+	}
 	// 装不下:仍然把「最小预留」形态交出去(带高够、宽度尽力扩过),但 ok=false ——
 	// 调用方据此发可执行的告警,而不是假装成功。
 	outRect.MinY = math.Min(outRect.MinY, math.Max(base, floor))
 	return outRect, bandOf(outRect), 0, 0, false
+}
+
+// reserveZoneNoteAreaTop 是底带走不通时的**唯一**退路:把说明带开到框顶、区名带
+// 之下,靠向上扩边腾出来(纯函数,与底带共用 scanNoteBand 这把尺)。
+//
+// 为什么需要它(2026-08-20 真机定案):sy8089_buck_3v3 区的器件区下沿 202,而
+// A4 图签禁区估算顶 198、安全带顶 228 —— 器件本身就压在安全带里,zone-plan 第一遍
+// 于是把框底"让"到器件区下沿(内容一寸不让),**底带高度当场归零**。底带方向再无
+// 一寸可用:往下是图签。旧代码在这里硬穿图签扩出一条 55 高的带(zone-plan 自己的
+// titleBlockHits 立刻从 0 变 1),扫描又被图签禁区全否 → 说明被甩到框外右侧。
+// 框顶到纸边还有 300+ 的空当,说明的家就该在那儿。
+func reserveZoneNoteAreaTop(rect layoutBBox, pins zoneNotePins, w, h float64, obstacles []layoutBBox,
+	sheet layoutBBox, keepout *layoutBBox, neighbors []layoutBBox, safe *layoutBBox, gutter float64) (outRect, band layoutBBox, ax, ay float64, ok bool) {
+
+	if pins.Top <= 0 {
+		return rect, layoutBBox{}, 0, 0, false // 老计划没有顶带钉边:保持旧行为
+	}
+	ceil := noteExpandCeilY(rect, neighbors, safe, sheet, gutter)
+	base := math.Max(rect.MaxY, pins.Top+requiredNoteBand(h)+pins.Title)
+	if base > ceil {
+		return rect, layoutBBox{}, 0, 0, false // 上面也没地方了
+	}
+	for k := 0; k <= noteBandDepthSteps; k++ {
+		r := rect
+		r.MaxY = base + float64(k)*noteAnchorStep
+		if r.MaxY > ceil+acOverlapEps {
+			break
+		}
+		b := zoneTopNoteBand(r, pins.Top, pins.Title)
+		if x, y, hit := scanNoteBand(b, r, w, h, obstacles, sheet, keepout); hit {
+			return r, b, x, y, true
+		}
+	}
+	return rect, layoutBBox{}, 0, 0, false
 }
 
 // snapNote 把锚点吸到 5 格网格(与连接网格同口径,避免半格漂移)。
@@ -570,6 +686,18 @@ func partitionBaseRects(parts []partitionRect, zoneName string) []layoutBBox {
 	return out
 }
 
+// notePartitionIndex 是「zoneName 归属哪个分区」的**唯一**查找(-1 = 不在计划里)。
+// matchNotePartition、`sch note` 的落点侧、`sch check` 的 note-outside-zone 判据
+// 都走它 —— 各写一遍循环就是各一把尺。
+func notePartitionIndex(parts []partitionRect, zoneName string) int {
+	for i, p := range parts {
+		if strInSlice(p.Modules, zoneName) {
+			return i
+		}
+	}
+	return -1
+}
+
 // matchNotePartition 在分区计划里找 zoneName 归属的分区(纯函数)。
 //
 // 命中:返回该区的框与说明带,以及**其它所有分区的矩形**(根因 B:回退链的每
@@ -578,13 +706,7 @@ func partitionBaseRects(parts []partitionRect, zoneName string) []layoutBBox {
 // 未命中:matched=false,且返回**全部**分区矩形 —— 落不进任何区的说明只能整页
 // 避让,但绝不许落进任何分区框里。
 func matchNotePartition(parts []partitionRect, zoneName string) (zoneRect, noteBand *layoutBBox, others []layoutBBox, matched bool) {
-	idx := -1
-	for i, p := range parts {
-		if strInSlice(p.Modules, zoneName) {
-			idx = i
-			break
-		}
-	}
+	idx := notePartitionIndex(parts, zoneName)
 	for i, p := range parts {
 		if i != idx {
 			others = append(others, p.BBox)
@@ -689,7 +811,11 @@ func placeSchNote(cfg *appConfig, window, docUUID, zoneRef string, content *stri
 				// 障碍口径:已登记说明一律排除,否则又是自增长反馈环)。
 				bandObstacles := collectNoteObstacles(comps,
 					filterUnregisteredTexts(texts, registeredNoteIDs(zoneClaims)))
-				zr, nb, ax, ay, fit := reserveZoneNoteArea(*zoneRect, noteBand.MaxY, w, h,
+				// 带的钉边**读计划**(planner 从 content 算好落进 NotePins),
+				// 不从 noteBand 反推 —— 带一旦翻到框顶,`noteBand.MaxY` 就不再是
+				// 底带的带顶,反推出来的就是第二把尺。
+				pins := plan.Partitions[notePartitionIndex(plan.Partitions, zoneName)].notePins()
+				zr, nb, ax, ay, fit := reserveZoneNoteArea(*zoneRect, pins, w, h,
 					bandObstacles, *sheet, keepout, partitionBaseRects(plan.Partitions, zoneName), opts.Gutter)
 				zoneRect, noteBand = &zr, &nb
 				if fit {
