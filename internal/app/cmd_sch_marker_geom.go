@@ -891,9 +891,11 @@ func noteOutsideZoneFindingsFor(parts []partitionRect, zones map[string]*schZone
 // noteOutsideZoneMessage 生成告警文案。**修法必须真的能执行** —— 旧文案一律说
 // 「prim-delete 后重跑 `sch note --zone X`」,而在两种真机情形下它必然死循环:
 // (a) 说明比带宽,重跑落到一模一样的框外坐标;(b) 框只有 68 宽(区里只有一个
-// 2 脚端子),任何可读说明都装不进,于是永远报警。现在 zone-plan 会为说明扩边/
-// 下探/翻到框顶,所以第一档修法给的是**算好的落点坐标**;只有在可扩边界内确实
-// 装不下时才给「缩短文字/腾地方」那一档,并说清是哪一维不够。
+// 2 脚端子),任何可读说明都装不进,于是永远报警。现在 zone-plan 会为说明横向
+// 扩边 / 向下下探,所以第一档修法给的是**算好的落点坐标**;只有在可扩边界内确实
+// 装不下时才走第二档 —— 那一档就是设计正本第 8 条的 **blocked**,归因文本走
+// 唯一函数 noteBlockedDetail(是谁 / 每条边各卡在哪 / 出路是区内收敛还是拆页),
+// 与 `sch note` 落点侧的告警逐字同源。**说明带恒在框底,没有「翻到框顶」这档。**
 //
 // **处方不再自己算坐标,而是念求解器落进计划里的那一对(NoteAnchor/NoteFits)。**
 // 这是 2026-08-20 那条用户可见 bug 的另一半根因:处方旧实现按「带底 + 内缩」重算
@@ -912,10 +914,9 @@ func noteOutsideZoneMessage(zone string, t zoneMoveText, p partitionRect) string
 			"或 `sch prim-delete --ids %s` 后重跑不带 --x/--y 的 `sch note --zone %s`;框几何变过就再跑一次 `sch zone-draw --mode partition`",
 			head, zone, tx, ty, band.MinX, band.MinY, band.MaxX, band.MaxY, t.ID, zone)
 	}
-	return fmt.Sprintf("%s — 这条说明(%.0f×%.0f)在本区可扩边界内装不下(说明带只有 %.0f×%.0f):"+
-		"缩短文字或减小 --font-size 后 `sch prim-delete --ids %s` 重放,或用 `sch group-move` 把邻近模块挪开给这个区腾横向/纵向空间;"+
+	return fmt.Sprintf("%s — blocked:%s;收敛/拆页之后 `sch prim-delete --ids %s` 再重放这条说明。"+
 		"**别再原样重跑 `sch note`,那会落回同一个位置**",
-		head, w, h, band.MaxX-band.MinX, band.MaxY-band.MinY, t.ID)
+		head, noteBlockedDetail(zone, band, w, h), t.ID)
 }
 
 // schTextCount extracts the number of free text primitives from a

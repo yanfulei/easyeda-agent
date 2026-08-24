@@ -230,14 +230,13 @@ func TestNoteFlush_NeverOverlapsToStayFlush(t *testing.T) {
 		// 器件区几乎贴着纸边下沿:说明带只有 floor..bandTop 这么点,而且被一条
 		// 横跨整条带的占用堵死 —— 再往下就穿出纸边,没有任何合法落点。
 		//
-		// topBlocker 是 2026-08-20 补的:底带走不通时求解器会把说明带翻到**框顶**
-		// (reserveZoneNoteAreaTop),那是一条真实的退路,所以「只堵住下面」已经
-		// 不再是"顶死"。要让这条负对照继续有鉴别力,上下两个方向都得堵死 ——
-		// 否则它测的就不是"如实失败",而是"退路没实现"。
+		// **只堵下面就够了**(2026-08-24 回滚 67aa954 的上翻退路之后):说明带恒在
+		// 框底,底带走不通就是 blocked,不存在「翻到框顶」这条第二条路。此前为了让
+		// 这条负对照对上翻退路仍有鉴别力,额外加了一条 topBlocker 把框顶到纸边也堵死
+		// —— 退路删掉后那条障碍就是多余的伪装,一并去掉,免得掩盖底带判据的真实行为。
 		mod := partitionModule{Name: "POWER_IN", BBox: layoutBBox{200, 100, 500, 300}}
-		blocker := layoutBBox{100, 0, 600, 92}       // 盖住整条底带
-		topBlocker := layoutBBox{100, 310, 600, 813} // 器件区之上到纸边全被占住
-		obstacles := []layoutBBox{mod.BBox, blocker, topBlocker}
+		blocker := layoutBBox{100, 0, 600, 92} // 盖住整条底带
+		obstacles := []layoutBBox{mod.BBox, blocker}
 		plan := planPartitionsWithNotes(sheet, nil, []partitionModule{mod}, opts, obstacles)
 		_, rect, band, x, y, ok := simulateNotePlacement(plan, "POWER_IN", noteContentOf(3), 10, obstacles, sheet, nil, opts)
 		if ok {

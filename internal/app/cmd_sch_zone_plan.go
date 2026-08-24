@@ -57,19 +57,18 @@ func moduleCoreBBox(m partitionModule) layoutBBox {
 	return m.CoreBBox
 }
 
-// zoneNotePins 是「说明带钉在哪两条边上」的**唯一事实来源**:两条边都由器件区
+// zoneNotePins 是「说明带钉在哪条边上」的**唯一事实来源**:那条边由器件区
 // (content)直接算出,随计划落盘。任何消费者(`sch note` 的落点求解、`sch check`
 // 的 note-outside-zone 处方)只**读**它,绝不从框反推 —— 框会为说明横向扩边、
-// 向下下探、向上长高,从扩过的框反推带边就是第二把尺(2026-08-20 真机定案)。
+// 向下下探,从扩过的框反推带边就是第二把尺(2026-08-20 真机定案)。
+//
+// **只有一条钉边**:说明带恒在框底(设计正本第 2 条「区名左上、说明左下」)。
+// 曾短暂存在过的 Top/Title(顶带钉边)已随「上翻退路」一并回滚 —— 底带走不通
+// 是 blocked,不是换条带。
 type zoneNotePins struct {
-	// Bottom 是**底带的带顶** = 器件区下沿(content.MinY - partitionContentPad)。
+	// Bottom 是**带顶** = 器件区下沿(content.MinY - partitionContentPad)。
 	// 框为说明下探时它固定不动 —— 器件区一寸不挤。
 	Bottom float64 `json:"bottom"`
-	// Top 是**顶带的带底** = 器件区上沿(content.MaxY + partitionContentPad)。
-	// 底带走不通(框底顶着图签/纸边/邻框)时,说明带开到框顶,靠向上扩边腾地方。
-	Top float64 `json:"top"`
-	// Title 是框顶留给区名的带高:顶带必须让开它,否则说明会压住区名标签。
-	Title float64 `json:"title"`
 }
 
 // partitionRect is one planned partition: the rectangle, its title band, and the
@@ -78,10 +77,10 @@ type partitionRect struct {
 	Modules   []string   `json:"modules"`
 	BBox      layoutBBox `json:"bbox"`
 	TitleBBox layoutBBox `json:"titleBBox"`
-	// NoteBBox 是框内留给电路说明的一条带 —— 默认在框底(区名在顶、说明在底),
-	// 框底走不通时翻到框顶、区名带之下(见 reserveZoneNoteAreaTop)。
+	// NoteBBox 是框内**底部**留给电路说明的一条带(区名在顶、说明在底,都在框内)。
+	// 带只在框底 —— 装不下是 blocked,不是翻到框顶(设计正本第 2/8 条)。
 	NoteBBox layoutBBox `json:"noteBBox"`
-	// NotePins 是这条带钉住的器件区两沿(+ 区名带高),见 zoneNotePins。
+	// NotePins 是这条带钉住的器件区下沿,见 zoneNotePins。
 	NotePins zoneNotePins `json:"notePins"`
 	// NoteAnchor / NoteFits 是**求解器**(reserveZoneNoteArea)算出的落点,由
 	// planner 原样落进计划。`sch check` 的 note-outside-zone 处方直接念它 ——
@@ -106,7 +105,7 @@ func (p partitionRect) baseRect() layoutBBox {
 }
 
 // notePins 返回这一区的说明带钉边。老计划/手写 fixture 没填 NotePins 时回退到
-// 「带顶 = NoteBBox.MaxY、无顶带」—— 即修复前的行为,不会凭空多出一条顶带。
+// 「带顶 = NoteBBox.MaxY」—— 与带的定义(zoneNoteBand)自洽。
 func (p partitionRect) notePins() zoneNotePins {
 	if (p.NotePins == zoneNotePins{}) {
 		return zoneNotePins{Bottom: p.NoteBBox.MaxY}
@@ -400,13 +399,8 @@ func planPartitionsWithNotes(sheet layoutBBox, keepout *layoutBBox, modules []pa
 		// (器件区一寸不挤)。`sch note` 拿 NoteBBox.MaxY 当带顶复算预留,两边
 		// 因此对得上 —— 带顶若跟着带高走,登记前后就是两个不同的基准。
 		bandTop := math.Min(rect.MaxY, math.Max(rect.MinY, content.MinY-partitionContentPad))
-		// 顶带的钉边(器件区上沿)同样只由 content 推,和带高无关 —— 底带走不通时
-		// 说明带翻到框顶,靠向上扩边腾地方,器件区照样一寸不挤。
-		pins := zoneNotePins{
-			Bottom: bandTop,
-			Top:    math.Max(rect.MinY, math.Min(rect.MaxY, content.MaxY+partitionContentPad)),
-			Title:  opts.TitleBand,
-		}
+		// 钉边只有一条(说明带恒在框底):带顶 = 器件区下沿,与带高无关。
+		pins := zoneNotePins{Bottom: bandTop}
 		plan.Partitions = append(plan.Partitions, partitionRect{
 			Modules:  names,
 			BBox:     rect,

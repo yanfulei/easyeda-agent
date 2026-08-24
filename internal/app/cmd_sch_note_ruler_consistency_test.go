@@ -26,6 +26,16 @@ package app
 //
 // 本文件钉住修复后的配对:**求解器说能放下 ⇔ check 判定在框内、且 check 的处方
 // 就是求解器的落点**。任一边改了另一边没跟上,这里当场转红。
+//
+// **2026-08-24 回滚说明**:67aa954 当时还加了一条「底带走不通就把说明带翻到框顶」
+// 的退路,靠它让真机那条三行说明"进了框"。用户按设计正本裁定回滚 —— 正本第 2 条
+// 把「区名左上、说明左下」定为版式契约(同页说明底边齐平才读得下去),第 8 条要求
+// 装不下时输出 **blocked**(报出是谁、每条边各卡在哪),而不是造第四种状态偷偷挪位。
+// 回滚后:根因 (2) 的修法(noteExpandFloorY 认「罩住框底」的 blocker + clamp)**独立
+// 成立**,`TestRuler_NoteReservationNeverCreatesTitleBlockHit` 把它单独钉住(把判据
+// 改回旧式当场转红,与顶带无关);真机那条三行说明的结局改为**如实 blocked**
+// (见 TestRuler_RealMachineThreeLineNoteIsHonestlyBlocked)—— 那一区的器件区下沿
+// 本来就嵌在图签安全带里,底带高度为 0、往下就是图签,它在这一页上确实没有家。
 
 import (
 	"math"
@@ -242,12 +252,22 @@ func TestRuler_NoteFitAndCheckAgreeRandomized(t *testing.T) {
 	t.Logf("配对通过:%d 组能放下 / %d 组放不下", fits, misses)
 }
 
-// ── 正对照:真机那条三行说明必须落进自己的区 ─────────────────────────────────
+// ── 真机那条三行说明:如实 blocked,而不是"大概摆了一下" ──────────────────────
 //
-// 复刻真机几何:A4 图签禁区 (468,0)..(1170,198),器件区下沿 202(已经嵌在
-// 安全带 228 里),框 (258,202)..(848,496)。修复前:底带被硬扩到 147 穿过图签、
-// 带内每个候选点被图签禁区全否 → 说明落到 (865,441),框外。
-func TestRuler_RealMachineThreeLineNoteLandsInsideItsZone(t *testing.T) {
+// 复刻真机几何:A4 图签禁区 (468,0)..(1170,198)、安全带顶 228,器件区下沿 202
+// **已经嵌在安全带里**,zone-plan 第一遍于是把框底"让"到器件区下沿(内容一寸
+// 不让)—— 底带高度当场归零,而框底再往下一寸就是图签。
+//
+// 这一区在底带方向上**结构上没有地方**。设计正本第 2 条把「说明左下」定为版式
+// 契约(同页所有说明底边齐平),第 8 条要求这种情形输出 **blocked**:报出是谁、
+// 每条边各卡在哪、出路是什么,交人做区内收敛或拆页 —— 而不是造第四种状态把说明
+// 挪到框顶(67aa954 那条上翻退路,2026-08-24 已回滚)。
+//
+// 所以本用例钉的是**三件事**:
+//   - 结论如实:两侧都说放不下,check 恰报 1 条且**不开 --x/--y 的方子**;
+//   - 报文可执行:点名区、给出纵向差、给出两条出路;
+//   - 框不撒谎:框底一寸都没探进图签 keep-out(根因 B 的直接鉴别项)。
+func TestRuler_RealMachineThreeLineNoteIsHonestlyBlocked(t *testing.T) {
 	c := rulerCase{
 		name:     "sy8089_buck_3v3(C1)",
 		module:   layoutBBox{282, 202, 824, 442},
@@ -256,31 +276,35 @@ func TestRuler_RealMachineThreeLineNoteLandsInsideItsZone(t *testing.T) {
 		keepout:  true,
 	}
 	o := runRulerCase(t, c)
-	if !o.placeOK {
-		t.Fatalf("三行说明必须落进自己的区,却求解失败;band=%+v frame=%+v", o.part.NoteBBox, o.part.BBox)
+	t.Logf("三行说明 %.0f×%.0f:fits=%v,带 %+v,框 %+v",
+		o.noteW, o.noteH, o.placeOK, o.part.NoteBBox, o.part.BBox)
+
+	if o.placeOK {
+		t.Fatalf("这一区的底带高度为 0、往下就是图签,不该报「放得下」;落点 (%g,%g) 带 %+v",
+			o.placeX, o.placeY, o.part.NoteBBox)
 	}
+	// 两侧结论一致 + check 如实报 1 条、绝不开求解器拒过的方子。
 	assertOneRuler(t, c, o)
 	assertPrescriptionIsSolvable(t, c, o)
 
-	box := noteAnchorBBox(o.placeX, o.placeY, o.noteW, o.noteH)
-	t.Logf("三行说明 %.0f×%.0f 落在 (%g,%g),带 %+v,框 %+v",
-		o.noteW, o.noteH, o.placeX, o.placeY, o.part.NoteBBox, o.part.BBox)
-
-	// ① 落在带内(带既可能在框底,也可能翻到框顶 —— 两者都在框里)。
-	if !bboxContains(o.part.NoteBBox, box) || !bboxContains(o.part.BBox, box) {
-		t.Fatalf("落点 %+v 不在带 %+v / 框 %+v 内", box, o.part.NoteBBox, o.part.BBox)
+	// 报文必须回答正本第 8 条的三问:谁 / 卡在哪条边 / 出路。
+	msg := o.findings[0].Message
+	// 报出**是谁**:runRulerCase 把这一区登记成 "Z"(真机是 sy8089_buck_3v3(C1))。
+	for _, want := range []string{`区 "Z"`, "纵向差", "区内收敛", "拆页", "zone-arrange", "page-new"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("blocked 报文缺 %q:%s", want, msg)
+		}
 	}
-	// ② 症状本体:绝不许再落到框外右侧那种地方。
-	if box.MinX >= o.part.BBox.MaxX {
-		t.Fatalf("说明又被甩到框外右侧:%+v vs frame %+v", box, o.part.BBox)
+	// 根因 B 的直接鉴别项:框底一寸都不许探进图签 keep-out / 安全带。
+	if o.keepout == nil {
+		t.Fatal("fixture 失效:这条用例必须有图签禁区")
 	}
-	// ③ 不许压图签(真机那张处方 (275,162.5) 正是压在图签上)。
-	if o.keepout != nil && boxesGapOverlap(box, *o.keepout, 0) {
-		t.Fatalf("说明压在图签禁区上:%+v vs keepout %+v", box, *o.keepout)
+	if f := o.part.BBox; f.MinY < o.keepout.MaxY && f.MaxX > o.keepout.MinX && f.MinX < o.keepout.MaxX {
+		t.Fatalf("为说明预留把框底捅进了图签:frame %+v vs keepout %+v", f, *o.keepout)
 	}
-	// ④ check 一条不报。
-	if len(o.findings) != 0 {
-		t.Fatalf("修复后不该再报 note-outside-zone:%+v", o.findings)
+	if safe := inflatedTitleKeepout(o.keepout); safe != nil && boxesOverlap(o.part.BBox, *safe) &&
+		o.part.BBox.MinY < c.module.MinY {
+		t.Fatalf("框底探进了图签安全带 %+v(器件区下沿 %.0f):frame %+v", *safe, c.module.MinY, o.part.BBox)
 	}
 }
 
@@ -334,10 +358,17 @@ func TestRuler_NoteReservationNeverCreatesTitleBlockHit(t *testing.T) {
 }
 
 // ── 幂等:说明登记前后,两侧算出的框/带/落点必须逐字段相同 ────────────────────
+//
+// 两档都要覆盖(否则这条测试只证明了一种结论会收敛):
+//   - 装得下:落点必须逐字段相同(底带贴底 / 窄框横向扩边两种形态);
+//   - blocked:两侧必须**同样**判 blocked,且 planner 不许悄悄落一个锚点进计划
+//     —— 计划里躺着坐标而 NoteFits=false,就是下一轮「check 开出求解器拒过的
+//     方子」的种子。原「顶带」那一档随上翻退路一并回滚(2026-08-24)。
 func TestRuler_PlaceThenPlanConverges(t *testing.T) {
 	for _, c := range []rulerCase{
-		{name: "底带", module: layoutBBox{260, 452, 647, 700}, content: noteContentOf(3), fontSize: 10},
-		{name: "顶带", module: layoutBBox{282, 202, 824, 442}, content: noteContentOf(3), fontSize: 10, keepout: true},
+		{name: "底带贴底", module: layoutBBox{260, 452, 647, 700}, content: noteContentOf(3), fontSize: 10},
+		// 窄框:框宽 68 装不下任何可读说明 → 求解器横向扩边,两侧必须扩得一样。
+		{name: "窄框横向扩边", module: layoutBBox{420, 452, 488, 620}, content: noteContentOf(2), fontSize: 10},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			o := runRulerCase(t, c)
@@ -350,4 +381,15 @@ func TestRuler_PlaceThenPlanConverges(t *testing.T) {
 			}
 		})
 	}
+	t.Run("blocked 也要收敛", func(t *testing.T) {
+		c := rulerCase{name: "器件嵌在图签安全带里", module: layoutBBox{282, 202, 824, 442},
+			content: noteContentOf(3), fontSize: 10, keepout: true}
+		o := runRulerCase(t, c)
+		if o.placeOK || o.part.NoteFits {
+			t.Fatalf("底带归零、下方是图签:两侧都该判 blocked;fit=%v NoteFits=%v", o.placeOK, o.part.NoteFits)
+		}
+		if o.part.NoteAnchor != [2]float64{} {
+			t.Fatalf("blocked 的分区不许在计划里留落点坐标:%v", o.part.NoteAnchor)
+		}
+	})
 }
