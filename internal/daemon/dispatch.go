@@ -261,6 +261,20 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Connector-FIFO gate (queueblock.go): when a light QUEUED read has been
+	// unanswered for seconds while the BYPASS read still answers, the connector's
+	// per-window action queue is proven stuck behind one wedged handler. Anything
+	// sent now would just queue behind it and time out too (真机:12 条 pages.list
+	// 各烧满 18s 才报「connector did not respond」,合计 216 秒). Refuse instantly,
+	// name the head, and say "do NOT re-issue the write" — the stuck handler is
+	// still running and its effect may land later.
+	if errResp := s.checkQueueBlocked(&req); errResp != nil {
+		started := time.Now().UTC()
+		s.audit.Append(fromResponse(started, &req, errResp))
+		writeJSON(w, http.StatusServiceUnavailable, *errResp)
+		return
+	}
+
 	// Re-entrancy guard: refuse to stack a second DRC onto a window whose first
 	// one hasn't settled — retrying piles recompute tasks onto the webview.
 	if nonReentrant[req.Action] {
@@ -302,8 +316,17 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		},
 		sleep: time.Sleep,
 	}
+	// Mark this window busy for the autosave gate: a debounced save must land in
+	// an IDLE gap, never in the middle of a batch (autosave.go). Deferred rather
+	// than released inline so no early return can leak the counter.
+	defer s.beginClientAction(req.WindowID)()
 	resp, err, _ := forwardWithAdaptiveRetry(ctx, req, target.dispatch, hooks)
 	if err != nil {
+		// One timed-out FIFO action is not yet proof of a blocked queue — a light
+		// queued read that stays unanswered IS. Fire that probe now (never awaited)
+		// so the NEXT command gets an instant answer instead of another full budget
+		// of silence. See queueblock.go.
+		s.armQueueProbe(target, &req, err)
 		errResp := errorResponse(req.ID, "DISPATCH_FAILED", "connector did not respond", err.Error())
 		s.writeHealth.annotateDegraded(&req, &errResp)
 		s.audit.Append(fromResponse(started, &req, &errResp))

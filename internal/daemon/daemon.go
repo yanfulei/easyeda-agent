@@ -66,6 +66,17 @@ type Server struct {
 	// structured degraded advisory (writehealth.go, REPORT round2 新 3).
 	writeHealth *writeHealthTracker
 
+	// queueBlocks proves (or clears) "the connector's per-window FIFO is stuck
+	// behind one wedged handler", so a command gets an instant, named answer
+	// instead of burning its full dispatch budget behind a dead head
+	// (queueblock.go).
+	queueBlocks *queueBlockTracker
+
+	// clientInflight counts client-issued actions currently forwarded per window,
+	// so the debounced autosave never injects a 20-60s save into the middle of a
+	// batch (autosave.go: 真机实测 4 次超时簇全部叠在 22s/36s/44s/59s 的 autosave 上).
+	clientInflight sync.Map // windowID -> *atomic.Int64
+
 	// inflight tracks non-reentrant actions currently forwarded, keyed
 	// "<action>|<windowId>" — see acquireExclusive / nonReentrant.
 	inflight sync.Map
@@ -86,6 +97,41 @@ func (s *Server) acquireExclusive(action, windowID string) (release func(), acqu
 	return func() { s.inflight.Delete(key) }, true
 }
 
+// beginClientAction marks one client-issued action as in flight on a window and
+// returns the release func. Used by the autosave gate: a save must land in an
+// IDLE gap, never in the middle of a batch (autosave.go). Release is idempotent.
+func (s *Server) beginClientAction(windowID string) (release func()) {
+	if windowID == "" {
+		return func() {}
+	}
+	v, _ := s.clientInflight.LoadOrStore(windowID, new(atomic.Int64))
+	counter, ok := v.(*atomic.Int64)
+	if !ok {
+		return func() {}
+	}
+	counter.Add(1)
+	var once sync.Once
+	return func() { once.Do(func() { counter.Add(-1) }) }
+}
+
+// clientActionsInFlight reports how many client-issued actions are currently
+// forwarded to a window (the autosave's own save is never counted — it does not
+// go through /action).
+func (s *Server) clientActionsInFlight(windowID string) int64 {
+	if windowID == "" {
+		return 0
+	}
+	v, ok := s.clientInflight.Load(windowID)
+	if !ok {
+		return 0
+	}
+	counter, ok := v.(*atomic.Int64)
+	if !ok {
+		return 0
+	}
+	return counter.Load()
+}
+
 // logf writes a diagnostic line to the server log, if one is set.
 func (s *Server) logf(format string, args ...any) {
 	if s.log != nil {
@@ -102,6 +148,7 @@ func New(opts Options) *Server {
 		staleReads:       newStaleGuard(),
 		concurrentWrites: newConcurrentGuard(),
 		writeHealth:      newWriteHealthTracker(),
+		queueBlocks:      newQueueBlockTracker(),
 	}
 	if opts.AutosaveDebounce > 0 {
 		s.autosave = newAutosaver(opts.AutosaveDebounce, s.dispatchSave)

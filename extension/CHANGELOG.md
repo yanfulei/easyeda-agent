@@ -6,6 +6,34 @@ follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed — 超时守卫改由 worker tick 兜底:队首卡死不再拖死整条队列
+
+真机连续四次「连接器在负载下停摆」查到底了,**根因不在重连、不在 WebSocket、也不在
+daemon**,而在**主线程 setTimeout 在后台窗口里被节流/冻结**,于是连接器所有基于
+setTimeout 的守卫(FIFO 的放弃闸 22s、每次平台调用的 `withTimeout` 7s)到点不响。
+
+证据(2026-08-24 三份 daemon 日志 + 审计逐条对齐):
+
+- 09:10:47 一条 `schematic.power.connect_pin` 进入 FIFO 队首,队列**一动不动 6 分钟**;
+- 同一时间**心跳一拍不落**(退化前后都是 3.00s/次,它由 Web Worker tick 驱动),
+  **旁路读 `document.current` 每次 12ms 就回** —— WS、主线程、`eda.*` 桥全都活着;
+- 排在后面的 12 条 `schematic.pages.list`(本身 p50 只有 15ms)**每条各烧满 18s**
+  才报 "connector did not respond",合计白等 216 秒;
+- 队首终于 settle 后,积压的 12 条**按 FIFO 顺序一次性冲出来,全部 ok:true**;
+- 队首那条的错误码是 `EDA_*` 而**不是 `ACTION_ABANDONED`** —— 三份日志与全部审计
+  记录里 `ACTION_ABANDONED` 出现 **0 次**:放弃闸自上线以来一次都没响过。
+
+修法:新增 `src/deadlines.ts`,把所有「到点必须发生」的守卫登记成**绝对时刻**,
+`setTimeout` 只当快路径,**worker tick 的 `sweepDeadlines()` 是保底路径** —— 那是本
+进程里唯一被真机证明不受后台节流影响的时基(看门狗当初正是为此搬进 Worker 的,
+只是队列和 per-op 守卫被落在了老路上)。`action-queue` 的放弃闸与 `actions.ts` 的
+`withTimeout` 一并改用它。保底路径的分辨率是一拍(3s),所以短守卫最坏晚一拍触发
+——远好过晚六分钟。
+
+**行为变化**:队首卡死时,连接器现在会在 `timeoutMs + 2s` 真的放弃它并回
+`ACTION_ABANDONED`,队列继续流动。收到这个码 = 那次写的效果**可能稍后才落地**,
+关于它的任何结论都不成立(`seqAbandoned` 已递增),必须回读复核后再决定,**不要盲重试**。
+
 ## [1.1.1] — 2026-08-21
 
 ### Docs — SKILL.md 顶部写清「这个 skill 单独装上没用」+ 连接器下载地址

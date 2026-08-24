@@ -126,6 +126,96 @@ func TestMaybeAutosave_DryRunDoesNotArm(t *testing.T) {
 	}
 }
 
+// ── autosave 必须落在空档里(2026-08-24 真机四次超时簇的直接回归) ────────────
+//
+// 连接器每窗口只有一条 FIFO;schematic.save 在真板上 p95=6.8s、max=59.4s。计时器
+// 到点就发 = 把一条几十秒的阻塞插进一批动作中间,后面所有动作(含 --doc 门那条
+// 15ms 的 pages.list)排在它后面一起超时。判据只有一条:窗口正忙就重新防抖。
+
+func TestDeferAutosave_BusyWindowPushesTheSaveBack(t *testing.T) {
+	var saved atomic.Int32
+	s := &Server{queueBlocks: newQueueBlockTracker()}
+	s.autosave = newAutosaver(10*time.Millisecond, func(_, _ string) { saved.Add(1) })
+
+	release := s.beginClientAction("w1")
+	if got := s.clientActionsInFlight("w1"); got != 1 {
+		t.Fatalf("in-flight count = %d, want 1", got)
+	}
+	if !s.deferAutosave("w1", "schematic.save") {
+		t.Fatal("a save must never be injected while a client action is in flight on that window")
+	}
+
+	// It was re-armed, not dropped: once the window goes idle the save happens.
+	release()
+	if got := s.clientActionsInFlight("w1"); got != 0 {
+		t.Fatalf("release must decrement, got %d", got)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if n := saved.Load(); n != 1 {
+		t.Fatalf("deferring must RE-ARM the debounce, not cancel the safety net; saves=%d", n)
+	}
+}
+
+func TestDeferAutosave_IdleWindowSavesImmediately(t *testing.T) {
+	s := &Server{queueBlocks: newQueueBlockTracker()}
+	s.autosave = newAutosaver(10*time.Millisecond, func(_, _ string) {})
+	if s.deferAutosave("w1", "schematic.save") {
+		t.Fatal("an idle window must save right away — this gate must not slow the normal path")
+	}
+}
+
+func TestDeferAutosave_BlockedQueueAlsoDefers(t *testing.T) {
+	now := time.Unix(6000, 0)
+	s := &Server{queueBlocks: clockTracker(&now)}
+	s.autosave = newAutosaver(10*time.Millisecond, func(_, _ string) {})
+	s.queueBlocks.beginProbe("w1", "schematic.power.connect_pin", "req_1", now)
+	now = now.Add(queueBlockGrace * 2)
+	if !s.deferAutosave("w1", "schematic.save") {
+		t.Fatal("pushing a save at a queue that is already proven blocked only lengthens the backlog")
+	}
+}
+
+func TestDeferAutosave_CapKeepsItASafetyNet(t *testing.T) {
+	s := &Server{queueBlocks: newQueueBlockTracker()}
+	s.autosave = newAutosaver(10*time.Millisecond, func(_, _ string) {})
+	release := s.beginClientAction("w1")
+	defer release()
+
+	if !s.deferAutosave("w1", "schematic.save") {
+		t.Fatal("first call defers")
+	}
+	// Rewind the deferral clock past the cap: a long busy stretch must not mean
+	// "never saved" — past autosaveMaxDefer the save goes in regardless.
+	s.autosave.mu.Lock()
+	s.autosave.deferredSince["w1"] = time.Now().Add(-autosaveMaxDefer - time.Second)
+	s.autosave.mu.Unlock()
+
+	if s.deferAutosave("w1", "schematic.save") {
+		t.Fatal("past autosaveMaxDefer the save must go through even on a busy window")
+	}
+	s.autosave.mu.Lock()
+	_, stillDeferred := s.autosave.deferredSince["w1"]
+	s.autosave.mu.Unlock()
+	if stillDeferred {
+		t.Error("the deferral clock must reset once a save is let through")
+	}
+}
+
+func TestBeginClientAction_ReleaseIsIdempotent(t *testing.T) {
+	s := &Server{}
+	release := s.beginClientAction("w1")
+	release()
+	release()
+	if got := s.clientActionsInFlight("w1"); got != 0 {
+		t.Fatalf("a double release must not drive the counter negative, got %d", got)
+	}
+	// An unrouted request (no windowId) must not blow up or leak a counter.
+	s.beginClientAction("")()
+	if got := s.clientActionsInFlight(""); got != 0 {
+		t.Fatalf("empty windowId must stay a no-op, got %d", got)
+	}
+}
+
 func TestRequestMutates(t *testing.T) {
 	mutating := &protocol.Request{Action: "pcb.page.clear"}
 	if !requestMutates(mutating) {

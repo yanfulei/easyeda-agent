@@ -6,6 +6,7 @@
  */
 
 import { type BeautifyOptions, runBeautify } from './beautify';
+import { armDeadline } from './deadlines';
 import { documentTypeLabel, readResponseContext } from './eda-context';
 import {
 	ActionError,
@@ -3640,13 +3641,20 @@ const schematicExportImage: Handler = async (payload) => {
 	};
 };
 
-/** Reject after ms rather than await forever. */
+/**
+ * Reject after ms rather than await forever.
+ *
+ * 截止时间走 `deadlines.ts`,**不是**裸 setTimeout:后台窗口里主线程定时器会被
+ * 节流/冻结,那正是 2026-08-24 真机上「7s 的 per-op 闸门在 6 分钟里没响、队首
+ * 一直堵着」的根因(详见 deadlines.ts 头注释)。快路径仍是 setTimeout,保底路径
+ * 是 transport 的 worker tick。
+ */
 function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
-		const timer = setTimeout(() => reject(new ActionError(ErrorCodes.EDA_CALL_FAILED, message)), ms);
+		const handle = armDeadline(ms, () => reject(new ActionError(ErrorCodes.EDA_CALL_FAILED, message)));
 		p.then(
-			(v) => { clearTimeout(timer); resolve(v); },
-			(e) => { clearTimeout(timer); reject(e); },
+			(v) => { handle.cancel(); resolve(v); },
+			(e) => { handle.cancel(); reject(e); },
 		);
 	});
 }

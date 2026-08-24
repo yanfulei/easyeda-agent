@@ -31,6 +31,7 @@
  */
 
 import { ActionQueue, isBypassAction } from './action-queue';
+import { sweepDeadlines } from './deadlines';
 import { buildContextFrame, readEasyEdaVersion } from './eda-context';
 import { runAction } from './actions';
 import { createWebSocketId } from './transport-identity';
@@ -757,6 +758,15 @@ function autoConnectEnabled(): boolean {
 
 function watchdogTick(): void {
 	watchdogTicks += 1;
+	// 保底触发所有到期的守卫(队列放弃闸 + 每次平台调用的 withTimeout)。
+	// **必须在最前面、且不受任何分支影响**:队首卡死与连接状态无关,而这条
+	// worker tick 是本进程里唯一被真机证明不受后台节流影响的时基
+	// (2026-08-24:退化 6 分钟里心跳一拍不落,而 setTimeout 一次没响)。
+	// 见 deadlines.ts 的头注释。
+	try {
+		sweepDeadlines();
+	}
+	catch { /* 清扫失败绝不能拖垮心跳/重连 */ }
 	if (isConnecting) {
 		// Self-heal: a connect flow that hasn't settled in a bounded number of ticks
 		// is wedged (leaked isConnecting=true). Force a clean reset so the fall-through

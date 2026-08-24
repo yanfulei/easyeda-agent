@@ -17,6 +17,7 @@ import {
 	isBypassAction,
 	type QueueOutcome,
 } from './action-queue';
+import { sweepDeadlines } from './deadlines';
 
 interface Deferred<T> {
 	promise: Promise<T>;
@@ -137,6 +138,35 @@ test('截止时间用请求自带的 timeoutMs —— 长操作不被误杀,短�
 	});
 	assert.equal(short.status, 'abandoned');
 	assert.equal(short.stamp.seqAbandoned, 1);
+});
+
+test('放弃闸不依赖 setTimeout —— 只靠 worker tick 的 sweepDeadlines 也必须到点', async () => {
+	// 2026-08-24 真机定案的直接回归:后台窗口里主线程 setTimeout 被节流/冻结,
+	// 22s 的放弃闸在 6 分钟里一次没响,队首把后面 12 条全堵死。这里把预算设成
+	// 一小时 —— 真实 setTimeout 在测试期内绝不可能自己响 —— 然后只喂一个未来
+	// 时刻给 sweepDeadlines()(那正是 worker tick 走的路)。它必须照样放弃队首。
+	const q = new ActionQueue({ graceMs: 0, fallbackTimeoutMs: 1000 });
+	const stuck = deferred<number>();
+	let secondRan = false;
+
+	const first = q.submit({ id: 'req-frozen-timers', timeoutMs: 3_600_000, run: () => stuck.promise });
+	const second = q.submit({ id: 'req-behind', timeoutMs: 3_600_000, run: async () => { secondRan = true; return 2; } });
+
+	await sleep(5); // 让队首真正开跑并登记好截止时间
+	assert.equal(secondRan, false, '前提:队首还在跑,后面那条被 FIFO 挡着');
+
+	sweepDeadlines(Date.now() + 3_600_001);
+
+	const firstOutcome = await first;
+	assert.equal(firstOutcome.status, 'abandoned', 'setTimeout 被冻结时,worker tick 就是唯一的闸门');
+	assert.equal(firstOutcome.stamp.seqAbandoned, 1);
+	assert.deepEqual(firstOutcome.stamp.abandonedIds, ['req-frozen-timers']);
+
+	const secondOutcome = await second;
+	assert.equal(secondOutcome.status, 'ok', '放弃之后积压必须继续流动');
+	assert.equal(secondRan, true);
+
+	stuck.resolve(0);
 });
 
 test('旁路:wedge 期仍可观测,且响应必须打 unordered、不动 seq', async () => {

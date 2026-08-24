@@ -76,21 +76,56 @@ func saveActionForDocType(docType string) string {
 	return ""
 }
 
+// autosaveMaxDefer bounds how long a save may keep being pushed back because the
+// window is busy (see deferAutosave). The safety net must stay a safety net: past
+// this the save goes in regardless, accepting the head-of-line cost rather than
+// letting a long busy stretch mean "never saved".
+const autosaveMaxDefer = 60 * time.Second
+
 // autosaver debounces per-window saves: a burst of edits on one window collapses
 // into a single save fired `debounce` after the LAST edit (trailing debounce).
 type autosaver struct {
 	mu       sync.Mutex
 	debounce time.Duration
 	timers   map[string]*time.Timer
-	save     func(windowID, saveAction string)
+	// deferredSince records when a window's save first got pushed back because
+	// the window was busy — the clock autosaveMaxDefer is measured against.
+	deferredSince map[string]time.Time
+	save          func(windowID, saveAction string)
 }
 
 func newAutosaver(debounce time.Duration, save func(windowID, saveAction string)) *autosaver {
 	return &autosaver{
-		debounce: debounce,
-		timers:   map[string]*time.Timer{},
-		save:     save,
+		debounce:      debounce,
+		timers:        map[string]*time.Timer{},
+		deferredSince: map[string]time.Time{},
+		save:          save,
 	}
+}
+
+// deferredFor reports how long this window's save has been pushed back, starting
+// the clock on the first call. Cleared by clearDeferred once a save goes through.
+func (a *autosaver) deferredFor(windowID string, now time.Time) time.Duration {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	since, ok := a.deferredSince[windowID]
+	if !ok {
+		a.deferredSince[windowID] = now
+		return 0
+	}
+	return now.Sub(since)
+}
+
+func (a *autosaver) clearDeferred(windowID string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	delete(a.deferredSince, windowID)
+	a.mu.Unlock()
 }
 
 // schedule (re)arms the trailing-debounce timer for windowID. Each call resets
@@ -125,6 +160,7 @@ func (a *autosaver) stop() {
 		t.Stop()
 	}
 	a.timers = map[string]*time.Timer{}
+	a.deferredSince = map[string]time.Time{}
 }
 
 // maybeAutosave arms an autosave after a successful mutating action. It EXCLUDES
@@ -144,12 +180,59 @@ func (s *Server) maybeAutosave(req *protocol.Request) {
 	s.autosave.schedule(req.WindowID, saveAction)
 }
 
+// ── autosave 不得插进一批动作的中间(2026-08-24 真机定案) ───────────────────
+//
+// 连接器每窗口只有一条 FIFO 队列,而 `schematic.save` 在真板上是**长尾**动作:
+// 今天 114 次保存 p50 只有 37ms,p95 却是 6.8s,最大 59.4s。autosave 又是一个
+// 纯计时器:防抖到点就发,完全不看那个窗口此刻是不是正忙。结果就是它把一条
+// 20-60 秒的阻塞塞进一批动作中间,后面所有 FIFO 动作(含 --doc 门那条 15ms 的
+// schematic.pages.list)全部排在它后面超时。当天四次超时簇逐一对上:
+//
+//	03:14:43  connect_pin 18s 失败  ⟵ 叠在 schematic.save 35.8s 上
+//	03:16:20  connect_pin 18s 失败  ⟵ 叠在 schematic.save 22.7s 上
+//	03:16:48  connect_pin 18s 失败  ⟵ 叠在 schematic.save 44.2s 上
+//	03:17:08  pages.list  18s 失败  ⟵ 同一条 44.2s 的 save
+//	03:20:16  pages.list  18s 失败  ⟵ 叠在 schematic.save 59.4s 上
+//
+// 而且**保存是可以等的**:窗口还在被写,再等一会儿只会让这次保存覆盖更多内容。
+// 所以这里只加一条判据 —— 窗口此刻有客户端动作在飞就重新防抖,把保存推到真正的
+// 空档里去;上限 autosaveMaxDefer,保证它仍然是安全网而不是"永远不保存"。
+
+// deferAutosave reports whether this save must be pushed back instead of sent
+// now, re-arming the debounce when it is. True = caller must not dispatch.
+func (s *Server) deferAutosave(windowID, saveAction string) bool {
+	if s.autosave == nil {
+		return false
+	}
+	busy := s.clientActionsInFlight(windowID) > 0
+	if _, _, blocked := s.queueBlocks.blocked(windowID); blocked {
+		// 队列已经堵死:再灌一条保存只会加长积压,而它照样得排队。
+		busy = true
+	}
+	if !busy {
+		s.autosave.clearDeferred(windowID)
+		return false
+	}
+	if waited := s.autosave.deferredFor(windowID, time.Now()); waited >= autosaveMaxDefer {
+		// 安全网优先:忙了太久也得落一次盘,哪怕要付队首阻塞的代价。
+		s.autosave.clearDeferred(windowID)
+		s.logf("autosave: %s on %s deferred %s (window busy) — saving anyway", saveAction, windowID, waited.Round(time.Second))
+		return false
+	}
+	s.autosave.schedule(windowID, saveAction)
+	return true
+}
+
 // dispatchSave forwards the debounced save to the window's connector. Best-effort
 // and fired from a timer (no HTTP caller): logged + audited, never surfaced.
 func (s *Server) dispatchSave(windowID, saveAction string) {
 	target, ok := s.hub.target(windowID)
 	if !ok {
+		s.autosave.clearDeferred(windowID)
 		return // window disconnected before the timer fired
+	}
+	if s.deferAutosave(windowID, saveAction) {
+		return
 	}
 	req := protocol.Request{
 		Envelope: protocol.Envelope{

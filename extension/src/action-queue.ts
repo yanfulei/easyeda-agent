@@ -40,7 +40,18 @@
  *
  * 被放弃的 handler 仍在后台跑 —— 我们只是不再等它,**它的效果可能稍后才落地**。
  * 这就是为什么 `seqAbandoned` 一旦变化,关于那段时间任何写的结论都不成立。
+ *
+ * ── 放弃闸的时基必须是 worker tick,不能是 setTimeout(2026-08-24 真机定案) ──
+ *
+ * 上面那套放弃机制**从上线到 2026-08-24 一次都没生效过**:三份 daemon 日志 +
+ * 全部审计记录里 `ACTION_ABANDONED` 出现 0 次,而同期真机连续出现「队首卡死 6
+ * 分钟、后面 12 条全部超时、然后按 FIFO 一次性冲出来」。根因不在这个文件的逻辑,
+ * 在它用的**时钟**:后台窗口里主线程 setTimeout 会被节流/冻结(同一段时间里
+ * worker tick 驱动的心跳一拍不落、旁路读 12ms 就回)。所以截止时间改为登记到
+ * `deadlines.ts`,由 transport 的 **worker tick** 兜底触发。详见那个文件的头注释。
  */
+
+import { armDeadline, type DeadlineHandle } from './deadlines';
 
 /** 无 timeoutMs 的请求(裸 HTTP 调用方)用它兜底 —— 与 daemon 的 dispatchTimeout 同值。 */
 export const ABANDON_FALLBACK_MS = 60_000;
@@ -178,9 +189,12 @@ export class ActionQueue {
 		const deadlineMs = budget + this.graceMs;
 		const startedAt = Date.now();
 
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		// 截止时间登记到 deadlines.ts:setTimeout 是快路径,worker tick 的
+		// sweepDeadlines() 是保底路径。**保底路径才是这个闸门真正的时基** ——
+		// 见文件头「放弃闸的时基必须是 worker tick」。
+		let handle: DeadlineHandle | undefined;
 		const abandonSignal = new Promise<{ kind: 'abandoned' }>((res) => {
-			timer = setTimeout(() => res({ kind: 'abandoned' }), deadlineMs);
+			handle = armDeadline(deadlineMs, () => res({ kind: 'abandoned' }));
 		});
 
 		// run() 可能**同步抛**(payload 校验之类),那也算一次正常的 settle。
@@ -196,9 +210,7 @@ export class ActionQueue {
 		}
 
 		const outcome = await Promise.race([running, abandonSignal]);
-		if (timer !== undefined) {
-			clearTimeout(timer);
-		}
+		handle?.cancel();
 
 		if (outcome.kind === 'abandoned') {
 			// 我们不再等它,但它**还在跑**:效果可能稍后才落地。这就是
