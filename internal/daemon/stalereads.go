@@ -221,6 +221,17 @@ func (g *staleGuard) blockedBy(req *protocol.Request) string {
 // cannot be acted on is what produced 1780 ignored advisories. project is the
 // resolved project name when the daemon knows it, so the printed command is
 // copy-pasteable rather than a template.
+//
+// Both instructions in here are load-bearing and BOTH must be real CLI surface.
+// The first cut of this message offered `--force-reason`, a flag that has never
+// existed on any subcommand (the CLI's routing-stage bypass is `--force`, a
+// different gate) — so the gate that exists to give a runnable next step handed
+// out an unrunnable one. The escape hatch is now `--force-stale-read "<理由>"`
+// (a root persistent flag, internal/app/app.go), named after the gate it opens
+// the way `--skip-version-check` is, and deliberately NOT `--force-reason`,
+// which would read as "the reason for --force". internal/app's
+// TestRefusalMessagesOnlyNameRealCLISurface parses the string literals in this
+// file and fails if any command/flag named here is not registered.
 func staleReadRefusal(read, mutation, project string) (message, detail string) {
 	target := project
 	if target == "" {
@@ -228,9 +239,9 @@ func staleReadRefusal(read, mutation, project string) (message, detail string) {
 	}
 	next := "easyeda doc reload --project " + target
 	message = fmt.Sprintf(
-		"%s —— PCB 自 %s 后未 reload,读到的是旧引擎状态。\n下一步: %s\n(绕过: --force-reason \"<理由>\",入审计)",
+		"%s —— PCB 自 %s 后未 reload,读到的是旧引擎状态。\n下一步: %s\n(绕过: --force-stale-read \"<理由>\",入审计)",
 		read, mutation, next)
-	detail = fmt.Sprintf("SKILL 铁律 5 (机械门): 下一步 `%s`;确需读旧状态时用 --force-reason \"<理由>\"(入审计)", next)
+	detail = fmt.Sprintf("SKILL 铁律 5 (机械门): 下一步 `%s`;确需读旧状态时用 --force-stale-read \"<理由>\"(入审计)", next)
 	return message, detail
 }
 

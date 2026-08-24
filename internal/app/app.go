@@ -77,6 +77,17 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		"route by project name/uuid instead of --window (survives windowId churn)")
 	root.PersistentFlags().BoolVar(&cfg.skipVersionCheck, "skip-version-check", false,
 		"run even when CLI / daemon / connector versions disagree (audited escape hatch; also EASYEDA_SKIP_VERSION_CHECK=1)")
+	// STALE_READ 机械门(internal/daemon/stalereads.go)的人工逃生口。**必须**是
+	// 根级 persistent:那道门拦的是任何 pcb.* 读,而这类读散落在 pcb / board / view /
+	// call / apply 多棵子命令树下 —— 挂在 `pcb` 一棵树上,拒绝消息对其余几棵就又成了
+	// 一句做不到的承诺。名字刻意不叫 --force-reason:三个布线命令上已经有一个语义
+	// 完全不同的 `--force <理由>`(阶段门),再来一个 --force-reason 会被读成「--force
+	// 的理由」。照 --skip-version-check 的先例:逃生口用它拆的那道门命名。
+	// 注意 usage 里的反引号:cobra 用**第一个**反引号词当值占位符,所以只能给
+	// `reason`,不能顺手把 `easyeda doc reload` 引起来(否则 --help 显示成
+	// `--force-stale-read easyeda doc reload`)。
+	root.PersistentFlags().StringVar(&cfg.forceStaleRead, "force-stale-read", "",
+		"read PCB state not reloaded since the last PCB edit: bypass the STALE_READ gate with this `reason` (audited as daemon.stale_read.force; only ever attaches to PCB reads, never unlocks the routing stage gate). Normal fix is: easyeda doc reload")
 	root.PersistentFlags().StringVar(&cfg.doc, "doc", "",
 		"pin every mutating action to this schematic page / PCB (uuid or name): the CLI switches to it and confirms via live document.current before editing, refusing rather than land the edit on whatever page is foreground — removes the doc-switch race")
 

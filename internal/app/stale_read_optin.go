@@ -55,7 +55,23 @@ package app
 // 审计:daemon 收到带 forceReason 的读会自己写一行 `daemon.stale_read.force`
 // 伪动作(stalereads.go checkStaleRead)。所以放行**自动入审计**,app 侧不需要、
 // 也不应该另造格式。理由串前缀 "写后回读" 让审计里一眼分得清:这是回读放行,
-// 不是人在敲 --force-reason 硬闯。
+// 不是人在敲 --force-stale-read 硬闯(那一类前缀是 "人工放行")。
+//
+// ── 人工逃生口 --force-stale-read ──────────────────────────────────────
+//
+// 上面这套是**给代码用的**。门还需要一个**给人用的**出口:daemon 的拒绝消息里
+// 白纸黑字写着「绕过: …」,而在补上这个 flag 之前它指向的 `--force-reason` 根本
+// 不存在 —— 一道给不出可执行下一步的门,正是它自己要根治的毛病。
+//
+// 它必然是「整进程生效」(persistent flag 就这一种寿命),所以危险不在寿命上,
+// 而在**作用面**上。这里的处理是:**不给它第二条通路**。它和上面的作用域副本
+// 汇到同一个 staleReadForceReason,过同一张 staleReadEligibleRequest 收窄表,
+// 所以即便用户在一条会写画布的命令上敲了它,forceReason 也不会落到任何写请求上
+// —— 布线阶段门解不开。区别只有两点:寿命(整进程 vs 一次调用)和审计前缀。
+//
+// 寿命换来的那点风险用**可见性**兜底:每个被它放行的动作在 stderr 打一行(每动作
+// 一次,照 warnStaleRisk 的去重口径),所以「整条命令的 PCB 读都在读旧状态」这件事
+// 不会是静默的。
 //
 // 什么时候**不该**用它:读的目标不是本命令刚写的那批图元(例如重新规划、重新
 // 评分整块板),那种情况该老老实实 `doc reload`,或者把 reload 编进配方。
@@ -70,6 +86,8 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -112,7 +130,8 @@ func isStaleRead(err error) bool { return errors.Is(err, errStaleRead) }
 func staleReadNextStep(what string) string {
 	return fmt.Sprintf("%s 撞上 STALE_READ 机械门(铁律 5):PCB 自上次写后没 reload。"+
 		"若这确实是写后回读,请给这处回读加放行位(staleReadOptIn);"+
-		"若是重新规划,先 `easyeda doc reload` 再重跑", what)
+		"若是重新规划,先 `easyeda doc reload` 再重跑"+
+		"(确需读旧状态:加 --force-stale-read \"<理由>\",入审计)", what)
 }
 
 // staleReadEligible 是**允许**携带回读放行位的动作白名单:PCB 域、不改画布、且
@@ -236,20 +255,64 @@ func activeDispatchStaleReadReason() string {
 	return dispatchStaleReadReason
 }
 
+// 审计前缀。两类放行走同一条线、同一张收窄表,靠前缀在 audit 里分开:
+// 「写后回读」= 代码自己的回读证实;「人工放行」= 人敲了 --force-stale-read。
+const (
+	staleReadPrefixAfterWrite = "写后回读: "
+	staleReadPrefixManual     = "人工放行(--force-stale-read): "
+)
+
+// staleReadWarnOut 是人工放行提示的去处。做成变量只为可测 —— 生产路径永远是
+// os.Stderr(和 checkVersionGate / warnStaleRisk 同一个口径:提示走 stderr,
+// stdout 留给机器读的报文)。
+var staleReadWarnOut io.Writer = os.Stderr
+
+// 人工放行提示每动作只打一次 —— 复合命令一轮能发几十条 pcb 读,逐条打会把提示
+// 本身变成噪音(warnStaleRisk 去重的同一个理由)。
+var (
+	staleReadWarnMu   sync.Mutex
+	staleReadWarnSeen = map[string]bool{}
+)
+
+func warnManualStaleReadBypass(action string) {
+	staleReadWarnMu.Lock()
+	seen := staleReadWarnSeen[action]
+	staleReadWarnSeen[action] = true
+	staleReadWarnMu.Unlock()
+	if seen || staleReadWarnOut == nil {
+		return
+	}
+	fmt.Fprintf(staleReadWarnOut,
+		"⚠ --force-stale-read 放行了 %s —— 读到的可能是 reload 前的旧引擎状态(已入审计 daemon.stale_read.force);正常修法是 `easyeda doc reload`\n",
+		action)
+}
+
 // staleReadForceReason 给出本次请求要写到线上的 forceReason(空 = 不放行)。
-// postAction 在派发咽喉上调用它,所以收窄规则只有一份实现。
+// postAction 在派发咽喉上调用它,所以收窄规则只有一份实现 —— 三个来源(一次调用的
+// 作用域副本 / verify 块的作用域全局 / 人敲的 --force-stale-read)在这里汇成一条路,
+// 谁都绕不过 staleReadEligibleRequest。
 func staleReadForceReason(cfg *appConfig, action string, payload any) string {
-	reason := ""
+	reason, prefix := "", staleReadPrefixAfterWrite
 	if cfg != nil {
 		reason = cfg.staleReadReason
 	}
 	if reason == "" {
 		reason = activeDispatchStaleReadReason()
 	}
+	// 人工 flag 排在最后:两者同时成立时,代码自己那句「回读什么」比人敲的通用理由
+	// 更能说清这一次读是干嘛的,审计里留下更有用的那条。
+	if reason == "" && cfg != nil {
+		if manual := strings.TrimSpace(cfg.forceStaleRead); manual != "" {
+			reason, prefix = manual, staleReadPrefixManual
+		}
+	}
 	if reason == "" || !staleReadEligibleRequest(action, payload) {
 		return ""
 	}
-	return "写后回读: " + reason
+	if prefix == staleReadPrefixManual {
+		warnManualStaleReadBypass(action)
+	}
+	return prefix + reason
 }
 
 // requestReadAfterWrite 是给「写完立刻回读」用的唯一入口:一次调用 = 一次放行。

@@ -96,7 +96,10 @@ func TestStaleReadGate_RefusesAndNamesTheNextStep(t *testing.T) {
 		t.Fatalf("want error code STALE_READ, got %+v", resp.Error)
 	}
 	msg := resp.Error.Message
-	for _, want := range []string{"pcb.components.list", "pcb.line.create", "easyeda doc reload", "--force-reason"} {
+	// --force-stale-read (not --force-reason): the CLI flag that actually exists.
+	// internal/app/TestRefusalMessagesOnlyNameRealCLISurface is what keeps this
+	// honest; this line only pins that the hatch is still advertised at all.
+	for _, want := range []string{"pcb.components.list", "pcb.line.create", "easyeda doc reload", "--force-stale-read"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("refusal message must contain %q, got:\n%s", want, msg)
 		}

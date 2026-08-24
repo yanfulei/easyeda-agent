@@ -61,6 +61,15 @@ type appConfig struct {
 	// stale_read_optin.go for why this is a per-call value rather than a second
 	// process-wide force switch.
 	staleReadReason string
+	// forceStaleRead is the HUMAN escape hatch past the same gate
+	// (--force-stale-read "<理由>"). Unlike staleReadReason it IS bound to a
+	// persistent flag, so its lifetime is the whole process — that is the price
+	// of a hatch a human can reach. What keeps it from becoming a second
+	// forceReason is that it is not a second wire field at all: it feeds the SAME
+	// narrowing predicate (staleReadForceReason → staleReadEligibleRequest), so it
+	// can only ever attach to a PCB read with RequiresGate=="" and can never
+	// unlock the routing stage gate. See stale_read_optin.go.
+	forceStaleRead string
 	// doc, when set (--doc <uuid|name>), PINS every action — mutating AND read —
 	// to that document: the daemon-choke-point guard (ensureActiveDoc) switches
 	// to it and confirms via LIVE document.current BEFORE the action dispatches,
@@ -804,8 +813,9 @@ func postAction(cfg *appConfig, action, window string, payload any, timeout time
 		// 顺带解锁 CheckRouteGate。daemon 收到后自己写 daemon.stale_read.force
 		// 审计行,app 侧不另造格式。
 		//
-		// 显式排在 forceReason 之后:人手敲的 --force-reason 语义更强,不该被一个
-		// 自动放行位覆盖掉(也不该把 forceUnsafe 带上 —— 那是布线门的东西)。
+		// 显式排在 forceReason 之后:人手敲的 `--force <理由>`(布线阶段门)语义更强,
+		// 不该被一个自动放行位覆盖掉(也不该把 forceUnsafe 带上 —— 那是布线门的东西)。
+		// 人手敲的 STALE_READ 逃生口是 --force-stale-read,它走的正是下面这个函数。
 		body["forceReason"] = reason
 	}
 	// Tell the daemon where to drop artifacts. Anchored to the project root
