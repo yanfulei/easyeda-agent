@@ -1151,8 +1151,11 @@ func runBlockApply(cfg *appConfig, window, blockID string, in bapInput, partsPat
 	// 必须在归组**之后**:组表就是回填的事实来源(它记的是 remap 后的真实位号)。
 	// 失败一律降级成一行警告 —— 器件与连线都已落地,一个外部 json 没同步上不该
 	// 把这次 apply 判成失败;但也绝不能沉默,漂移的位号会让分区判据静默少算模块。
+	//
+	// window 必须传下去:`--window` 是一等的路由方式(同名多窗口时 `--project`
+	// 会被 dispatch 拒掉,那时只能用 --window),回填不该在那种场合整个失效。
 	if !dryRun && strings.TrimSpace(in.SpecPath) != "" {
-		bapBackfillSpec(cfg, in.SpecPath, stderr)
+		bapBackfillSpec(cfg, window, in.SpecPath, stderr)
 	}
 
 	// 10. 统一收尾:状态已经全部固化(连线尽力、对账已做、组已封),**先出 manifest**,

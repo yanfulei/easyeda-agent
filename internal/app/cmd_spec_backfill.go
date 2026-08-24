@@ -18,7 +18,7 @@ import (
 )
 
 func newSpecBackfillCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command {
-	var project string
+	var project, window string
 	var write, asJSON bool
 	c := &cobra.Command{
 		Use:   "backfill <s0-spec.json>",
@@ -46,11 +46,24 @@ remap 之后的真值),所以整条命令**完全离线** —— 不需要连接
 默认只预览(dry-run),--write 才落盘。`,
 		Example: `  easyeda spec backfill .easyeda/s0-ceshi.json --project ceshi
   easyeda spec backfill .easyeda/s0-ceshi.json --project ceshi --write
+  easyeda spec backfill .easyeda/s0-ceshi.json --window a149acb3-... --write   # 同名多窗口时
   easyeda spec backfill s0.json --project ceshi --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(project) == "" {
 				project = cfg.project
+			}
+			// 只有显式给了 --window 才去问实时窗口 —— 这条命令的最大优点是**完全
+			// 离线**,不该因为没写 --project 就悄悄要求一个跑着的 daemon。
+			// 反查走 resolveStageProject:与 block-apply 归组写状态时同一个函数、
+			// 同一套优先级,所以两条路径永远落在同一个 state 文件上。
+			if strings.TrimSpace(project) == "" && strings.TrimSpace(window) != "" {
+				p, err := resolveStageProject(cfg, window)
+				if err != nil {
+					return fmt.Errorf("--window %s 认不出工程:%w(改用 --project <工程名>)", window, err)
+				}
+				project = p
+				fmt.Fprintf(stderr, "工程 %s(由 --window %s 反查)\n", project, window)
 			}
 			res, patched, err := runSpecBackfill(args[0], project)
 			if err != nil {
@@ -72,6 +85,7 @@ remap 之后的真值),所以整条命令**完全离线** —— 不需要连接
 		},
 	}
 	c.Flags().StringVar(&project, "project", "", "工程名(默认取全局 --project);决定读哪份 workflow 状态里的虚拟组")
+	c.Flags().StringVar(&window, "window", "", "EasyEDA 窗口 ID;没给 --project 时用它反查工程名(同名多窗口时唯一可用的路由方式)")
 	c.Flags().BoolVar(&write, "write", false, "真的写回文件(默认只预览)")
 	c.Flags().BoolVar(&asJSON, "json", false, "结构化输出")
 	return c
@@ -80,11 +94,27 @@ remap 之后的真值),所以整条命令**完全离线** —— 不需要连接
 // bapBackfillSpec 是 `sch block-apply --spec` 的钩子:落块+归组之后,把这一页的
 // 真实位号同步回 S0 spec。**永不返回错误** —— 见调用点注释(器件已落地,外部
 // json 没同步不该判整单失败),但每一种失败都必须说出来。
-func bapBackfillSpec(cfg *appConfig, path string, stderr io.Writer) {
-	res, patched, err := runSpecBackfill(path, cfg.project)
+//
+// 工程标识**必须走 resolveStageProject**,不能直接读 cfg.project:`--window` 是
+// 一等的路由方式(同名多窗口时 `--project` 会被 dispatch 直接拒掉 —— "maps to 2
+// windows — pass --window <id>",那时 --window 是唯一能跑的路),原先直接取
+// cfg.project 等于让回填在那种场合整个失效。
+//
+// 用同一个函数还顺带保证了**两条路径落在同一个 state 文件上**:resolveStageProject
+// 的优先级是「--project 字符串 > friendlyName > name > uuid」,而 block-apply 归组
+// 时(bapRegisterGroup → loadSchGroupsContext)用的正是它。回填读的组表因此必然
+// 就是刚刚写进去的那一份,不会因为反查方式不同而分裂出第二份组表 / 第二个文件。
+func bapBackfillSpec(cfg *appConfig, window, path string, stderr io.Writer) {
+	project, perr := resolveStageProject(cfg, window)
+	if perr != nil {
+		fmt.Fprintf(stderr, "warn: spec 位号回填跳过(认不出这块画布属于哪个工程:%v)—— %s\n",
+			perr, specBackfillManualHint(path, ""))
+		return
+	}
+	res, patched, err := runSpecBackfill(path, project)
 	if err != nil {
-		fmt.Fprintf(stderr, "warn: spec 位号回填跳过(%v)—— 手工同步:easyeda spec backfill %s --project %s --write\n",
-			err, path, cfg.project)
+		fmt.Fprintf(stderr, "warn: spec 位号回填跳过(%v)—— %s\n",
+			err, specBackfillManualHint(path, project))
 		return
 	}
 	for _, w := range res.Warnings {
@@ -95,8 +125,8 @@ func bapBackfillSpec(cfg *appConfig, path string, stderr io.Writer) {
 		return
 	}
 	if err := specWriteAtomic(path, patched); err != nil {
-		fmt.Fprintf(stderr, "warn: spec 位号回填写入失败(%v)—— 手工同步:easyeda spec backfill %s --project %s --write\n",
-			err, path, cfg.project)
+		fmt.Fprintf(stderr, "warn: spec 位号回填写入失败(%v)—— %s\n",
+			err, specBackfillManualHint(path, project))
 		return
 	}
 	for _, ch := range res.Changes {
@@ -117,7 +147,8 @@ func runSpecBackfill(path, project string) (specBackfillResult, []byte, error) {
 	}
 	if strings.TrimSpace(project) == "" {
 		return specBackfillResult{}, nil, fmt.Errorf(
-			"回填要知道读哪个工程的虚拟组表 —— 加 --project <工程名>(与 `easyeda sch block-apply --project` 同一个名字)")
+			"回填要知道读哪个工程的虚拟组表 —— 加 --project <工程名>(与 `easyeda sch block-apply --project` 同一个名字)," +
+				"或者加 --window <id> 让它反查(同名多窗口时只能走这条)")
 	}
 	st, err := workflow.Load(project)
 	if err != nil {

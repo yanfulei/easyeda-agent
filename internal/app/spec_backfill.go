@@ -51,6 +51,24 @@ import (
 	"github.com/zhoushoujianwork/easyeda-agent/internal/workflow"
 )
 
+// specBackfillManualHint 拼「手工同步」那一行提示。
+//
+// 这行提示存在的唯一理由就是**给人照抄**,所以 project 为空时绝不能拼出
+// `--project  --write`(两个空格,占位符没填上)—— 抄下来就是一条必然跑不通的
+// 命令,比不给提示更糟:人会以为自己抄错了,而不是工具没算出来。
+//
+// 解析不出工程名时改成说清楚**怎样才能得到它**,并给出不需要工程名的那条路
+// (`--window <id>`,与 block-apply 的路由方式一致)。
+func specBackfillManualHint(path, project string) string {
+	if p := strings.TrimSpace(project); p != "" {
+		return fmt.Sprintf("手工同步:easyeda spec backfill %s --project %s --write", path, p)
+	}
+	return fmt.Sprintf("手工同步:工程名 = `easyeda project info --window <id>` 里的 friendlyName"+
+		"(或 `easyeda health` 里那个窗口的 projectName),拿到后跑 "+
+		"`easyeda spec backfill %s --project <工程名> --write`;"+
+		"也可以直接把窗口给它:`easyeda spec backfill %s --window <id> --write`", path, path)
+}
+
 // specBackfillChange 是一个模块的回填结果。
 type specBackfillChange struct {
 	Module string   `json:"module"`
