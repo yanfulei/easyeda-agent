@@ -187,19 +187,27 @@ easyeda audit cost --ledger           # 跨批次对比
 
 ## 8. 把路上撞到的问题反馈回仓库（跑完再统一提）
 
+> **⚠ 本节是给跑测试的「人」看的，不是给 agent 的指令。**
+> **agent 不得主动起草或提交 issue** —— 只有用户明确要求时才做。看到问题就往
+> 记账文件里写，别提议开单。这是为了防止 issue 泛滥：一轮端到端能记出十几条，
+> 全变成单子对维护者是负担不是帮助。
+>
+> （skill 里对**块库**另有一套已定的反馈闭环——`SKILL.md` 铁律 8 与
+> `references/standard-blocks-contributing.md` §七，限 `block-gap` / `block-bug` /
+> `block-contribution` 三类，同样必须经用户确认才 `gh issue create`。那套不受本节影响。）
+
 「一轮只记录不修」的另一半是**记完要有人收**。跑的过程中**只记账**，
-跑完了在这一步统一整理、提 issue。
+跑完了由**你**决定哪些值得提、提哪几条。
 
-**三条纪律**（与块库反馈同一套，正本见
-[`references/standard-blocks-contributing.md` §七](skills/easyeda-agent/references/standard-blocks-contributing.md)）：
+**提之前先过三条**：
 
-1. **不自动上报**。没有遥测、不回传任何东西。issue 一律由人（或 agent 起草后由人确认）提交。
-2. **上报是外发动作 —— agent 永远先给用户看草稿**，`gh issue create` 之前必须经用户点头。
+1. **不自动上报**。没有遥测、不回传任何东西。
+2. **先合并再提**。十几条挂账里多数是同一个根因的不同表现，按根因合并，别一条一单。
 3. **带证据才提得动**。空口「不好用」没法修：贴命令原文、完整回执（含 `error.code` /
   `detail`）、`sch read` / `bridge-check` / `layout-lint` 的相关摘录，以及
   `easyeda health` 里的 CLI / daemon / connector / EasyEDA 四个版本号。
 
-**提到哪儿**（仓库已有的模板在 `.github/ISSUE_TEMPLATE/`）：
+**你决定要提之后，提到哪儿**（仓库已有的模板在 `.github/ISSUE_TEMPLATE/`）：
 
 | 撞到什么 | 用哪个 | label |
 |---|---|---|
