@@ -32,15 +32,19 @@ skill ──▶ Go CLI/daemon ──WebSocket──▶ connector .eext ──▶
 
 ## 首要准则 — 固定测试用例（端到端验收）
 
-**每次做端到端测试，都必须把 [`esp32MiniRequire.md`](esp32MiniRequire.md)
-（客户口吻的**原始需求**：4 层板 + 点灯 + 5V 供电端子 + 降压到 3V3 + CH340 USB 烧录 +
-BOOT/RESET 按键 + 四角 M3 固定，**故意不含 BOM/UUID/网表**）当输入，让 agent 自己
+**每次做端到端测试，都必须把 [`esp32MiniRequire.md`](esp32MiniRequire.md) 的
+**「一、客户原始需求」那一节**（4 层板 + 点灯 + 5V 供电端子 + 降压到 3V3 + CH340 USB
+烧录 + BOOT/RESET 按键 + 四角 M3 固定，**故意不含 BOM/UUID/网表**）当输入，让 agent 自己
 选型 → 放置 → 编组 → 布线 → `sch layout-lint` → DRC → 转 PCB（4 层叠层 / GND 内电层 /
 丝印极性 / 天线 keepout）→ save 完整跑一遍**——照 `skills/easyeda-agent/references/design-flow.md`
 流程脊柱（S0–S6 + P0–P10），不是只测单点，**也绝不喂加工过的答案**（喂好 BOM/网表就不叫真实场景了）。
 这是 agent 从需求到成品的回归基准：layout-lint / autosave / design-flow / 连接器 任何改动后都重跑此用例。
 验收：需求条条落实（0 overlap、0 fatal、网络连通、丝印/极性正、4 层电源树、已落盘）。
 测试工程用 `--project ceshi`，测完清理还原。
+
+同一份文件的**「二、怎么跑完这个 Demo」是给人看的 runbook**（环境自举、分段验收表、
+会被问到的决策题目、验收命令、已知坑、收尾），**不是喂给 agent 的输入** —— 它只写
+「你会被问到哪些题」，不写答案，所以不构成加工过的答案；但跑回归时仍然只交第一节。
 
 ## Notes
 

@@ -356,7 +356,9 @@ routability gate FAILED: score 44 < min 60; crossings 14 > max 8
 它至少该说清：交叉超标先看 `layout-lint` 的逐条 crossing 归因、判断哪些是拓扑性的，
 以及 `--max-crossings/--min-score` 是有意提供的降级旋钮（用了要写进交付摘要）。
 
-### F19 — `pcb silk-align` 连接器侧崩溃
+### F19 — 丝印动作在「前台不是 PCB」时报 `null.map`，报文完全指错方向
+
+**首版结论「`pcb silk-align` 连接器侧崩溃」是误诊，已订正。**
 
 ```
 "code": "EDA_CALL_FAILED",
@@ -364,8 +366,25 @@ routability gate FAILED: score 44 < min 60; crossings 14 > max 8
 "detail": "Cannot read properties of null (reading 'map')"
 ```
 
-32 件已布局、`pcb list` 正常返回的板子上，`silk-align` 读件表就 `null.map` 崩了。
-本轮到此停手，未进一步复现（reload 后重试没跑）。
+真相：当时前台文档停在**原理图页**（`doc reload` 的回执写着
+`✓ reloaded schematic 48b3fb13df9f2d2e`，我没注意），而 `pcb.silk.*` 要读 PCB 件表。
+`easyeda doc switch <pcbUuid>` 之后重跑：
+
+- `pcb.silk.list` → `count: 96`，正常返回
+- `pcb silk-align` → `aligned 32 / skipped 0 / unresolved 0 / warned 7`，功能完好
+
+**真正的缺陷是报文**：`Cannot read properties of null (reading 'map')` 里没有一个字提到
+「当前文档不是 PCB」。对照 PCB 侧另一道门 `STALE_READ` 的措辞——它会明写
+「PCB 自 xxx 后未 reload，下一步 `easyeda doc reload --project ceshi`」——同一批命令的
+前置条件检查，一个说得清清楚楚，一个抛原始 JS 异常。**前台文档类型应当在入口就校验，
+拒绝消息里点名「当前是 schematic，请先 `doc switch <pcbUuid>`」。**
+
+**附带发现**：`pcb.silk.list` 是 typed action，但**没有对应的 Cobra 子命令**
+（`pcb --help` 里只有 `silk-add/silk-align/silk-import-svg/silk-label-pads/silk-netnames/
+silk-set/silk-zone-outline`，没有 `silk-list`），只能走 `easyeda call pcb.silk.list`。
+这与 CLAUDE.md 首要准则「所有明确的功能模块必须以 Cobra 子命令方式暴露」相抵。
+—— 而且 `easyeda pcb silk-list --help` **退出码是 0**（cobra 回落到父命令帮助），
+所以「用 `--help` 探命令存不存在」这个检查法本身不可靠，要看输出而不是退出码。
 
 ---
 

@@ -1,32 +1,198 @@
 # ESP32 模组设计要求
 
-## 设计规格
+> **这份文件有两部分**：上半是**客户原始需求**（喂给 agent 的唯一输入），
+> 下半是**怎么把这个 Demo 跑完**（给人看的 runbook）。
+> 跑 Demo 时**只把「一、客户原始需求」交给 agent**——它故意不含 BOM / 器件 UUID /
+> 网表 / 选型，喂加工过的答案就不叫真实场景了。
+
+---
+
+## 一、客户原始需求
+
+### 设计规格
 - **层数**: 4层板
 - **丝印**: 必须包含丝印信息
 - **GND层**: 2层接地（GND）
 - **内电层**: 1层内电层
 - **电源层**: 1层 VCC 电源层
 
-## 供电与电源
+### 供电与电源
 - 板载 **5V 供电端子**（接线端子），支持外部 5V 输入
 - 插 USB 时也能供电（与端子共用一路 5V 即可）
 - 加一个**降压模块**，把 5V 降到 3.3V 给主控供电
 
-## 下载与调试
+### 下载与调试
 - 板载 **CH340** USB 转串口，插上 USB 就能烧录固件 / 看串口
 - 2 个基本按键：**BOOT**（进下载模式）和 **RESET**（复位）
 
-## 点灯
+### 点灯
 - 要求能点灯，加一个 LED
 - 在LED附近添加丝印标记，以清晰指示正负极 (+ 和 -)
 
-## 结构固定
+### 结构固定
 - 板子**四角各留一个 M3 螺丝孔**，方便固定安装
 
-## 其他要求
+### 其他要求
 - 设计应符合电气规范
 - 确保良好的信号完整性
 - 考虑散热设计
 - 提供必要的接口和连接器
 
 **Created by**: github:zhoushoujianwork/easyeda-agent
+
+---
+---
+
+# 二、怎么跑完这个 Demo
+
+这是本项目的**固定端到端用例**：从上面那段客户原话出发，让 agent 自己选型 → 放置 →
+编组 → 布线 → 转 PCB → 布局 → 布线 → 铺铜 → DRC → 落盘，跑完整条 S0–S6 + P0–P10。
+任何改动（layout-lint / autosave / design-flow / 连接器）之后都重跑它。
+
+## 0. 环境（一次性）
+
+三样东西缺一不可：**CLI/daemon**、**EasyEDA 里的连接器插件**、**外部交互权限**。
+
+```bash
+# ① CLI + daemon（已装过就 easyeda update）
+curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+
+# ② 启动 daemon（自动占 60832–60841 里的第一个空端口）
+easyeda daemon start
+```
+
+**③ 连接器插件**（在 EasyEDA Pro 里装，二选一）：
+
+- 立创EDA官方插件市场（一键装、平台可原地自动更新，但版本可能滞后 CLI）：
+  https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector
+- GitHub Release 直下（与 CLI **严格同版**，回归测试以它为准）：
+  https://github.com/zhoushoujianwork/easyeda-agent/releases/latest
+  下载 `easyeda-agent-connector.eext` → EasyEDA 扩展管理导入。
+  ⚠ 同 uuid 更新**必须先在「已安装」里卸载旧的**，否则导入静默失败；导入后**完全退出
+  并重启 EasyEDA**，否则已开窗口还在跑旧代码并抢 daemon 的 socket。
+
+**④ 开权限**：EasyEDA 里打开工程 → 启用「允许外部交互 / Allow external interaction」
+（在连接器**详情页 → 配置**标签里，不在扩展卡片上）。
+
+**验证**：
+
+```bash
+easyeda health
+```
+
+应能看到 `windows[]` 里有一条带 `connectorVersion` 的记录，且 `versionGate` 不报
+CLI/daemon/连接器落后。看到 `windows: []` 就是连接器没附上——回头查权限和重启。
+
+> 开发者另有一条免卸载/免重导入的热重载捷径（WS 灌 IndexedDB），见
+> `docs/dev-environment.md` §5。跑 Demo 不需要。
+
+## 1. 准备工程
+
+在 EasyEDA Pro 里**新建一个空工程**（建议命名 `ceshi`，本仓库把它当一次性测试工程，
+可随意清空/重建），打开它。工程里有一页空原理图和一块空 PCB 即可。
+
+后续所有命令都带 `--project ceshi` 定位窗口——**别用 `--window <id>`**，windowId 每次
+重连都会变。
+
+## 2. 起跑
+
+把**「一、客户原始需求」那一段**交给 agent，并要求它按
+`skills/easyeda-agent/references/design-flow.md` 的流程脊柱走。一句话就够：
+
+> 按 esp32MiniRequire.md 的客户原始需求，在工程 ceshi 上跑完整的 S0–S6 + P0–P10，
+> 分段验收，每段过门后存盘。
+
+## 3. 分段验收（**不要追求一次跑通**）
+
+一个重操作跨越太多步时，单次失败的爆炸半径太大（实测出现过 `zone-arrange` 把页面
+留在 26 脚断线状态）。按段走，**每段独立验收、独立存盘，段间可以中断**：
+
+| 段 | 验收标准 | 存盘点 |
+|---|---|---|
+| S0 | `easyeda spec validate .easyeda/s0-ceshi.json` 无 ERROR，且方案书经你确认 | spec 落盘 |
+| S1–S3 | 逐页 `easyeda sch bridge-check --doc <页>` 出 **0 problem tree** | 每页落完即 `sch save` |
+| S4–S6 | 逐页 `easyeda sch gate --doc <页>` 出 **PASS**；全工程 `sch nets --strict` 无同轨异名/单引脚网 | gate 过后 save |
+| P0–P6 | 板框 + 四角 M3 孔 + 天线全层 keepout + `pcb layout-lint --gate` 通过 | 每档 `pcb stage confirm-tier`，四档齐后 `confirm-layout` |
+| P7–P10 | 布线 + 4 层电源树 + 铺铜 + `pcb drc` 0 fatal + `pcb check` 无 ERROR | 每步 `pcb save` + `doc reload` |
+
+### 一轮只记录不修
+
+跑 → 发现问题 → 立刻修 → 重跑 → 又发现 → 又立刻修，**永远不收敛**。
+**跑完一整段只记账不修**，段末统一决定修什么。挂账数量不降就是没收敛，该停下算账。
+
+## 4. 你会被问到的决策（agent 猜不了，必须你拍板）
+
+这些需求里没写死，是**真实权衡**，agent 应当摊开选项+坑+推荐让你选，而不是替你默认。
+**这里只列题目，不给答案**——给了就等于喂加工过的答案：
+
+| 停点 | 要你决定什么 |
+|---|---|
+| S0 · 降压拓扑 | 需求只说「加一个降压模块」，没指定 LDO 还是同步 buck |
+| S0 · 5V 合轨 | 「与端子共用一路 5V 即可」——直接并联？二极管 OR？防倒灌那颗放哪一侧？ |
+| S0 · 叠层与地策略 | 需求写「4层板 / 2层接地 / 1层内电层 / 1层VCC层」，4 层只有 2 个内层，**字面加起来超编**，要定一个解释 |
+| S1–S3 · 分页 | 某一页装不下时，拆页是设计决策，工具只会停手不会自己拆 |
+| P2 · 板框尺寸 | 需求没给尺寸。让 agent 按最小包络算，还是钉死一个常见尺寸？ |
+| P2 · 装配工艺 | 单/双面、手焊还是回流——这决定 `layout-lint --gate` 的间距门档位 |
+| P2 · 接口边序 | ESP32-S3-WROOM-1 的 PCB 天线必须独占一条边且全层禁铜，剩下三边怎么分 USB-C / 5V 端子 / 按键与 LED |
+| P7 · 布线档 | 稠密板要不要停手让你在 EasyEDA 菜单里点原生自动布线 |
+
+## 5. 验收（需求条条落实）
+
+跑完对着原始需求逐条核，**只看数据不看截图**：
+
+```bash
+easyeda sch nets --all --project ceshi        # 逐网成员：跨页是否真连上
+easyeda sch gate --doc <每一页> --project ceshi
+easyeda pcb layout-lint --gate --project ceshi
+easyeda pcb layers --project ceshi            # 4 层 + 内电层网络
+easyeda pcb drc --project ceshi               # 0 fatal
+easyeda pcb check --project ceshi             # 无 ERROR / power-not-poured / width-under-spec
+easyeda call pcb.silk.list --project ceshi    # LED 旁 +/- 极性标记，且落在器件本体之外
+```
+
+> ⚠ 跑 `pcb *` 之前先确认**前台是 PCB**（`easyeda doc switch <pcbUuid> --project ceshi`）。
+> 前台停在原理图页时，丝印类动作会报一句毫不相干的
+> `Cannot read properties of null (reading 'map')`，极易被当成连接器崩溃去追。
+> 另：`pcb.silk.list` 目前只有 typed action、没有 Cobra 子命令，所以走 `easyeda call`。
+
+判据：**0 overlap、0 fatal、网络连通、丝印/极性正确、4 层电源树成立、已落盘**。
+
+`sch nets` 那条最容易漏——**跨页网名不一致是隐形杀手**：块之间的默认网名并不统一
+（有的出 `+3V3`、有的要 `3V3`），逐页判据结构上看不见，主控没接上电也照样全绿。
+S0 阶段就该定一张唯一网名表，之后每次落块显式 `--bind` 到表里的名字。
+
+## 6. 已知会撞上的坑（不是你操作错了）
+
+跑之前先知道这几条，能省下大量排查：
+
+- **页名改不动**：`sch page-rename` 在 EasyEDA 3.2.149 上恒失败（平台
+  `dmt_Schematic` 改名族返 `false`，而 `dmt_Pcb` 改名正常）。页的功能身份改用 uuid 钉住。
+- **`sch gate --strict` 过不了**：`missing-titleblock` 的唯一处方（写图签）当前被
+  design-flow 禁用，平台 DRC 又只回聚合数没法清零。**用非 strict 档**，把这两类如实
+  写进交付摘要。
+- **P6 可布性门的交叉阈值**：默认 `--max-crossings 8`。这块板有交叉耦合的自动下载电路 +
+  UART 收发对接 + USB-C 双侧 CC，**十来处交叉是拓扑性的、挪件消不掉**，要靠 4 层板换层在
+  布线期解决。挪到收敛后仍超标时，可显式降级
+  （`--max-crossings 16 --min-score 40`）——但**必须写进交付摘要**，别偷偷放行。
+- **PCB 改完必须 `doc reload` 再读**：不 reload 就读，daemon 直接拒（`STALE_READ`）。
+- **`sch clear` / 删器件之后跑 `bridge-check`**：`sch check` 不管 orphan-tree，
+  漏掉的孤岛导线可能正是一条 VBUS↔GND 短路。用 `sch gate` 一次跑四关，别单跑。
+
+完整的问题台账见 `docs/e2e-round-2026-08-25-findings.md`。
+
+## 7. 收尾
+
+测试工程用完清理还原即可（`ceshi` 是一次性的，可直接清空/删除重建）：
+
+```bash
+easyeda pcb clear --project ceshi     # 破坏性，会先要确认
+easyeda sch clear --project ceshi
+```
+
+**每跑完一场端到端记一笔成本画像**（墙钟 / daemon 侧机器时间 / 两者之差各自分开）：
+
+```bash
+easyeda audit cost --day <YYYY-MM-DD> --since HH:MM --until HH:MM \
+  --label "esp32Mini E2E" --tokens <N> --record
+easyeda audit cost --ledger           # 跨批次对比
+```
