@@ -299,6 +299,15 @@ destagger 的规划器没把「桩线会不会和邻居共线合并」算进去�
 本轮按「不修、如实报」处理（3 条：POWER×1 / USB_DL×2）。
 「自动恢复」这句话在没真恢复时不能印出来。
 
+> **v1.2.0 独立复验（2026-08-25 下午，POWER 页）**：原样复现。跑前 `bridge-check`
+> 0 problem tree、`check` 1 条 marker-overlap；规划 `GND left/80 → down/150`；
+> `--apply` 后 `bridge-check` 报 `ERROR wire-bridge nets=[C6_N3,GND] pins=[U3:2,U3:3]`，
+> `check` 报 `multi-net-wire`，而 **marker-overlap 一条没消**（换成 `+5V × C6_N3`）——
+> 净效果纯负。手工 `prim-delete` 整树 + 两次 `sch connect`（U3:2 GND left/80、
+> U3:3 C6_N3 **down**/30）三条命令修好，且 marker-overlap 归零 —— 差别只在落点方向
+> 避开了共线邻居。据此撤回 ADR-0004 里「destagger --apply 已解禁」的结论，
+> 已回帖 issue #171。
+
 ### F15 — `sch status --all-pages` 结构上只能读到当前活动页，多页工程恒报 3/4 读不到
 
 ```
