@@ -18,6 +18,8 @@ import {
 	isGroundLikeNet,
 	isPowerRailNet,
 	normalizeDeviceRef,
+	planOtherPropertyBackfill,
+	PROJECTED_STATE_KEYS,
 	runAction,
 	schematicComponentsList,
 	serializeComponent,
@@ -1842,4 +1844,98 @@ test('sch check: polarity-convention-outlier fires on the #183 nine-cap page (ha
 	finally {
 		delete (globalThis as any).eda;
 	}
+});
+
+// ── planOtherPropertyBackfill (#186) ────────────────────────────────────────
+//
+// The real device record for a C0805 (live-read 2026-08-25) — note that it
+// carries BOTH the values we want and the two landmines: a placeholder
+// `Designator: "C?"` and a projection template `Name: "={Value}"`.
+const DEVICE_OP_C0805 = {
+	'Datasheet': 'https://item.szlcsc.com/datasheet/GRM21BR61H106KE43L/439567.html',
+	'Description': '容值:10uF;精度:±10%;额定电压:50V;温度系数:X5R;',
+	'Designator': 'C?',
+	'JLCPCB Part Class': 'Basic Part',
+	'LCSC Part Name': '10uF ±10% 50V',
+	'Manufacturer': 'muRata(村田)',
+	'Manufacturer Part': 'GRM21BR61H106KE43L',
+	'Name': '={Value}',
+	'Supplier': 'LCSC',
+	'Supplier Part': 'C440198',
+	'Temperature Coefficient': 'X5R',
+	'Tolerance': '±10%',
+	'Value': '10uF',
+	'Voltage Rating': '50V',
+	'3D Model': '1ba041120af144c991958decab20d241',
+	'Footprint': 'ccb32feceadc4298b406326a506ce8e7',
+};
+
+// What the platform leaves on a freshly placed instance: the keys are there,
+// every value is empty (this is the #186 defect being fixed).
+const FRESH_INSTANCE_OP = {
+	'Datasheet': '',
+	'Description': '',
+	'JLCPCB Part Class': '',
+	'LCSC Part Name': '',
+	'Supplier Footprint': '',
+	'Temperature Coefficient': '',
+	'Tolerance': '',
+	'Value': '',
+	'Voltage Rating': '',
+};
+
+test('planOtherPropertyBackfill: fills the empty values a fresh instance carries', () => {
+	const { merged, filled } = planOtherPropertyBackfill(FRESH_INSTANCE_OP, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	assert.equal(merged['Value'], '10uF');
+	assert.equal(merged['Tolerance'], '±10%');
+	assert.equal(merged['Voltage Rating'], '50V');
+	assert.equal(merged['Temperature Coefficient'], 'X5R');
+	assert.ok(filled.includes('Value'), 'Value must be reported as filled');
+	// A key the device has no value for is left untouched, not invented.
+	assert.equal(merged['Supplier Footprint'], '');
+});
+
+test('planOtherPropertyBackfill: NEVER writes projected-state keys (the 166/166 designator wipe)', () => {
+	const { merged, filled } = planOtherPropertyBackfill(FRESH_INSTANCE_OP, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	for (const key of PROJECTED_STATE_KEYS) {
+		assert.ok(!(key in merged), `projected key ${key} must never be merged in`);
+		assert.ok(!filled.includes(key), `projected key ${key} must never be reported as filled`);
+	}
+	// The placeholder that caused the wipe specifically.
+	assert.equal(merged['Designator'], undefined);
+});
+
+test('planOtherPropertyBackfill: onlyExistingKeys refuses to introduce new keys', () => {
+	const { merged } = planOtherPropertyBackfill(FRESH_INSTANCE_OP, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	// Present on the device record, absent from the instance ⇒ must stay absent.
+	assert.ok(!('3D Model' in merged), '3D Model must not be introduced');
+	assert.ok(!('Footprint' in merged), 'Footprint must not be introduced');
+	assert.deepEqual(Object.keys(merged).sort(), Object.keys(FRESH_INSTANCE_OP).sort());
+});
+
+test('planOtherPropertyBackfill: never overwrites a value the instance already has', () => {
+	const edited = { ...FRESH_INSTANCE_OP, 'Value': '22uF (hand-picked)' };
+	const { merged, filled } = planOtherPropertyBackfill(edited, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	assert.equal(merged['Value'], '22uF (hand-picked)');
+	assert.ok(!filled.includes('Value'));
+});
+
+test('planOtherPropertyBackfill: idempotent — a second pass fills nothing', () => {
+	const first = planOtherPropertyBackfill(FRESH_INSTANCE_OP, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	const second = planOtherPropertyBackfill(first.merged, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	assert.deepEqual(second.filled, [], 'nothing left to fill on the second run');
+});
+
+test('planOtherPropertyBackfill: scrubs a stale placeholder Designator leaked by an older backfill', () => {
+	const poisoned = { ...FRESH_INSTANCE_OP, 'Designator': 'C?' };
+	const { merged, filled } = planOtherPropertyBackfill(poisoned, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	assert.equal(merged['Designator'], undefined, 'stale placeholder must be removed');
+	assert.ok(filled.some(f => f.startsWith('Designator')), 'the scrub must be reported');
+});
+
+test('planOtherPropertyBackfill: a real designator in otherProperty is left alone', () => {
+	// Only '?'-bearing placeholders are scrubbed — a real value is not ours to delete.
+	const withReal = { ...FRESH_INSTANCE_OP, 'Designator': 'C9' };
+	const { merged } = planOtherPropertyBackfill(withReal, DEVICE_OP_C0805, { onlyExistingKeys: true });
+	assert.equal(merged['Designator'], 'C9');
 });

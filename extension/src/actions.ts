@@ -951,6 +951,138 @@ export const schematicComponentsList: Handler = async (payload) => {
 };
 
 /**
+ * PROJECTED-STATE keys must NEVER be merged into a primitive's otherProperty
+ * from a library record: the platform projects them from top-level primitive
+ * state (designator, uniqueId, name, addIntoBom, manufacturerId, supplierId),
+ * it does not store them in otherProperty. Two failure modes, both live-verified:
+ *   - `Designator`: the library record carries its own PLACEHOLDER ("C?"), and
+ *     the platform syncs otherProperty.Designator INTO the primitive's
+ *     designator on modify — one sync-attrs run wiped 166/166 real designators
+ *     to U?/C?/RF? (each part flipping to its own library's placeholder
+ *     prefix); deterministic on a quiet 6-part board.
+ *   - The rest: writes are silently DROPPED (never appear in the next
+ *     getState_OtherProperty), so merging them re-"fills" the same keys every
+ *     run — a lying report and wasted writes, never a real backfill.
+ *
+ * ONE ruler for both sides: the PCB `sync-attrs` backfill and the schematic
+ * place-time backfill (#186) share this set. A second copy would be a second
+ * ruler, and the failure it guards against is designator-wiping.
+ */
+export const PROJECTED_STATE_KEYS: ReadonlySet<string> = new Set([
+	'Designator', 'Unique ID', 'Name', 'Add into BOM',
+	'Manufacturer', 'Manufacturer Part', 'Supplier', 'Supplier Part',
+]);
+
+/**
+ * Plan an otherProperty backfill: which library values may land on an instance.
+ *
+ * Pure so the rule is unit-testable without an EasyEDA runtime. Policy:
+ *   - projected-state keys are skipped (see PROJECTED_STATE_KEYS);
+ *   - empty/nullish library values are skipped (nothing to carry);
+ *   - a key the instance already fills is left alone (never overwrite a real
+ *     value — hand edits and later standardization both outrank the library);
+ *   - `onlyExistingKeys` (the place-time default) additionally refuses to
+ *     INTRODUCE keys the instance doesn't already carry. The platform copies
+ *     the device's key structure at create time with empty values, so the
+ *     existing key set is exactly "what this part is supposed to have" — and
+ *     not inventing keys makes it structurally impossible to leak a library
+ *     placeholder onto a fresh instance.
+ * Also scrubs a stale placeholder `Designator` that an OLDER backfill leaked
+ * in, since any future whole-otherProperty write would re-wipe the designator.
+ */
+export function planOtherPropertyBackfill(
+	current: Record<string, unknown>,
+	source: Record<string, unknown>,
+	opts: { overwrite?: boolean; onlyExistingKeys?: boolean } = {},
+): { merged: Record<string, unknown>; filled: Array<string> } {
+	const { overwrite = false, onlyExistingKeys = false } = opts;
+	const filled: Array<string> = [];
+	const merged: Record<string, unknown> = { ...current };
+	for (const [key, value] of Object.entries(source)) {
+		if (PROJECTED_STATE_KEYS.has(key)) continue;
+		if (value === undefined || value === null || value === '') continue;
+		if (onlyExistingKeys && !(key in current)) continue;
+		const existing = current[key];
+		if (!overwrite && existing !== undefined && existing !== null && existing !== '') continue;
+		if (existing === value) continue;
+		merged[key] = value;
+		filled.push(key);
+	}
+	if (typeof merged['Designator'] === 'string' && merged['Designator'].includes('?')) {
+		delete merged['Designator'];
+		filled.push('Designator (stale placeholder removed)');
+	}
+	return { merged, filled };
+}
+
+/**
+ * #186: `sch_PrimitiveComponent.create` copies the device record's otherProperty
+ * KEY STRUCTURE onto the instance but leaves every value empty — live-verified
+ * on a C0805: the instance carries `Value` / `Tolerance` / `Voltage Rating` /
+ * `Datasheet` / `Description` as keys, all `""`, while the device record has
+ * `Value: "10uF"`, `Tolerance: "±10%"`, `Voltage Rating: "50V"`, … So the BOM's
+ * value column and the 器件标准化 panel stayed empty until the PCB-side
+ * `sync-attrs` pass filled them much later in the flow — even though the very
+ * same record is in hand at place time.
+ *
+ * Backfills at place time under the shared rule (see planOtherPropertyBackfill),
+ * restricted to keys the instance already carries. Best-effort: placement never
+ * fails because a backfill did — same contract as backfillSupplierId (#157).
+ */
+async function backfillOtherProperty(
+	component: SchComponent,
+	device: { libraryUuid: string; uuid: string },
+): Promise<{ component: SchComponent; filled?: Array<string>; warning?: string }> {
+	let current: Record<string, unknown> = {};
+	try { current = (component.getState_OtherProperty() as Record<string, unknown>) ?? {}; }
+	catch { return { component }; }
+	if (!Object.keys(current).length) return { component };
+
+	let source: Record<string, unknown> = {};
+	try {
+		const item = await eda.lib_Device.get(device.uuid, device.libraryUuid) as
+			{ property?: { otherProperty?: unknown } } | undefined;
+		const op = item?.property?.otherProperty;
+		if (op && typeof op === 'object') source = op as Record<string, unknown>;
+	}
+	catch { return { component }; }
+	if (!Object.keys(source).length) return { component };
+
+	const { merged, filled } = planOtherPropertyBackfill(current, source, { onlyExistingKeys: true });
+	if (!filled.length) return { component };
+
+	// Re-assert the identity fields in the SAME call. A whole-otherProperty write
+	// re-projects top-level state from the library record, so anything already
+	// backfilled onto the instance is reset unless it is restated here — both
+	// failures are live-verified:
+	//   - `designator`: the 166/166 wipe to U?/C?/RF? described above;
+	//   - `supplierId`: dropping it undid #157 — the instance fell back to the
+	//     platform default `<MPN>.1`, which is exactly the unorderable BOM value
+	//     #157 exists to prevent. Caught by reading the instance back after the
+	//     first build of this backfill; the response had claimed success.
+	let designator = '';
+	try { designator = String(component.getState_Designator() ?? ''); }
+	catch { /* optional */ }
+	let supplierId = '';
+	try { supplierId = String(component.getState_SupplierId() ?? ''); }
+	catch { /* optional */ }
+	try {
+		const m = await eda.sch_PrimitiveComponent.modify(component.getState_PrimitiveId(), {
+			...(designator ? { designator } : {}),
+			...(/^C\d+$/.test(supplierId) ? { supplierId } : {}),
+			otherProperty: merged as Record<string, string | number | boolean>,
+		});
+		if (m) return { component: m, filled };
+	}
+	catch { /* fall through */ }
+	return {
+		component,
+		warning: `otherProperty backfill (${filled.join(', ')}) failed — the instance keeps the platform's empty values; `
+			+ 'the PCB-side `sync-attrs` pass will still fill them later.',
+	};
+}
+
+/**
  * #157: sch_PrimitiveComponent.create defaults the placed instance's supplierId
  * to `<MPN>.1` (the subPartName), NOT the device's real LCSC C-number — which
  * flags every part in the official 器件标准化 panel and makes the BOM's
@@ -1046,13 +1178,21 @@ export const schematicComponentPlace: Handler = async (payload) => {
 	const backfill = await backfillSupplierId(component, { libraryUuid, uuid });
 	component = backfill.component;
 
+	// #186: carry the device's attribute VALUES (Value / Tolerance / …) onto the
+	// instance — create copies their keys but leaves them empty. Runs after the
+	// designator assignment above so the re-assert writes the real designator.
+	const attrs = await backfillOtherProperty(component, { libraryUuid, uuid });
+	component = attrs.component;
+
+	const warnings = [backfill.warning, attrs.warning].filter((w): w is string => Boolean(w));
 	return {
 		result: {
 			primitiveId: component.getState_PrimitiveId(),
 			component: serializeComponent(component),
 			...(backfill.backfilled ? { supplierIdBackfilled: backfill.backfilled } : {}),
+			...(attrs.filled?.length ? { otherPropertyBackfilled: attrs.filled.sort() } : {}),
 		},
-		...(backfill.warning ? { warnings: [backfill.warning] } : {}),
+		...(warnings.length ? { warnings } : {}),
 	};
 };
 
@@ -7588,22 +7728,8 @@ const pcbComponentAttrsBackfill: Handler = async (payload) => {
 		}
 	}
 
-	// PROJECTED-STATE keys must NEVER be merged in from the library record: the
-	// platform projects them from top-level primitive state (designator,
-	// uniqueId, name, addIntoBom, manufacturerId, supplierId), it does not store
-	// them in otherProperty. Two failure modes, both live-verified:
-	//   - `Designator`: the library record carries its own PLACEHOLDER ("C?"),
-	//     and the platform syncs otherProperty.Designator INTO the primitive's
-	//     designator on modify — one sync-attrs run wiped 166/166 real
-	//     designators to U?/C?/RF? (each part flipping to its own library's
-	//     placeholder prefix); deterministic on a quiet 6-part board.
-	//   - The rest: writes are silently DROPPED (never appear in the next
-	//     getState_OtherProperty), so merging them re-"fills" the same keys
-	//     every run — a lying report and wasted writes, never a real backfill.
-	const projectedStateKeys = new Set([
-		'Designator', 'Unique ID', 'Name', 'Add into BOM',
-		'Manufacturer', 'Manufacturer Part', 'Supplier', 'Supplier Part',
-	]);
+	// Projected-state keys are never merged in — see PROJECTED_STATE_KEYS.
+	const projectedStateKeys = PROJECTED_STATE_KEYS;
 
 	const updated: Array<{ designator: string; lcsc: string; filledKeys: Array<string> }> = [];
 	const unresolved: Array<string> = [];

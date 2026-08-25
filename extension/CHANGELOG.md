@@ -4,6 +4,43 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.3] — 2026-08-25
+
+> 1.2.2 只在 dev 循环里打过包(未发版),它的条目并入本版。
+
+### Fixed — 放置器件时就把属性值带上,不再等到 PCB 侧 `sync-attrs`(#186)
+
+`sch_PrimitiveComponent.create` 把 device 记录的 otherProperty **键结构**复制到实例上,
+**但值全空**。真机实测一颗 C0805:实例上 `Value` / `Tolerance` / `Voltage Rating` /
+`Datasheet` / `Description` 键都在、全是 `""`,而同一刻 `lib_Device.get` 返回的记录里
+`Value: "10uF"`、`Tolerance: "±10%"`、`Voltage Rating: "50V"` 一应俱全。后果是 BOM 的
+值列与器件标准化面板一路空着,要等流程很后面的 PCB `sync-attrs` 才补 —— **而那份记录
+在放置当刻就在手里**。
+
+现在 place 落件后立刻回填(同 #157 supplierId 回填的 best-effort 契约:回填失败绝不让
+放置失败),回执多一个 `otherPropertyBackfilled: [...]`。
+
+判据与 PCB 侧 `sync-attrs` **收成同一把尺**(`PROJECTED_STATE_KEYS` +
+`planOtherPropertyBackfill` 提到模块级共享,原先只存在于 PCB handler 内部):
+
+- **投影键永不写**:库记录自带占位 `Designator: "C?"` 与模板 `Name: "={Value}"`,
+  而平台会把 `otherProperty.Designator` 同步进位号 —— 这正是曾把 166/166 真位号
+  洗成 `U?/C?/RF?` 的那条路;写入时同一 call 重新断言真实位号,双保险;
+- **只填实例上已有的键**:平台 create 已经把「这颗件该有哪些属性」的键集复制好了,
+  不新增键 ⇒ 结构上不可能把库占位漏到新实例;
+- **不覆盖已有值**:手改与后续标准化都优先于库记录;
+- **幂等**:填过一遍第二遍零动作。
+
+**同一 call 重新断言 `designator` + `supplierId`**:整包 otherProperty 写会让平台
+**重新投影顶层字段**。designator 那条是已知的(上面 166/166);`supplierId` 这条是本次
+真机回读**当场抓到的回归** —— 第一版只断言了 designator,结果实例的 C 号被打回平台默认
+`GRM21BR61H106KE43L.1`(正是 #157 要消灭的不可下单值),**而回执还印着
+`supplierIdBackfilled: C440198`**。同一块板上的前后对照:C99(旧构建)`supplierId=<MPN>.1`,
+C98(修复后)`supplierId=C440198`,两者 `Value` 都是 `10uF`。
+**教训照旧:回执不算数,回读才算数。**
+
+7 个新离线单测钉住上述每一条(含 166/166 位号洗白的回归、陈旧占位 Designator 清洗)。
+
 ## [1.2.1] — 2026-08-25
 
 ### Added

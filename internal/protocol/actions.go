@@ -230,7 +230,7 @@ func AllActions() []ActionSpec {
 			Phase:       1,
 			Mutates:     true,
 			NeedsWindow: true,
-			Description: "Place a device/component from library identity at coordinates. `uuid` must be a device-library uuid (from schematic.library.search), NOT a placed-instance id from schematic.components.list — an instance uuid hangs the EasyEDA API.",
+			Description: "Place a device/component from library identity at coordinates. `uuid` must be a device-library uuid (from schematic.library.search), NOT a placed-instance id from schematic.components.list — an instance uuid hangs the EasyEDA API. Two backfills run right after create, both best-effort (placement never fails because a backfill did): supplierId → the device's real LCSC C-number instead of the platform default `<MPN>.1` (#157), and otherProperty VALUES (Value/Tolerance/Voltage Rating/Datasheet/…) which create copies as empty keys (#186) — reported as `supplierIdBackfilled` / `otherPropertyBackfilled`. Projected-state keys (Designator/Name/Supplier Part/…) are never written and identity fields are re-asserted in the same call, because a whole-otherProperty write re-projects them from the library record.",
 			Inputs:      []string{"libraryUuid", "uuid (device-library uuid, not an instance id)", "x", "y", "rotation optional", "mirror optional"},
 			Outputs:     []string{"primitive id", "component state"},
 			VerifyWith:  []string{"schematic.component.get"},
