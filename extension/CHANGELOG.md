@@ -4,7 +4,30 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
-## [1.1.2] — 2026-08-24
+## [1.2.0] — 2026-08-25
+
+> 1.1.2 从未发版(无 tag),它的条目并入本版。
+> **升级方式**:CLI/skill 跑 `easyeda update`;**连接器 sideload 必须手工重导入**
+> (同 uuid 更新要先在「已安装」里卸载旧的,导入后完全退出并重启 EasyEDA)。
+
+### Added — 版本一致性门:工具链错位当场拒绝并给出修法
+
+CLI / daemon / 连接器三方版本对不上时,`easyeda health` 给出 `versionGate` 判定,
+后续动作在 `/action` 层被直接拒绝并附修法,而不是让人先怀疑电路或工具坏了。
+明知故犯的逃生口是 `--skip-version-check`(会写审计)。
+
+### Added — S0 spec 位号回填进流程,不用再「每次落块回头改 json」
+
+`modules[].parts` 写的是 designator,而平台会在 create 时按自己的全局位号重编
+(计划 C1 → 落地 C11)。位号对不上**不会报错**,只会让分区打分/连接器规则静默少算
+一个模块。现在 `sch block-apply --spec <s0.json>` 落块即回填,或事后
+`easyeda spec backfill … --write`;写入是外科手术(只替换那一段字节,键序/缩进/
+未知字段一个不动),任一模块定位不到就整体拒写。
+
+### Added — `--force-stale-read`:STALE_READ 的逃生口从「不存在的 flag」变成真的
+
+此前拒绝消息里印着一个并不存在的 flag,照抄跑不通。现在它是真 flag,带理由入审计,
+且**只放 PCB 读**、解不开布线阶段门。
 
 ### Fixed — 超时守卫改由 worker tick 兜底:队首卡死不再拖死整条队列
 
@@ -33,6 +56,42 @@ setTimeout 的守卫(FIFO 的放弃闸 22s、每次平台调用的 `withTimeout`
 **行为变化**:队首卡死时,连接器现在会在 `timeoutMs + 2s` 真的放弃它并回
 `ACTION_ABANDONED`,队列继续流动。收到这个码 = 那次写的效果**可能稍后才落地**,
 关于它的任何结论都不成立(`seqAbandoned` 已递增),必须回读复核后再决定,**不要盲重试**。
+
+### Fixed — 两处「两把尺」:state 身份靠名字背 / block-apply 落点只看器件本体
+
+- **state 身份**:工程被同名删除重建后,旧工程的页记账会继续参与跨页匹配,让
+  `spec backfill` / 分区打分把死页算进分母。新增 `easyeda workflow pages --reap`
+  (拿活体页表核销)与 `--prune`(清数据);核销后的页会被 WARN 点名并**明确排除出分母**。
+- **block-apply 落点**:落点搜索此前只把「器件本体」当障碍,不算 marker 晕圈,于是
+  同一页先落主控再落 LED 会撞出图元重叠。现在为 marker 预留约 105 单位——
+  **副作用是落点可能离 `--at` 更远**,挤的时候跑 `sch clusters` 看组间压没压到。
+
+### Fixed — zone-draw 拒画:规划器自己造的违规先让掉,拒了也要说得出挪多少
+
+两个内容分得开、只是版面余量对撞的区,现在直接画得出框。真画不出时报文给出逐条
+最小位移(`sch zone move --zone X --dy +N`)。版面知识:**竖着叠的两个功能区之间要留
+≥96 单位**(24 边距 + 42 说明带 + 30 区名带),横着排的贴着放也画得出框。
+
+### Fixed — 电路说明不再被甩出分区框;`missing-partition` 改看画布而非本地记账
+
+说明带的三把尺收敛成一把;`sch check` 的分区判据改由**画布上的区标题文本**作证
+(与 `zone-draw` 生成标题同一个函数),消除「画布上明明有框、check 永远说没有」的恒报。
+同时新增 `page-too-small` 判据:块/组比整页可用区还大时**停手交回用户**(拆页是设计决策,
+工具不自动分页)。
+
+### Known issues — 随版本如实公布
+
+一次广度优先的端到端(esp32Mini 固定用例)记了 19 条挂账,完整台账见仓库
+`docs/e2e-round-2026-08-25-findings.md`。**升级前值得先知道的三条**:
+
+- **`sch group-move --ids` 报「电气自检失败」却不回滚**:位移照样落地,留下悬空脚 +
+  悬空树。看到那个 `✗` **不要当作没发生**,先 `sch bridge-check` 复核画布。
+  单件带线搬请改用 `sch group create` + `--group`,或 `disconnect → modify → connect`。
+- **`sch destagger --apply` 在相邻引脚场景仍会共线合并成短路**,且「已按快照自动恢复」
+  这句话在没真恢复时也会打印。跑完必须 `sch bridge-check` 验一遍。
+- **`sch gate --strict` 目前无法出 `verdict=pass`**:`missing-titleblock` 的唯一处方
+  (写图签)当前被 design-flow 禁用,平台 DRC 又只回聚合数没法清零。**用非 strict 档**,
+  把这两类如实写进交付摘要。
 
 ## [1.1.1] — 2026-08-21
 
