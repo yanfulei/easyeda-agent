@@ -4,6 +4,23 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`sch check` 新规则 `polarity-convention-outlier`(WARN,#183 第一阶段)—— 同页电容电源脚约定一致性检查**。
+  一颗钽电容正极接 GND 曾带着 51 条 WARN 顺利过 gate,打样上电约 10 秒后热失控才发现——DRC 看不见极性、
+  静态测量兆欧级测不出、现象带延迟。该规则的判据**不需要器件极性领域知识**:同页同类两脚电容中,
+  「一脚电源轨 + 一脚 GND」的多数派对"电源侧在哪个 pin 号"有强约定,违背多数派的那颗就是 #183 描述的
+  8:1 强信号。保守阈值防误报:命中样本 <3 不报(无约定可言)、多数派并列不报(歧义)、多数派占比 <75%
+  不报(`--strict` 会把 WARN 升级为阻塞,不允许掷硬币);串联/信号电容(两脚都不是电源地)天然排除,
+  候选口径 C+数字编号(CN 端子/CR 二极管不进票仓),地网分类含全拼 GROUND;`totalMatched`
+  只计真正进入统计的器件。已知限制:`--all-pages` 下候选跨页池化成一个约定而非逐页统计
+  (gate 默认单页不受影响),该模式下 finding message 会注明。finding 带 `pins`(电源脚,地脚)+ `nets` + 多数派归因,message
+  明确提示 MLCC 无极性可忽略;summary 新增 `polarityConventionOutliers`,Go 渲染端新增计数槽与修复提示行。
+  纯函数 `detectPolarityConventionOutliers` / `isGroundLikeNet` / `isPowerRailNet` 可离线单测
+  (8 个新用例含 #183 九电容真机复现)。ERROR 级极性判定(需封装/符号证据)留待 #183 第二阶段。
+
 ## [1.1.2] — 2026-08-24
 
 ### Fixed — 超时守卫改由 worker tick 兜底:队首卡死不再拖死整条队列

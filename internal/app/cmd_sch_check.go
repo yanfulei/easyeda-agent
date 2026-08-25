@@ -31,6 +31,9 @@ import (
 //	wire-over-pin       WARN  a wire body runs through a pin it doesn't end on
 //	zero-length-wire    WARN  degenerate zero-length segment
 //	dangling-wire       WARN  wire end anchored to nothing (incl. orphan stubs)
+//	polarity-convention-outlier WARN cap whose rail-side pin contradicts the
+//	                          same-page majority (#183 phase 1; MLCC numbering is
+//	                          arbitrary, so a consistency hint, not an assertion)
 //
 // checkSummary mirrors these with one per-type count field each.
 
@@ -71,6 +74,8 @@ type checkFinding struct {
 	Nets              []string         `json:"nets,omitempty"`
 	Pins              []string         `json:"pins,omitempty"`
 	PinDetails        []checkPinDetail `json:"pinDetails,omitempty"`
+	// Count 是规则专属槽:floating-pin=悬空脚数 / multi-net-wire=异名数 /
+	// polarity-convention-outlier=同页多数派票数(majorityCount)。
 	Count             int              `json:"count,omitempty"`
 	Message           string           `json:"message,omitempty"`
 	At                *checkPoint      `json:"at,omitempty"`
@@ -116,7 +121,11 @@ type checkSummary struct {
 	// Orientation rule: a netflag whose stored rotation contradicts its stub
 	// direction per the orientation truth table (reversed/upside-down flag).
 	ReversedNetFlags int `json:"reversedNetFlags"`
-	Total            int `json:"total"`
+	// Polarity-convention outliers (#183 phase 1): caps whose rail-side pin
+	// number contradicts the same-page supermajority — the mechanically
+	// detectable core of a reversed tantalum that once sailed through this gate.
+	PolarityConventionOutliers int `json:"polarityConventionOutliers"`
+	Total                      int `json:"total"`
 }
 
 type checkReport struct {
@@ -239,8 +248,8 @@ func checkLevelTag(level string) string {
 
 func renderCheckReport(rep checkReport, w io.Writer) {
 	s := rep.Summary
-	fmt.Fprintf(w, "sch check: %d finding(s) — %d floating pin(s)/%d comp, %d geom-net mismatch(es), %d net-marker mismatch(es), %d multi-net wire(s), %d wire-crossing(s), %d wire-over-pin(s), %d zero-length wire(s), %d dangling wire(s), %d duplicate-net-marker(s), %d titleblock-overlap(s), %d marker-overlap(s), %d missing-deliverable(partition/note/titleblock), %d note-outside-zone(s), %d folded-net-label(s), %d redundant-net-marker(s), %d reversed-net-flag(s)\n",
-		s.Total, s.FloatingPins, s.ComponentsWithFloating, s.GeomNetMismatches, s.NetMarkerMismatches, s.MultiNetWires, s.WireCrossings, s.WireOverPins, s.ZeroLengthWires, s.DanglingWires, s.DuplicateNetMarkers, s.TitleblockOverlaps, s.MarkerOverlaps, s.MissingPartitions, s.NoteOutsideZones, s.FoldedNetLabels, s.RedundantNetMarkers, s.ReversedNetFlags)
+	fmt.Fprintf(w, "sch check: %d finding(s) — %d floating pin(s)/%d comp, %d geom-net mismatch(es), %d net-marker mismatch(es), %d multi-net wire(s), %d wire-crossing(s), %d wire-over-pin(s), %d zero-length wire(s), %d dangling wire(s), %d duplicate-net-marker(s), %d titleblock-overlap(s), %d marker-overlap(s), %d missing-deliverable(partition/note/titleblock), %d note-outside-zone(s), %d folded-net-label(s), %d redundant-net-marker(s), %d reversed-net-flag(s), %d polarity-convention outlier(s)\n",
+		s.Total, s.FloatingPins, s.ComponentsWithFloating, s.GeomNetMismatches, s.NetMarkerMismatches, s.MultiNetWires, s.WireCrossings, s.WireOverPins, s.ZeroLengthWires, s.DanglingWires, s.DuplicateNetMarkers, s.TitleblockOverlaps, s.MarkerOverlaps, s.MissingPartitions, s.NoteOutsideZones, s.FoldedNetLabels, s.RedundantNetMarkers, s.ReversedNetFlags, s.PolarityConventionOutliers)
 
 	for _, f := range rep.Findings {
 		tag := checkLevelTag(f.Level)
@@ -335,5 +344,8 @@ func renderCheckReport(rep checkReport, w io.Writer) {
 	}
 	if s.FoldedNetLabels > 0 {
 		fmt.Fprintln(w, "→ folded-net-label: netport 竖排、网名侧向难读 — `sch disconnect` 后重连(autoconnect 现已惩罚竖排,水平错列优先),或显式 --direction left|right")
+	}
+	if s.PolarityConventionOutliers > 0 {
+		fmt.Fprintln(w, "→ polarity: verify the flagged caps' rail pin against the page majority (钽/电解 reverse = thermal-runaway/fire risk); MLCC numbering is arbitrary — ignore if non-polarized (#183)")
 	}
 }

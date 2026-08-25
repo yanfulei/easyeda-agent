@@ -2733,7 +2733,7 @@ interface CheckPinDetail {
 
 // One reconstructed design-check finding. Reuses the DRC severity buckets.
 interface CheckFinding {
-	type: string; // 'floating-pin' | 'geom-net-mismatch' | 'wire-crossing' | 'wire-over-pin' | 'net-marker-mismatch' | 'multi-net-wire' | 'zero-length-wire' | 'dangling-wire'
+	type: string; // 'floating-pin' | 'geom-net-mismatch' | 'wire-crossing' | 'wire-over-pin' | 'net-marker-mismatch' | 'multi-net-wire' | 'zero-length-wire' | 'dangling-wire' | 'polarity-convention-outlier'
 	level: DrcSeverity;
 	designator?: string;
 	primitiveId?: string; // owning component (floating-pin / wire-over-pin)
@@ -2744,7 +2744,7 @@ interface CheckFinding {
 	nets?: Array<string>;
 	pins?: Array<string>; // pin numbers — kept flat for `sch no-connect`
 	pinDetails?: Array<CheckPinDetail>; // number+name+coords for each pin
-	count?: number;
+	count?: number; // rule-specific slot: floating-pin 悬空脚数 / multi-net-wire 异名数 / polarity-convention-outlier 同页多数派票数(majorityCount)
 	message?: string;
 	at?: { x: number; y: number }; // location of a crossing / through-pin
 }
@@ -2860,6 +2860,86 @@ async function collectNetlistPinNets(): Promise<NetlistPinNets> {
 		byDesignator.set(designator, pins);
 	}
 	return { byDesignator, available: true };
+}
+
+// ─── Polarity-convention outlier (#183 phase 1) ─────────────────────────────
+//
+// Pure helpers so the rule is unit-testable without an EasyEDA runtime (project
+// test law: handlers may touch the `eda` global, tests touch pure functions).
+//
+// Issue #183: a tantalum cap wired positive-to-GND sailed through `sch check`
+// (51 WARNs, none about polarity) until the board came back and thermally ran
+// away. The mechanically detectable core of that incident needs NO domain
+// knowledge: on one page, peers of the same class wired as {one pin on a power
+// rail, the other on GND} overwhelmingly agree on WHICH pin number carries the
+// rail — a part contradicting that majority is worth a look.
+
+// Ground-ish net names: GND family (incl. full spelling GROUND) + VSS + earth.
+// Prefix match on purpose so GNDA / DGND / PGND / GND_1 classify while longer
+// unrelated names do not.
+export function isGroundLikeNet(net: string): boolean {
+	return /^(gnd|agnd|dgnd|pgnd|vss|earth|ground)/i.test(net);
+}
+
+// Power-rail-ish net names: numeric-volt prefixes (+5V / 3V3 / 12V0) and common
+// V-rail families (VCC/VDD/VPP/VBAT/VBUS/VIN/VOUT/VSYS…). Prefix match on
+// purpose — suffixed rails like VBAT_RAW / VSYS_5V must still classify.
+export function isPowerRailNet(net: string): boolean {
+	return /^[+-]?\d+(\.\d+)?v/i.test(net)
+		|| /^v(cc|dd|pp|bat|bus|in|out|sys|usb|mic|aux)/i.test(net);
+}
+
+export interface PolarityCapCandidate {
+	designator: string;
+	primitiveId?: string;
+	pins: Array<{ number: string; net: string }>; // the component's exactly-2 physical pins with netlist nets
+}
+
+export interface PolarityConventionOutlier {
+	designator: string;
+	primitiveId?: string;
+	powerPin: string; // this part's rail-side pin number
+	gndPin: string;
+	powerNet: string;
+	gndNet: string;
+	majorityPowerPin: string; // the page convention this part contradicts
+	majorityCount: number;
+	totalMatched: number; // parts entering the statistics (gnd+power pattern)
+}
+
+// A candidate enters the statistics only when its two pins classify as exactly
+// {power rail, GND} — series/signal caps (both pins on signal nets) are excluded
+// because their pin order carries no polarity meaning.
+const POLARITY_MIN_GROUP = 3; // fewer matched parts than this ⇒ no page convention to violate
+const POLARITY_MAJORITY_FRACTION = 0.75; // --strict promotes WARNs to blocking, so "the page convention" must be supermajority, not a coin flip
+
+export function detectPolarityConventionOutliers(
+	candidates: Array<PolarityCapCandidate>,
+): Array<PolarityConventionOutlier> {
+	const matched: Array<Omit<PolarityConventionOutlier, 'majorityPowerPin' | 'majorityCount' | 'totalMatched'>> = [];
+	for (const c of candidates) {
+		if (!c.pins || c.pins.length !== 2) continue;
+		const [a, b] = c.pins;
+		const cls = (net: string): 'gnd' | 'pwr' | 'other' =>
+			isGroundLikeNet(net) ? 'gnd' : isPowerRailNet(net) ? 'pwr' : 'other';
+		if (cls(a.net) === 'pwr' && cls(b.net) === 'gnd') {
+			matched.push({ designator: c.designator, primitiveId: c.primitiveId, powerPin: a.number, gndPin: b.number, powerNet: a.net, gndNet: b.net });
+		}
+		else if (cls(a.net) === 'gnd' && cls(b.net) === 'pwr') {
+			matched.push({ designator: c.designator, primitiveId: c.primitiveId, powerPin: b.number, gndPin: a.number, powerNet: b.net, gndNet: a.net });
+		}
+	}
+	if (matched.length < POLARITY_MIN_GROUP) return [];
+	const byPowerPin = new Map<string, number>();
+	for (const m of matched) byPowerPin.set(m.powerPin, (byPowerPin.get(m.powerPin) ?? 0) + 1);
+	const ranked = [...byPowerPin.entries()].sort((x, y) => y[1] - x[1]);
+	if (ranked.length < 2) return []; // unanimous — nothing to flag
+	const [majorityPin, majorityCount] = ranked[0];
+	if (ranked[1][1] === majorityCount) return []; // tie — no established convention
+	if (majorityCount < Math.ceil(matched.length * POLARITY_MAJORITY_FRACTION)) return [];
+	return matched
+		.filter(m => m.powerPin !== majorityPin)
+		.map(m => ({ ...m, majorityPowerPin: majorityPin, majorityCount, totalMatched: matched.length }));
 }
 
 type Seg = [number, number, number, number];
@@ -3022,6 +3102,9 @@ const schematicCheck: Handler = async (payload) => {
 	let geomNetMismatches = 0;
 	// All component pins, kept for the wire-over-pin rule below.
 	const allPins: Array<{ designator: string; number: string; x: number; y: number }> = [];
+	// #183 phase 1: two-pin capacitor candidates for the polarity-convention rule
+	// (collected during the loop below; analyzed right after it — pure fn).
+	const polarityCandidates: Array<PolarityCapCandidate> = [];
 
 	for (const c of components ?? []) {
 		// Net flags/ports/labels are components too but have no real pins to float
@@ -3032,6 +3115,20 @@ const schematicCheck: Handler = async (payload) => {
 		catch { continue; }
 		if (!pins || pins.length === 0) continue;
 		const designator = c.getState_Designator?.() ?? '';
+
+		// #183 phase 1: candidate collection — capacitor-designated (C+digits; the
+		// digit keeps CN power terminals / CR diodes out of the cap vote — their
+		// rail-pin numbering follows no cap convention), exactly two physical pins,
+		// both with netlist nets (netlist muted ⇒ no rail facts, skip).
+		if (/^c\d/i.test(designator) && pins.length === 2 && netlistAvailable) {
+			const pinNets = pins.map(p => ({
+				number: String(p.getState_PinNumber?.() ?? ''),
+				net: netlistPinNets.get(designator)?.get(String(p.getState_PinNumber?.() ?? '')) ?? '',
+			}));
+			if (pinNets.every(pn => pn.number !== '' && pn.net !== '')) {
+				polarityCandidates.push({ designator, primitiveId, pins: pinNets });
+			}
+		}
 
 		// Rule 1: floating pins (geometric connectivity).
 		const floating: Array<string> = [];
@@ -3093,6 +3190,39 @@ const schematicCheck: Handler = async (payload) => {
 				pinDetails: floatingDetails,
 				count: floating.length,
 				message: `${floating.length} 个引脚悬空(无导线连接,未打 NC 标识)`,
+			});
+		}
+	}
+
+	// Rule 1.5: polarity-convention-outlier (#183 phase 1) — same-page same-class
+	// rail-pin consistency. A tantalum cap wired positive-to-GND once passed this
+	// check silently (issue #183): DRC cannot see polarity and static measurements
+	// look fine until thermal runaway. Peers wired {rail pin, GND pin} that agree
+	// on the rail-side pin number form a convention; a contradicting part is the
+	// 8:1 signal the issue describes. WARN-only by design — MLCC numbering is
+	// arbitrary, so this is a consistency hint, not a polarity assertion; the
+	// ERROR-level rule needs footprint/symbol evidence (issue #183 phase 2).
+	// Known v1 scope limit: `--all-pages` pools candidates across pages into ONE
+	// convention instead of per-page stats (the connector loop is page-agnostic);
+	// default single-page runs — the gate path — are unaffected.
+	let polarityConventionOutliers = 0;
+	{
+		const outliers = detectPolarityConventionOutliers(polarityCandidates);
+		polarityConventionOutliers = outliers.length;
+		// --all-pages pools candidates across pages into ONE convention (scope limit
+		// above) — say so in the finding instead of letting the reader assume
+		// per-page stats.
+		const poolingNote = allPages ? ';注意 --all-pages 下统计为跨页池化而非逐页约定' : '';
+		for (const o of outliers) {
+			findings.push({
+				type: 'polarity-convention-outlier',
+				level: 'warn',
+				designator: o.designator,
+				primitiveId: o.primitiveId,
+				pins: [o.powerPin, o.gndPin],
+				nets: [o.powerNet, o.gndNet],
+				count: o.majorityCount, // rule-specific slot: majority vote count (see CheckFinding.count)
+				message: `极性脚约定与同页多数不一致:该电容电源侧接在 pin ${o.powerPin}(${o.gndNet} 侧为 pin ${o.gndPin}),同页 ${o.totalMatched} 颗同类中 ${o.majorityCount} 颗电源侧为 pin ${o.majorityPowerPin} —— 钽/电解电容反接有热失控风险务必核对;MLCC 无极性可忽略 (#183)${poolingNote}`,
 			});
 		}
 	}
@@ -3264,6 +3394,7 @@ const schematicCheck: Handler = async (payload) => {
 		wireOverPins: overPinTotal,
 		zeroLengthWires,
 		danglingWires,
+		polarityConventionOutliers,
 		total: findings.length,
 	};
 	return { result: { passed: findings.length === 0, summary, findings } };

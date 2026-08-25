@@ -13,7 +13,10 @@ import { test } from 'node:test';
 
 import {
 	connectPinEndpoint,
+	detectPolarityConventionOutliers,
 	getComponentOrThrow,
+	isGroundLikeNet,
+	isPowerRailNet,
 	normalizeDeviceRef,
 	runAction,
 	schematicComponentsList,
@@ -1695,6 +1698,146 @@ test('pcb lock: already-in-state components are idempotent success, not rewrites
 		assert.deepEqual(res.result.alreadyInState, ['a']);
 		assert.deepEqual(res.result.applied, []);
 		assert.equal(res.result.verified, true);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+// ─── #183 phase 1: polarity-convention-outlier ─────────────────────────────
+
+function polarityCap(designator: string, pin1Net: string, pin2Net: string) {
+	return {
+		designator,
+		primitiveId: `prim-${designator}`,
+		pins: [
+			{ number: '1', net: pin1Net },
+			{ number: '2', net: pin2Net },
+		],
+	};
+}
+
+test('polarity classifiers: GND family vs power rails vs unclassified signals', () => {
+	for (const n of ['GND', 'gnd', 'AGND', 'DGND', 'PGND', 'VSS', 'Earth_1', 'GROUND']) {
+		assert.ok(isGroundLikeNet(n), `${n} should classify as ground`);
+		assert.ok(!isPowerRailNet(n), `${n} should not classify as a power rail`);
+	}
+	for (const n of ['+5V', '3V3', '12V0', 'VCC', 'VDD', 'VBUS', 'VBAT_RAW', 'VSYS_5V', 'vcc']) {
+		assert.ok(isPowerRailNet(n), `${n} should classify as a power rail`);
+		assert.ok(!isGroundLikeNet(n), `${n} should not classify as ground`);
+	}
+	for (const n of ['SW1_NODE', 'EN', 'TXD', 'USB_DP', 'SCL', 'VEN', '']) {
+		assert.ok(!isGroundLikeNet(n) && !isPowerRailNet(n), `${JSON.stringify(n)} must stay unclassified`);
+	}
+});
+
+test('polarity: 8:1 page flags exactly the single reversed cap (#183)', () => {
+	const cands = [];
+	for (let i = 1; i <= 8; i++) cands.push(polarityCap(`C${i}`, '+3V3', 'GND'));
+	cands.push(polarityCap('C9', 'GND', '+3V3')); // the reversed tantalum from the incident
+	const out = detectPolarityConventionOutliers(cands);
+	assert.equal(out.length, 1);
+	assert.equal(out[0].designator, 'C9');
+	assert.equal(out[0].powerPin, '2');
+	assert.equal(out[0].gndPin, '1');
+	assert.equal(out[0].powerNet, '+3V3');
+	assert.equal(out[0].gndNet, 'GND');
+	assert.equal(out[0].majorityPowerPin, '1');
+	assert.equal(out[0].majorityCount, 8);
+	assert.equal(out[0].totalMatched, 9);
+});
+
+test('polarity: unanimous page stays silent', () => {
+	const cands = [];
+	for (let i = 1; i <= 5; i++) cands.push(polarityCap(`C${i}`, '+3V3', 'GND'));
+	assert.deepEqual(detectPolarityConventionOutliers(cands), []);
+});
+
+test('polarity: below minimum group stays silent (no convention to violate)', () => {
+	const out = detectPolarityConventionOutliers([
+		polarityCap('C1', '+3V3', 'GND'),
+		polarityCap('C2', 'GND', '+3V3'),
+	]);
+	assert.deepEqual(out, []);
+});
+
+test('polarity: tie stays silent', () => {
+	const out = detectPolarityConventionOutliers([
+		polarityCap('C1', '+3V3', 'GND'),
+		polarityCap('C2', '+3V3', 'GND'),
+		polarityCap('C3', 'GND', '+3V3'),
+		polarityCap('C4', 'GND', '+3V3'),
+	]);
+	assert.deepEqual(out, []);
+});
+
+test('polarity: weak majority stays silent (--strict promotes WARNs — no coin flips)', () => {
+	const cands = [
+		polarityCap('C1', '+3V3', 'GND'),
+		polarityCap('C2', '+3V3', 'GND'),
+		polarityCap('C3', '+3V3', 'GND'),
+		polarityCap('C4', '+3V3', 'GND'),
+		polarityCap('C5', 'GND', '+3V3'),
+		polarityCap('C6', 'GND', '+3V3'),
+		polarityCap('C7', 'GND', '+3V3'),
+	];
+	// 4:3 — technically a majority but far under the 75% supermajority bar.
+	assert.deepEqual(detectPolarityConventionOutliers(cands), []);
+});
+
+test('polarity: series/signal caps never enter the convention statistics', () => {
+	const cands = [];
+	for (let i = 1; i <= 6; i++) cands.push(polarityCap(`C${i}`, '+3V3', 'GND'));
+	cands.push(polarityCap('C20', 'GND', '+3V3')); // would-be outlier
+	cands.push(polarityCap('C21', 'AUDIO_IN', 'BIAS')); // coupling cap — no rail meaning
+	cands.push(polarityCap('C22', 'EN', 'KEY_ROW')); // ditto
+	const out = detectPolarityConventionOutliers(cands);
+	assert.equal(out.length, 1);
+	assert.equal(out[0].designator, 'C20');
+	assert.equal(out[0].totalMatched, 7, 'coupling caps must be excluded from totalMatched');
+});
+
+test('sch check: polarity-convention-outlier fires on the #183 nine-cap page (handler wiring)', async () => {
+	const caps: Array<{ id: string; designator: string; pinNets: Array<[string, string]> }> = [];
+	for (let i = 1; i <= 8; i++) caps.push({ id: `c${i}`, designator: `C${i}`, pinNets: [['1', '+3V3'], ['2', 'GND']] });
+	caps.push({ id: 'c9', designator: 'C9', pinNets: [['1', 'GND'], ['2', '+3V3']] });
+	caps.push({ id: 'cn1', designator: 'CN1', pinNets: [['1', 'GND'], ['2', '+3V3']] }); // C+非数字:电源端子不得进电容票仓
+	(globalThis as any).eda = {
+		sch_PrimitiveComponent: {
+			getAll: async () => caps.map(c => ({
+				getState_ComponentType: () => 'component',
+				getState_PrimitiveId: () => c.id,
+				getState_Designator: () => c.designator,
+			})),
+			getAllPinsByPrimitiveId: async (pid: string) => {
+				const c = caps.find(x => x.id === pid)!;
+				return c.pinNets.map(([num], idx) => ({
+					getState_PinNumber: () => num,
+					getState_X: () => 100 * (idx + 1),
+					getState_Y: () => 100,
+				}));
+			},
+		},
+		sch_PrimitiveWire: { getAll: async () => [] },
+		sch_ManufactureData: {
+			getNetlistFile: async () => ({
+				text: async () => JSON.stringify({
+					components: Object.fromEntries(caps.map(c => [`comp-${c.id}`, {
+						props: { Designator: c.designator },
+						pinInfoMap: Object.fromEntries(c.pinNets.map(([num, net], idx) => [`p${idx}`, { number: num, net }])),
+					}])),
+				}),
+			}),
+		},
+	};
+	try {
+		const res: any = await runAction('schematic.check', {});
+		const pol = res.result.findings.filter((f: any) => f.type === 'polarity-convention-outlier');
+		assert.equal(pol.length, 1);
+		assert.equal(pol[0].designator, 'C9');
+		assert.deepEqual(pol[0].pins, ['2', '1']);
+		assert.equal(res.result.summary.polarityConventionOutliers, 1);
+		assert.equal(res.result.summary.total, 1, 'a fully-wired page must produce ONLY the polarity finding');
 	}
 	finally {
 		delete (globalThis as any).eda;
