@@ -69,6 +69,7 @@ EasyEDA tooling.
 14. **阶段门禁机械强制,不必预读细则** — 布线前、布线后各一道门,未过一律被拒(daemon 在 /action 层也拦,raw 调用绕不过)。撞上去的拒绝消息**自带下一条该跑的命令**,照做即可。切入/恢复会话:`workflow status --reconcile` → `workflow advance`。→ design-flow P6(含 force 分级 #132)/P10
 15. **原理图必须分页分区 + 每模块电路说明,默认必做**(「最小/单页」不是借口)— ①分页(页名=功能名)②`sch zones set`+`zone-draw` 画区框(**单页小板也要画**)③每模块 1~3 行 `sch note`。⚠ 手工 `block-apply`/`sch place` **不自动画框**,必须补 ②③。机械兜底:`sch check` 的 `missing-partition` + `sch gate --strict` 会挡下。→ design-flow S1–S3
 16. **「探出图纸」≠「比图纸还大」** — 前者挪一挪能解;后者(`page-too-small`)挪多少次都没用,必须换手段,且**分页是设计决策 → 停手问用户**(工具不自动分页)。别人肉重试:`--max-attempts`(默认 3)会替你停手。→ design-flow S3
+17. **S0 先于任何放置** — spec 必须在首个 `page-new` / `place` / `block-apply` 前落盘并通过 `easyeda spec validate --strict`;先画后补只能算记录,不能证明设计决策已冻结。→ design-flow S0
 
 ## ② 流程停点 + 档位默认 + 块地图速查
 
