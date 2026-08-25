@@ -4,7 +4,7 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.2.1] — 2026-08-25
 
 ### Added
 
