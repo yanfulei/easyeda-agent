@@ -49,42 +49,24 @@
 编组 → 布线 → 转 PCB → 布局 → 布线 → 铺铜 → DRC → 落盘，跑完整条 S0–S6 + P0–P10。
 任何改动（layout-lint / autosave / design-flow / 连接器）之后都重跑它。
 
+> **本节只写这个 Demo 特有的东西。** 通用规则（环境自举、铁律、阶段定义、停点、
+> 档位默认、块地图、各命令签名）**正本都在 skill 里**，这里只给指针——照抄一份必然漂移。
+> 入口：[`skills/easyeda-agent/SKILL.md`](skills/easyeda-agent/SKILL.md)
+
 ## 0. 环境（一次性）
 
 三样东西缺一不可：**CLI/daemon**、**EasyEDA 里的连接器插件**、**外部交互权限**。
+装法与验证逐字见 **`skills/easyeda-agent/SKILL.md` 顶部的安装块**（①CLI ②连接器 ③开权限），
+排障见 **`references/environment-setup.md`**（§0.5 三方版本对齐、§3 已踩过的坑）。
+
+只强调最容易翻车的一条：**sideload 的 `.eext` 同 uuid 更新必须先卸载旧的**，
+且导入后要**完全退出重启 EasyEDA**——否则已开窗口还在跑旧代码并抢 daemon 的 socket。
 
 ```bash
-# ① CLI + daemon（已装过就 easyeda update）
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
-
-# ② 启动 daemon（自动占 60832–60841 里的第一个空端口）
-easyeda daemon start
+easyeda health        # windows[] 里有带 connectorVersion 的记录 = 装好了
 ```
 
-**③ 连接器插件**（在 EasyEDA Pro 里装，二选一）：
-
-- 立创EDA官方插件市场（一键装、平台可原地自动更新，但版本可能滞后 CLI）：
-  https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector
-- GitHub Release 直下（与 CLI **严格同版**，回归测试以它为准）：
-  https://github.com/zhoushoujianwork/easyeda-agent/releases/latest
-  下载 `easyeda-agent-connector.eext` → EasyEDA 扩展管理导入。
-  ⚠ 同 uuid 更新**必须先在「已安装」里卸载旧的**，否则导入静默失败；导入后**完全退出
-  并重启 EasyEDA**，否则已开窗口还在跑旧代码并抢 daemon 的 socket。
-
-**④ 开权限**：EasyEDA 里打开工程 → 启用「允许外部交互 / Allow external interaction」
-（在连接器**详情页 → 配置**标签里，不在扩展卡片上）。
-
-**验证**：
-
-```bash
-easyeda health
-```
-
-应能看到 `windows[]` 里有一条带 `connectorVersion` 的记录，且 `versionGate` 不报
-CLI/daemon/连接器落后。看到 `windows: []` 就是连接器没附上——回头查权限和重启。
-
-> 开发者另有一条免卸载/免重导入的热重载捷径（WS 灌 IndexedDB），见
-> `docs/dev-environment.md` §5。跑 Demo 不需要。
+看到 `windows: []` 就是连接器没附上，回头查权限和重启，**别往下跑**。
 
 ## 1. 准备工程
 
@@ -136,6 +118,10 @@ CLI/daemon/连接器落后。看到 `windows: []` 就是连接器没附上——
 | P2 · 接口边序 | ESP32-S3-WROOM-1 的 PCB 天线必须独占一条边且全层禁铜，剩下三边怎么分 USB-C / 5V 端子 / 按键与 LED |
 | P7 · 布线档 | 稠密板要不要停手让你在 EasyEDA 菜单里点原生自动布线 |
 
+「哪些停点必停、哪些坑永远不问用户」的完整口径在 **`SKILL.md` ②「流程停点 + 档位默认」**；
+每个决策项的选项 / 已知坑 / 推荐方案在 **`references/design-decisions.md`**。
+表里这几行只是「这块板会撞到哪几个」的索引。
+
 ## 5. 验收（需求条条落实）
 
 跑完对着原始需求逐条核，**只看数据不看截图**：
@@ -174,11 +160,13 @@ S0 阶段就该定一张唯一网名表，之后每次落块显式 `--bind` 到�
   UART 收发对接 + USB-C 双侧 CC，**十来处交叉是拓扑性的、挪件消不掉**，要靠 4 层板换层在
   布线期解决。挪到收敛后仍超标时，可显式降级
   （`--max-crossings 16 --min-score 40`）——但**必须写进交付摘要**，别偷偷放行。
-- **PCB 改完必须 `doc reload` 再读**：不 reload 就读，daemon 直接拒（`STALE_READ`）。
-- **`sch clear` / 删器件之后跑 `bridge-check`**：`sch check` 不管 orphan-tree，
-  漏掉的孤岛导线可能正是一条 VBUS↔GND 短路。用 `sch gate` 一次跑四关，别单跑。
+这几条**都是这块板/这个平台版本特有的**。属于通用纪律的那些不在这里重复，正本在
+`SKILL.md`：PCB 改完必须 `doc reload` 再读 = **铁律 5**（机械强制，不 reload 就读会被拒）；
+判对错只看 `list/check/drc/layout-lint` 不看截图 = **铁律 6**；天线 keepout 必须覆盖每一层
+= **铁律 10**；门禁机械强制、拒绝消息自带下一步 = **铁律 14**；
+「逐页 `sch gate` 一次跑四关，别单跑 `sch check`」= **②流程停点表的第 ② 个停点**。
 
-完整的问题台账见 `docs/e2e-round-2026-08-25-findings.md`。
+完整的问题台账见 [`docs/e2e-round-2026-08-25-findings.md`](docs/e2e-round-2026-08-25-findings.md)。
 
 ## 7. 收尾
 
@@ -196,3 +184,40 @@ easyeda audit cost --day <YYYY-MM-DD> --since HH:MM --until HH:MM \
   --label "esp32Mini E2E" --tokens <N> --record
 easyeda audit cost --ledger           # 跨批次对比
 ```
+
+## 8. 把路上撞到的问题反馈回仓库（跑完再统一提）
+
+「一轮只记录不修」的另一半是**记完要有人收**。跑的过程中**只记账**，
+跑完了在这一步统一整理、提 issue。
+
+**三条纪律**（与块库反馈同一套，正本见
+[`references/standard-blocks-contributing.md` §七](skills/easyeda-agent/references/standard-blocks-contributing.md)）：
+
+1. **不自动上报**。没有遥测、不回传任何东西。issue 一律由人（或 agent 起草后由人确认）提交。
+2. **上报是外发动作 —— agent 永远先给用户看草稿**，`gh issue create` 之前必须经用户点头。
+3. **带证据才提得动**。空口「不好用」没法修：贴命令原文、完整回执（含 `error.code` /
+  `detail`）、`sch read` / `bridge-check` / `layout-lint` 的相关摘录，以及
+  `easyeda health` 里的 CLI / daemon / connector / EasyEDA 四个版本号。
+
+**提到哪儿**（仓库已有的模板在 `.github/ISSUE_TEMPLATE/`）：
+
+| 撞到什么 | 用哪个 | label |
+|---|---|---|
+| 块用出问题（引脚名与 `sch read` 实测不符 / 拓扑错 / 器件停产 / 约束错） | `block-bug` 模板 | `block-bug` |
+| 需要的块查不到（`easyeda blocks search` 三个维度都没中） | `block-gap` 模板 | `block-gap` |
+| 自己搭了一块验证过的好电路想投稿 | `block-contribution` 模板 | `block-contribution` |
+| CLI / daemon / 连接器本身的缺陷（命令报错、写了不回滚、报文指错方向、门禁判据不一致…） | 开普通 issue | `bug` |
+
+普通 bug 的标题建议写成「**现象 + 触发条件**」而不是「XX 坏了」，例如
+`sch group-move --ids 报电气自检失败却不回滚，留下悬空脚`。
+能机械复现、不需要真机 DRC 验收的，可以再打 `ready-for-agent` 交自动化处理
+（需要连着 EasyEDA 才能验收的**不要**打这个标签——见
+[`docs/e2e-round-2026-08-25-findings.md`](docs/e2e-round-2026-08-25-findings.md) 的写法示例）。
+
+```bash
+gh issue create --repo zhoushoujianwork/easyeda-agent \
+  --label bug --title "<现象 + 触发条件>" --body-file <草稿.md>
+```
+
+> 上游（嘉立创 `pro-api-sdk`）的问题另走一条路，登记在 `docs/upstream-issues.md`，
+> **不要**直接往上游开单。
