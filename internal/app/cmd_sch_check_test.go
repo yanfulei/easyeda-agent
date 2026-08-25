@@ -339,3 +339,45 @@ func TestBlockingCheckFindings_InfoNeverGates(t *testing.T) {
 		t.Fatalf("warn must stay advisory without --strict, got %d", n)
 	}
 }
+
+// #183 phase 1: the connector's polarity-convention-outlier finding survives
+// parse with its type intact, counts in the per-type summary slot, renders its
+// rule name + designator + nets, and carries the verify/ignore hint.
+func TestRenderCheck_PolarityConventionOutlier(t *testing.T) {
+	result := map[string]any{
+		"passed": false,
+		"summary": map[string]any{
+			"polarityConventionOutliers": float64(1),
+			"total":                      float64(1),
+		},
+		"findings": []any{
+			map[string]any{
+				"type":       "polarity-convention-outlier",
+				"level":      "warn",
+				"designator": "C9",
+				"pins":       []any{"2", "1"},
+				"nets":       []any{"+3V3", "GND"},
+				"count":      float64(8),
+				"message":    "极性脚约定与同页多数不一致",
+			},
+		},
+	}
+	rep, err := parseCheckReport(result)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(rep.Findings) != 1 || rep.Findings[0].Type != "polarity-convention-outlier" {
+		t.Fatalf("finding type lost in parse: %+v", rep.Findings)
+	}
+	if rep.Summary.PolarityConventionOutliers != 1 {
+		t.Errorf("summary slot not populated: %+v", rep.Summary)
+	}
+	var buf bytes.Buffer
+	renderCheckReport(rep, &buf)
+	out := buf.String()
+	for _, want := range []string{"polarity-convention-outlier", "C9", "nets=[+3V3,GND]", "polarity-convention outlier(s)", "verify the flagged caps"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
