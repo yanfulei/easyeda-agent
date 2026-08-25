@@ -6,6 +6,9 @@
 
 > 这是**编排层**,不重复规则或动作细节:
 > - 具体动作(place/wire/modify/move/align/…) → [schematic.md](./schematic.md) / [pcb.md](./pcb.md)
+>   —— 两者都是**入口**,按需再取子文件:连线 [schematic-wiring.md](./schematic-wiring.md)、
+>   摆放 [schematic-placement.md](./schematic-placement.md)、动铜 [pcb-routing.md](./pcb-routing.md)、
+>   PCB 摆放 [pcb-layout.md](./pcb-layout.md)(RFC #178 拆分)
 > - 设计规则(分区/间距/朝向/选型) → `easyeda-agent` references
 > - 本 skill 只负责**顺序、分组、门禁、自调闭环**。
 
@@ -171,7 +174,7 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
 - **归属读 S0,不重新分配**:组的 page/zone 来自方案书 spec 的 `modules[].page` / `modules[].zone`,
   这里只是把已定的分区落成具体矩形。分区/信号流向规则见 conventions 的
   `schematic-layout-conventions.md`;zone 必须落在 S1 读到的 sheet 可用区内。
-- **认领 + 画框**(动作细节见 [`schematic.md`](./schematic.md) 的 *Functional frames + text labels*):
+- **认领 + 画框**(动作细节见 [`schematic-placement.md`](./schematic-placement.md) 的 *Functional frames + text labels*):
   1. **模块归属不用手工认领** —— `sch block-apply` 落块时已按**功能子群**把件封成虚拟组
      (`flow` 的每一级 + 跟着它的 attach 去耦 / pair 并列组),`zone-plan` 直接读组:
      那是「哪几件是一个功能单元」的**单一事实来源**,不再抄第二份。
@@ -224,7 +227,7 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
   - 块的 `parts` 直接给出 `standard-parts.json` 的 role,**选型这步都省了**;引脚按功能名引用,零改号。
   - 块的 `schematic_layout` 有两种形态:**关系形态(推荐)**只声明 `flow`/`attach`/`pair`,
     **一个坐标都不写**,几何由求解器按实测引脚 + 页面碰撞 + 图纸边界算(细节见
-    [`schematic.md`](./schematic.md));**legacy 绝对偏移**仍支持但已废弃 —— 块作者写模板时
+    [`schematic-placement.md`](./schematic-placement.md));**legacy 绝对偏移**仍支持但已废弃 —— 块作者写模板时
     根本不知道实例会落在页面哪里、图纸多大,手算必踩出界/顶图签。
   - 块还带 **PCB 多维约束 map**,各 P 阶段按 `target` 匹配读:`pcb_layout` / `placement` /
     `signals` / `silk`。无命中才手接;手接并验证过的新外设按
@@ -238,7 +241,7 @@ S6 平台不暴露脏标记(只能显式 `sch save` 并确认 `saved:true`)。
   (#142,`--zone-draw=false` 关)。失败按规划快照逆序恢复并回读证明,不伪装事务。
 - **兜底引擎 `--engine official`(块和 spec 都没覆盖的散乱页)**:官方
   `sch_Document.autoLayout()` @beta。⚠ **破坏性、只在布线前用、需目标页前台、~2min、
-  没有事务回滚**。三个实测坑与 `--rewire` 安全管线见 [`schematic.md`](./schematic.md)。
+  没有事务回滚**。三个实测坑与 `--rewire` 安全管线见 [`schematic-placement.md`](./schematic-placement.md)。
 - **优先级铁律**:命中块 → `block-apply`;有 spec → `--engine template`;都没有才 `official`,
   且**成品/已连线页一律别用它**。
 - **摆完可自评质量**:`easyeda sch layout-score` 给布局可读性打五维分(标签折叠/标签反向/外围贴核心/长链挤压/版面整洁),低分维的归因**自带填好真实位号坐标的 fix 命令,照抄执行即可修**;它是诊断视角不是门(无 `--min-score` 永远 exit 0),门仍是下面的 layout-lint + check。

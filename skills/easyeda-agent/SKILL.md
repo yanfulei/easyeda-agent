@@ -62,7 +62,7 @@ EasyEDA tooling.
 7. **每过一个阶段门显式 `save`(sch/PCB)** — place/wire/modify 只改内存,autosave 只兜底;整板每 ~10 件 save 一次。→ design-flow S 段 💾
 8. **手工连任何已知外围前先查块库 `easyeda blocks`**(离线,无需 daemon/窗口)— `blocks ls` 看全量,照抄验证过的块只重绑端口。**查不到 → 起草 `block-gap` issue;块用出问题(脚名不符/拓扑错/停产)→ 起草 `block-bug` issue 带证据 —— 都必须经用户确认后才 `gh issue create`,绝不自动上报**。→ ② 块地图速查 · standard-blocks-contributing.md §七
 9. **netflag 必须经真 wire 连、离 pin 非零距** — 重叠坐标 EasyEDA 不认作连接;禁零长 wire;多脚同名 pin 要全连(如多 GND、AMS1117 双 VOUT)。→ schematic.md
-10. **RF/天线 keepout 覆盖每一层** — top+bottom no-copper + 内层 no-inner-electrical;top-only 会被底层 pour 灌到失谐。→ pcb.md
+10. **RF/天线 keepout 覆盖每一层** — top+bottom no-copper + 内层 no-inner-electrical;top-only 会被底层 pour 灌到失谐。→ pcb-routing.md「Keep-out / rule regions」
 11. **丝印每个标记落在器件本体/courtyard 之外、装配后不被遮** — 端子塑料罩/卡座壳/按键帽会盖住 footprint 内的丝印 = 等于没标。→ design-flow P9
 12. **禁用 `eda.sch_Netlist.getNetlist()`**(已废弃、悬空脚挂死)— 网表走 `sch read/check/netlist/export`;raw 路径不得已才 `getNetlistFile()` 读 `File.text()`。→ schematic.md / actions.md
 13. **电气 clearance ≠ 手焊可达性** — P2 先持久化装配档案:`pcb stage set-assembly --profile hand-solder`(默认/下限40mil;大焊盘烙铁通道60mil);`layout-lint --gate` 有任何 tight pair 即失败,任何器件四面被围、无一侧 ≥60mil 烙铁通道(no-access)也失败;未过门不得确认布局。→ design-flow P2/P6 · issue #99
@@ -156,15 +156,20 @@ EasyEDA tooling.
   web 编辑器(`pro.lceda.cn`)+ chrome-devtools MCP 时
   agent 可自举全环境;**桌面客户端 chrome-devtools 够不到窗口,需用户手动开/切工程**(连接器照常附着,typed action 一样)。
 - **整板 / 从零 / >~10 件,或走到某阶段拿不准**:先读 `references/design-flow.md`(流程脊柱 S0–S6 / P0–P10,顶部有阶段 TOC)。含 S0 事前摸底子步 `references/design-pre-analysis.md`(轻量摸底,可选、非门禁)。**S0 方案书 spec 写完必跑 `easyeda spec validate`(无 ERROR 才算过门,`--strict` 交付前用)**——字段形状(含 `flow`/`modules[].kind`/`interfaces[].ref·edge·facing·internal`)在 design-flow S0。
-- **布线阶段(P7)选档 / 关键网先行 / 自动布线对话框清单**:读 `references/design-flow.md` **P7 三档阶梯**——别停在 `pcb.md` 的命令手册(那里只给命令,布线档默认在 design-flow)。
+- **布线阶段(P7)选档 / 关键网先行 / 自动布线对话框清单**:读 `references/design-flow.md` **P7 三档阶梯**——别停在 `pcb-routing.md` 的命令手册(那里只给命令,布线档默认在 design-flow)。
 - 架构权衡坑(真选择,非唯一答案——叠层、地策略、接口取向、成本档、单/双面、焊接工艺):读
   `references/design-decisions.md`;S0 从中产出方案书让用户确认。(RF/天线 keepout 是 guardrail 铁律 10,不进这张决策表。)
-- **Schematic work**:读 `references/schematic.md`。
+- **Schematic work**:先读 `references/schematic.md`(入口:器件放置 / Actions 目录 / 电气铁律 /
+  guardrails)。**按需再读**——不要一次全拉:连线细则 → `references/schematic-wiring.md`;
+  摆放命令(三层布局体系 / autolayout / autoplace-free)→ `references/schematic-placement.md`。
 - **混乱/已连线原理图整理、多页高质量布局、功能框和文字标注**:同时读
   `references/design-flow.md` 的 S1–S6、`references/auto-layout-sop.md` 的
-  “已连线页安全整理”，以及 `references/schematic.md` 的 “Functional frames +
+  “已连线页安全整理”，以及 `references/schematic-placement.md` 的 “Functional frames +
   text labels”。先保存 pin→net/NC 黄金表，任何布局重构后必须逐页对账。
-- **PCB work**:读 `references/pcb.md`(顶部有「块的 PCB 约束(先查)」+ 命令目录)。
+- **PCB work**:先读 `references/pcb.md`(入口:「块的 PCB 约束(先查)」+ 坐标系 + Workflow +
+  `doc reload` 门 + guardrails + 命令目录)。**按需再读**——不要一次全拉:动铜(布线 / 过孔 /
+  铺铜 / 禁布区 / 填充区域)→ `references/pcb-routing.md`;摆放(sch→PCB 同步 / 器件 CRUD /
+  align·distribute·grid-snap / 板框 / 自动布局)→ `references/pcb-layout.md`。
 - 查任一 typed action 签名、或 >5 步批量操作要用 playbook(`easyeda apply`):读 `references/actions.md`。
 - **DRC / 制造规则地板与 fallback**:读 `references/fab-rules-jlcpcb.json`(live `pcb.drc.rules` 优先,此表作 fallback seed + clamp floors,**永不发出低于 manufacturingMin 的 track/via/gap**)。
 - **PCB 设计规范手册(人读正本)**:`references/pcb-design-rules.md`——线宽阶梯/过孔/布局/走线/铺铜/Mark点/拼板/丝印/叠层/DRC 三级清单;`pcb check` 报错信息里的 `[规范 §N]` 即指此手册章节,照章修。

@@ -208,7 +208,7 @@ extensionUuid 在 `extension/extension.json`。IndexedDB 结构非官方稳定 A
   `easyeda pcb pour-rebuild` 重灌后复测即恢复(ceshi 实测 11→1)。
   via-hop / via-delete / track-delete / fill delete 之后,若 DRC 报同网断连,
   先 pour-rebuild 再判断。
-- **后台窗口 DRC 永不完成**:见 `pcb.md` DRC 条目——切前台单发,daemon 已防
+- **后台窗口 DRC 永不完成**:见 `pcb.md` DRC 条目(入口)——切前台单发,daemon 已防
   重入(`ACTION_BUSY`)。
 - **判连接器健不健康,看 `easyeda health` 的 `writeHealth`——但要按新口径读**
   (2026-08-19 修订)。它统计的是**写的效果**,不是调用的返回码:

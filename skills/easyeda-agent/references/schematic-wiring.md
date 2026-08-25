@@ -1,0 +1,137 @@
+# EasyEDA Schematic — 连线(pin-aware autoconnect)
+
+> 从 [`schematic.md`](schematic.md) 拆出(RFC #178)。入口、器件放置、Actions 目录、电气铁律仍在
+`schematic.md` —— **先读它**,再按需读本文件。
+
+---
+
+## Pin-aware autoconnect — let the planner pick direction/offset
+
+`connect_pin` (`sch connect`) keeps the connection **safe** (pin → short wire →
+flag/netport, never a netflag on a bare pin), but it still makes YOU pick
+`--direction` and `--offset`, so layout quality depends on judgment. **`sch
+autoconnect` removes that judgment**: it pulls the real geometry (part bboxes,
+pin coords, existing flag/port/label bboxes, title-block keep-out), scores every
+`up/down/left/right × offset` candidate with a deterministic cost function
+(flag-collision / through-part penalties, shortest-offset + outward-side +
+kind-default bonuses), picks the lowest-cost one, and delegates the mutation to
+`connect_pin`. Same schematic state + spec → same selection (deterministic).
+
+**批次内互斥 (issue #138):** 同一批(--spec / 多 --pin)里**已规划的短桩会当作
+既存导线注册回 scene**,后续连接对它做同样的异网硬拒——同器件相邻异网引脚
+(隔离 DC-DC 的 B0512S 类四域脚)不再出现短桩共线相触被 EasyEDA 合并成隐性
+短路;规划器会自动换方向/offset 错开,四向全堵时按 #64 语义响亮报
+"no safe candidate" 拒绝落笔。多域脚器件仍建议 power 上/gnd 下方向分治,给
+规划器留出错开空间。**标签 stagger 用真实 marker bbox 预测(#148 Phase-2):**
+预测框按 family + direction 使用活体 `getPrimitivesBBox` 标定值,并相对连接端点朝
+body 所在一侧偏移,不再用旧的端点居中 24×11 框:ground 为 10×21/21×10、
+power 为 6×11/11×6;**netport 的长度跟网名走**(`6*len(net)+8`,下限 31)——
+写死 31 会让任何长于 3 字符的网名少算,评分器于是算出「刚好不撞」而渲染出来擦在
+一起。**预测框 = 符号本体 ∪ 文字带**:`sch check` 的 marker-overlap 判的就是合并
+后的框(power/ground 的网名画在符号旁,长 `6*len(net)`、高 12),判定与生成必须
+同一把尺,否则评分器挑的「干净」位置在 check 眼里照样重叠。故
+**10-unit pitch 平行脚上相邻 marker 会触发 stagger,自动挑不同 offset 错开**;
+候选打分与同批后续连接注册回 scene 使用同一预测函数。
+
+**密集区会拉长桩线超出 `--offset-max`。** 常规档位里一个「既可选(未被 #64 硬
+拒绝)又不撞 marker」的候选都没有时,规划器把候选范围扩到 **3×offsetMax** 继续
+找干净位置 —— 人工画法本就如此(同侧密集旗阶梯 offset 错列)。所以看到某根桩线
+明显比同页其他的长,那是**让开标签**的结果,不是失控;扩展候选照样过全部判据,
+#64 短路保护不会被绕过。真机 ceshi 单块回归:markerOverlaps 12 → 3。
+残留不可避免的密集重叠由 `sch check` 的 marker-overlap 门捕获(见 Actions)。
+
+**Hard rejects (issue #64):** two hazards are never soft penalties — they make a
+candidate *unusable* no matter the offset, because EasyEDA would silently merge
+nets and the post-hoc DRC can't see it: (1) a stub whose endpoint or path touches
+an existing **foreign-net wire** (endpoint-on-wire = junction = net merge), and
+(2) a stub **crossing a non-target pin** (EasyEDA trims+connects there, and the
+wire-over-pin rule exempts pin endpoints). autoconnect now pulls existing wire
+geometry into the scene automatically; a wire already on the target net is fine
+(that's the connection point). **Title-block intrusion is now a THIRD hard reject
+(#147)**: a label landing in the A4 图签 keep-out steers to a safe direction, or —
+when every candidate enters it — fails rather than dropping a netport on the
+明细表 (which layout-lint, part-only, and the geometry-blind electrical check both
+miss). If EVERY direction/offset is a
+hard reject, autoconnect refuses to place the stub and reports the connection as
+failed — resolve the layout (move the part / clear the wire / free the title-block
+corner) and retry. **Create-after backstop (#147 DoD2):** the plan hard-rejects a
+title-block hit using a NOMINAL box, but a marker whose real rendered width (net-name
+text) still spills into the 图签 is caught by a post-batch real-bbox re-read — the
+intruding wire+marker is DELETED and that pin failed, so the command never returns
+success with a marker on the title block. **Partial-run bookkeeping (#146):** a batch interrupted mid-way
+returns `partial:true` + `succeeded[]`/`failed[]` pin lists — **retry ONLY the
+failed pins, never replay the whole spec** (a blind re-run stacks duplicate markers
+on the already-connected pins, which `NetKnown=false` after a connector drop can't
+detect). **Always run `sch check` right after a batch autoconnect** — its new
+`duplicate-net-marker` rule is the guard that catches those stacked markers.
+
+**带痕候选不再静默入选。** 硬拒之外的碰撞惩罚是软性累加,此前选中候选哪怕
+score 上千(真机:score=1737 的长桩扎进邻组标签区)也照连且报告只显示落选项。
+现在**选中候选** score 超过软阈值或 reasons 里含碰撞类惩罚时,结果行会带
+`⚠ WARN`(默认档照连);**`--strict`** 则把这类连接直接判失败、不落地。
+看到 WARN 的处方是**挪件腾位后重连**,不是忽略它。
+
+**平台会随机吞掉一个连接(stuck-at-99%),autoconnect 现在自己救一次。** 实测 2821 次
+connect_pin 里 57 次失败,其中 23 次是 netflag 卡在「请求被丢掉但平台不报错」——
+它是随机的,同一脚重发通常就成。所以失败后**重试一次,但只在连接器明确声明回滚
+之后**(netflag 失败时它会先删掉已建的桩线);`connector did not respond` 这类
+**状态未知**的失败绝不重试 —— 那可能只是我们没等到回应而对方已经建好了,重试会得到
+第二条桩线和第二面旗。被救回来的连接在报告里标 `retried`,**别忽略这个字段**:
+它是平台在变差还是变好的唯一现场证据。
+
+另外 connect_pin 用的是 **35s 专用预算**而非默认 20s(**裸 `sch connect` 也
+已对齐**,此前它还吃 20s 默认值,慢速成功被报成失败):连接器内部最坏路径
+(wire 7s + 重试 0.25s + wire 重试 7s + netflag 7s = 21.25s)本来就超过 20s,
+默认预算会让 daemon 先于连接器放弃 —— 报「connector did not respond」而对方其实
+已经把线和旗建完了(实测 57 次失败里 17 次是这么来的)。**`sch connect` 现在对
+超时/DISPATCH_FAILED 自动做一次轻读复核**:回读确认 pin 已在目标网,就按
+`slowLanded` 成功返回并在 stderr 警告勿重试 —— 「connector did not respond 后
+禁止盲重试」不再需要你人工执行,**按命令输出判断即可**;真失败(复核也没看到
+落地)照旧非零退出,那时仍以 `sch check` 兜底。
+
+```bash
+# single pin by designator:pin (number OR name)
+easyeda sch autoconnect --pin U1:41 --kind gnd --net GND
+easyeda sch autoconnect --pin U1:3V3 --kind power --net +3V3
+
+# 同名多脚:尾缀 * 一次连全部(连接器的冗余 VBUS/GND/屏蔽脚,#145)。
+# 光写功能名会被判歧义并拒绝——autoconnect 不该替你挑一个;* 是你说"全接"。
+# 对单脚是恒等,所以电源/地/屏蔽脚可放心加星。
+easyeda sch autoconnect --pin J1:VBUS* --kind power --net 5V   # → J1:A4B9 + J1:B4A9
+
+# explicit coordinates (compat with existing flows)
+easyeda sch autoconnect --x 720 --y 670 --kind gnd --net GND
+
+# preview the plan + rejected options WITHOUT mutating
+easyeda sch autoconnect --pin U1:41 --kind gnd --net GND --dry-run --json
+
+# batch spec — clustered pins auto-stagger so labels don't stack
+easyeda sch autoconnect --spec p1-connect.json
+
+# re-run the SAME spec safely — pins already on the target net are skipped
+easyeda sch autoconnect --spec p1-connect.json          # idempotent, no growth
+
+# re-route pins currently on the WRONG net (delete old flag+wire, reconnect)
+easyeda sch autoconnect --spec p1-connect.json --replace
+```
+
+**Idempotent (issue #50):** before connecting, autoconnect reads each pin's
+current net (via `sch list --include-pins`, which now carries `net`) and classifies
+every connection into three states — `new` (floating → connect), `already-connected`
+(already on the target net → **skip**, no duplicate flag+wire), and `conflict` (on a
+different net). A conflict is an error by default; pass `--replace` to delete the old
+flag+wire (deleted **together**, so no orphan stub — see issue #51) and reconnect.
+Re-running the same spec is therefore safe and never stacks duplicates. `--dry-run`
+reports the three states without mutating.
+
+Spec JSON (`--spec`): `{"connections":[{"pin":"U1:41","kind":"gnd","net":"GND"},
+{"pin":"U1:3V3","kind":"power","net":"+3V3"}], "rules":{"avoidTitleBlock":true,
+"avoidPinFanout":true,"staggerLabels":true,"offsetRange":[18,80],"offsetStep":6,
+"minLabelGap":12}}`. Each result reports the `selected` candidate (direction /
+offset / endPoint / score), the `rejected` alternatives with reasons, and the
+`wirePrimitiveId` / `flagPrimitiveId`. The title-block keep-out comes from the
+shared `sch sheet-geometry` derivation (issue #26) — when the sheet bbox isn't
+exposed it is reported as **provisional** and not geometrically enforced (so a
+guessed box can't corrupt scoring). **Prefer `sch autoconnect`
+over hand-picking `sch connect --direction/--offset`** for power/ground/netport
+stubs; `sch connect` stays for when you deliberately override the geometry.
