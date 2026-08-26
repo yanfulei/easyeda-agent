@@ -138,9 +138,13 @@ dry-run 阶段即可复现，不需要落地。三个问题：主件出框、spe
 
 ## P1 级（判据失灵 / 拦不住也放不开）
 
-### #5 `sch group-move --ids` 首次移动漏检 + 自检失败不回滚
+### #5 `sch group-move --ids`：读不到网表就静默放行
 
-同一条命令的两个方向都有问题：
+> **归因已订正（2026-08-27）**：原写「自检失败不回滚」。查证后**那不是缺陷**——
+> 移动已经发生，如实报告而非回滚正是设计意图（#151 部分应用约定），代码注释里写着。
+> 真问题只有 A 这一条。
+
+
 
 **A. 漏检**：`--ids` 移动 R1/C5/R2 时旗线不跟随（`movedFlags: []` / `movedWires: []`），
 造成 **6 个 orphan-tree**，但命令没报任何警告。更麻烦的是
@@ -158,11 +162,24 @@ dry-run 阶段即可复现，不需要落地。三个问题：主件出框、spe
 `ok: false`，但**画布已经改了**：件移走、旗线留在原地成孤儿。与 issue #151
 「部分应用约定」（画布已变就该报 `ok + notApplied`，不该报失败）自相矛盾。
 
-**修法建议**：`--ids` 路径统一做移动前后网表快照对比；失败即回滚，或按 #151 报 partial。
+**真因**（真机复现确认）：网表自检本身有效（单件移动能抓到），漏检走的是另一条路——
+
+```go
+before, _, berr := readLiveNets(cfg, window)
+if berr != nil { ...stderr warning... }
+...
+if berr != nil { return nil }   // ← 读不到网表 → 移动照做 → 自检整个跳过，退出码 0
+```
+
+连接器负载高时 `readLiveNets` 很容易失败，于是静默断网被当成功放过去。
+
+**已修**（commit `4b90f6b`）：明确报「平移已执行但电气自检没跑成」+ 非零退出 +
+给出 bridge-check / autoconnect / 改用 `--group` 三条下一步。口径同 gate 的 blocked ≠ pass。
+`group list` 的同类问题（在场校验读不到时 note 只在 stderr）一并修。
 
 ---
 
-### #6 `zone-arrange` 规划器自撞 R5 硬不变式，且不给出路
+### #6 `zone-arrange` 的 R5 判死了让位器管不到的重叠（两把尺）
 
 **现象**：POWER 页反复输出同一行，整页停手：
 
@@ -176,6 +193,20 @@ J2 是 KF301 两脚端子（两脚竖排）。三个子问题：
    它却重新规划成两旗同向 left，然后撞自己的 R5；
 2. **不给可执行的下一步**——只有这一行，没有「该跑什么命令」；
 3. **`--json` 在这条错误路径上不输出 JSON**，仍是这行纯文本。
+
+**真因**（靠新加的 phase A 诊断一眼看出来的）：**两把尺，两处**——
+
+- 判据函数不一致：`zfCheckTermOverlap` 用裸 `boxesOverlap`「碰到就算」，而让位循环用
+  `zfMarkerCollides`（+ 噪声地板）。`0 < 重叠 ≤ 1.0` 这条缝里，让位器认为让好了、检查器判死。
+- 比较的**集合**不一致（真凶）：侧面的 `netport` 按首版规则**不参与让位**（拉进来会把区框
+  撑爆），所以也不进 `placedBySide`；同侧的 `netflag` 于是以为左边没人、用默认桩长放下，
+  正好压在 port 标签上。而 R5 检查**所有**端子。J2 恰好是 `VIN_EXT=netport` +
+  `GND=netflag` 两脚同在左缘。
+
+**已修**（commit `b220cf3`）：把「参不参与让位」提成唯一谓词 `zfTermYields`，让位循环与 R5
+共问同一个函数；R5 只在双方都参与让位时才判。真正的自短路（同向且共线）由
+`zfCheckPassiveOpposed` 单独把关，负对照测试钉住。三个子问题（判死、不给出路、`--json`
+不出 JSON）一并解决。真机：当初卡死 4 轮的 POWER 页现在 **verdict=pass**。
 
 ---
 
@@ -196,7 +227,16 @@ WARN orphan-flag ORPHAN_FLAG nets=[__ROTPROBE__]  flags: 2693f1f2f947e107
 
 ---
 
-### #8 位号被平台重编后，虚拟组记账不跟随且不标 stale
+### #8 位号被平台重编后组记账不跟随 —— **误报，已撤回**
+
+> **归因已订正（2026-08-27）**：真机复现（往组里塞一个画布上不存在的位号）显示
+> stale 标记**工作正常**：`ZZ99(stale) ⚠ 1 stale (designator not found)`。
+> 当初没看到标记，最可能是那一次在场校验读失败（note 只打在 stderr，我没注意）——
+> 那条已作为 #5 的一部分修掉（stdout 也说清「本次没做在场校验」）。
+> 位号确实被重编了（ESD D1→D3，画布真值），但**工具有能力报出来**，不是缺陷。
+
+<details><summary>原始记录（保留备查）</summary>
+
 
 **现象**：手工 `sch place --designator D1` 与已落块的 ch340c ESD（当时也叫 D1）冲突，
 平台把 ESD 重编为 **D3**。画布真值：
@@ -215,7 +255,7 @@ g1  "ch340c_usb_serial(C7)/D_ESD"  1 member(s): D1
 
 ---
 
-### #9 `zone-plan` 的 `labelCollisions` 没有归因
+### #9 `zone-plan` 的 `labelCollisions` 没有归因 —— 已修（commit `99e9bdc`）
 
 同一份 validation 输出里，`partitionOverlap` 和 `titleBlockHits` 都带 `…Detail`
 （点名是哪两个区、差多少、给一条 `sch zone move` 命令），只有 `labelCollisions` 光秃秃一个计数：
@@ -225,6 +265,10 @@ g1  "ch340c_usb_serial(C7)/D_ESD"  1 member(s): D1
 ```
 
 `zone-draw` 又因为它拒绝画框。结果是「拦住了但不告诉你拦在哪」，只能靠改字号试。
+
+**已修**：逐条报出哪个区的标题带压住哪个模块、重叠多少，并给两条出路（把模块往下让
+最小让量的 `group-move --dy`，或缩小区名字号）。测试钉住「计数与归因条数必须相等」，
+防止下次再漏某一项。
 
 ---
 
