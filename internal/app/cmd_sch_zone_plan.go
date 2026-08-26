@@ -152,6 +152,11 @@ type partitionValidation struct {
 	// 最小挪动命令。
 	PartitionOverlapDetail []string `json:"partitionOverlapDetail,omitempty"`
 	TitleBlockDetail       []string `json:"titleBlockDetail,omitempty"`
+	// LabelCollisionDetail 是同一条纪律的最后一块(2026-08-26):其余五项都有
+	// Detail,唯独它只报一个数。真机 MCU_CORE 卡在 labelCollisions=1 上 ——
+	// `zone-draw` 因它拒绝画框,而 `zone-plan` 说不出是**哪个区的标题压了哪个器件**,
+	// 只能靠反复改字号试。拦得住却不告诉人拦在哪,等于没拦。
+	LabelCollisionDetail []string `json:"labelCollisionDetail,omitempty"`
 }
 
 // counters 是六项计数的稳定短摘要。错误文案用它而不是 %+v:自从 validation 带上
@@ -880,9 +885,22 @@ func validatePartitionsWithJudge(plan partitionPlan, modules []partitionModule,
 	// symbol (label collision).
 	for _, p := range ps {
 		for _, m := range modules {
-			if strInSlice(p.Modules, m.Name) && boxesOverlap(p.TitleBBox, moduleCoreBBox(m)) {
-				v.LabelCollisions++
+			core := moduleCoreBBox(m)
+			if !strInSlice(p.Modules, m.Name) || !boxesOverlap(p.TitleBBox, core) {
+				continue
 			}
+			v.LabelCollisions++
+			// 逐条说清:谁的标题带压了谁、压了多少、往哪挪能让开。
+			// 标题带恒在框顶,所以出路是**把这个器件往下让**或**把框做高**——
+			// 报出所需的最小让量,调用方照抄即可。
+			ox, oy, _ := overlapExtent(p.TitleBBox, core)
+			v.LabelCollisionDetail = append(v.LabelCollisionDetail, fmt.Sprintf(
+				"区 [%s] 的区名标题带 %s 压住模块 %s 的本体 %s(重叠 %.0f×%.0f)—— "+
+					"标题带恒在框顶,出路二选一:① 把该模块往下让至少 %.0f"+
+					"(`easyeda sch group-move --group %s --dy -%.0f`,y-UP:负值向下);"+
+					"② 缩小区名字号(`sch zone-draw --font-size <更小>`)让标题带变矮",
+				strings.Join(p.Modules, "+"), bboxText(p.TitleBBox), m.Name, bboxText(core),
+				ox, oy, oy, m.Name, oy))
 		}
 	}
 	return v
@@ -1736,6 +1754,14 @@ func partitionDrawGate(plan partitionPlan) error {
 	if v.TitleBlockHits > 0 {
 		why += fmt.Sprintf("\n  ⚠ %d 个分区压到图签禁区:", v.TitleBlockHits)
 		for _, d := range v.TitleBlockDetail {
+			why += "\n    · " + d
+		}
+	}
+	if v.LabelCollisions > 0 {
+		// 同一条纪律的最后一块:过去它只贡献一个计数,zone-draw 因它拒绝画框
+		// 却说不出是哪个标题压了哪个器件 —— 只能靠反复改字号试(2026-08-26 实测)。
+		why += fmt.Sprintf("\n  ⚠ %d 处区名标题压住器件:", v.LabelCollisions)
+		for _, d := range v.LabelCollisionDetail {
 			why += "\n    · " + d
 		}
 	}
