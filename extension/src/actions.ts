@@ -620,7 +620,26 @@ export const schematicTitleBlockModify: Handler = async (payload) => {
 		);
 	}
 
-	const after = await readFocusedTitleBlock();
+	// 写后回读必须**等它落定**:平台提交明细表是异步的,写完立刻读会读到旧值。
+	//
+	// #186 复验实测:一次把 `Name` 写成 "TB-BOOL-TEST" 的调用,回执报
+	// `nothing was applied: Name`(硬失败),而三秒后再读,值就好端端在那儿 ——
+	// 也就是**成功的写被报成了失败**。这条误报的代价不小:它让「图签写不进去」
+	// 成了流程里的既定结论(design-flow 因此禁用图签写入、`gate --strict` 的
+	// missing-titleblock 变成结构性不可达),而事实并非如此。
+	//
+	// 所以这里轮询回读:一旦所有请求项都对上就立刻返回(常见路径零额外延迟),
+	// 否则短暂退避重试。仍然对不上才判 notApplied —— 那时它是真的没生效。
+	let after = await readFocusedTitleBlock();
+	for (let attempt = 0; attempt < 4 && after; attempt++) {
+		const settled = wantedKeys.every(key => titleBlockFieldApplied(after!.titleBlockData[key], wanted[key]))
+			&& (showTitleBlock === undefined || after.showTitleBlock === showTitleBlock);
+		if (settled) break;
+		await new Promise<void>(resolve => setTimeout(resolve, 250));
+		const retry = await readFocusedTitleBlock();
+		if (!retry) break;
+		after = retry;
+	}
 	if (!after) {
 		// 写调用已返回成功但回读不可用:画布可能已变,绝不降级成 ok:false
 		// (那会丢掉 autosave)。如实报 verified:false 交调用方判断(#151 同款)。

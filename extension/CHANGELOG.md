@@ -4,6 +4,27 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.7] — 2026-08-26
+
+### Fixed — 图签**其实一直能写**:是回读太早把成功报成了失败(#186)
+
+承接 1.2.6。修完损毁问题后实测「文本项写不进去」,一度以为是平台限制 —— **错了**。
+
+真机复验:把 `Name` 写成 `"TB-BOOL-TEST"` 的调用回执报
+`nothing was applied: Name`(硬失败),**三秒后再读,值好端端在那儿**;单写
+`Drawed` 同样如此。也就是说**平台提交明细表是异步的,写完立刻回读拿到的是旧值**,
+handler 把一次成功的写判成了彻底失败。
+
+这条误报的代价远超它自己:它让「图签写不进去」变成流程里的既定结论 ——
+design-flow 因此禁用图签写入、`sch gate --strict` 的 `missing-titleblock`
+被认定为结构性不可达。**实际上那条路是通的。**
+
+修法:回读改成轮询到落定(命中即返回,常见路径零额外延迟;最多 4 次 × 250ms 退避)。
+仍对不上才判 `notApplied` —— 那时它是真的没生效,不能拿等待去粉饰。
+
+两个新单测钉正反两面:慢落定的写不再被误报(且**只写一次** —— 重试的是读不是写);
+始终不生效的项轮询完仍如实报失败。
+
 ## [1.2.6] — 2026-08-26
 
 ### Fixed — 明细表写入不再损毁图框(#186,社区报告 + 真机复现)

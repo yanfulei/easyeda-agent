@@ -1998,3 +1998,59 @@ test('constraintList: nullish and empty inputs read as an empty list, never thro
 	assert.deepEqual(constraintList([]), []);
 	assert.deepEqual(constraintList({}), []);
 });
+
+// 写后回读必须等落定 —— 平台提交明细表是异步的(#186 复验)。
+//
+// 真机实测:把 Name 写成 "TB-BOOL-TEST" 的调用回执报 `nothing was applied`,
+// 三秒后再读值就在那儿。这条误报让「图签写不进去」成了流程里的既定结论,
+// 而事实是写成功了、只是读早了。
+test('titleblock: 慢落定的写不再被误报成 nothing-applied (#186)', async () => {
+	let reads = 0;
+	const calls: Array<unknown> = [];
+	(globalThis as any).eda = {
+		dmt_Schematic: {
+			getCurrentSchematicPageInfo: async () => {
+				reads += 1;
+				// 第 1 次 = 改前快照;第 2 次 = 写后立刻读(平台还没提交,仍是旧值);
+				// 第 3 次起才看到新值 —— 正是真机观察到的形态。
+				const landed = reads >= 3;
+				return {
+					uuid: 'page-1',
+					name: 'Page1',
+					showTitleBlock: true,
+					titleBlockData: { Title: { showTitle: true, showValue: true, value: landed ? 'new' : 'old' } },
+				};
+			},
+			modifySchematicPageTitleBlock: async (show: unknown, data: unknown) => {
+				calls.push({ show, data });
+				return true;
+			},
+		},
+	};
+	const res: any = await schematicTitleBlockModify({
+		titleBlockData: { Title: { showTitle: true, showValue: true, value: 'new' } },
+	});
+	assert.equal(res.result.ok, true, '慢落定不能报成失败');
+	assert.deepEqual(res.result.applied, ['Title']);
+	assert.equal(res.result.partial, undefined, '落定之后不是 partial');
+	assert.equal(calls.length, 1, '只写一次 —— 重试的是读,不是写');
+	delete (globalThis as any).eda;
+});
+
+// 反向:真的没生效时,轮询完仍要如实报 notApplied,不能把等待变成粉饰。
+test('titleblock: 始终不生效的项在轮询后仍如实报失败 (#186)', async () => {
+	installTitleBlockStub({
+		before: { Title: { value: 'old' } },
+		after: { Title: { value: 'old' } },
+	});
+	await assert.rejects(
+		() => schematicTitleBlockModify({
+			titleBlockData: { Title: { showTitle: true, showValue: true, value: 'new' } },
+		}) as any,
+		(err: any) => {
+			assert.match(err.message, /nothing was applied/);
+			return true;
+		},
+	);
+	delete (globalThis as any).eda;
+});

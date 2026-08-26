@@ -46,32 +46,15 @@ func tbPreserve(v any) any {
 	return out
 }
 
-// tbStructuralKeys 是**画布结构**开关 —— 它们不是文字栏位,而是「图框画不画」
-// 「明细表画不画」。写坏了不是显示问题,是判据失明(sheet 图元没了,越界/分区
-// 一概判不了),所以整包回传时单独按住。
-var tbStructuralKeys = []string{"Title Block", "Border"}
-
-// tbKeepStructural 把结构开关按住:值取原值(数字化),并显式给**真布尔**的
-// showTitle/showValue —— 读回来是 null,原样带回去平台按默认处理,默认就是关。
-func tbKeepStructural(full, out map[string]any) {
-	for _, k := range tbStructuralKeys {
-		v, ok := full[k].(map[string]any)
-		if !ok {
-			continue
-		}
-		kept, _ := tbPreserve(v).(map[string]any)
-		if kept == nil {
-			continue
-		}
-		if _, has := kept["value"]; !has {
-			continue
-		}
-		kept["showTitle"] = tbBoolOr(v["showTitle"], false)
-		kept["showValue"] = tbBoolOr(v["showValue"], true)
-		out[k] = kept
-	}
-}
-
+// 这里曾有 tbStructuralKeys / tbKeepStructural:整包回传时把 `Title Block`/`Border`
+// 两个结构开关按住原值,因为读回来的 "1" 被平台解析成 0 会把图框整个关掉
+// (2026-08-15 esp32Mini E2E:四页图纸静默丢失)。
+//
+// **2026-08-26 连同整包回传一起删除。** 那套保护是在给一个本就不该做的动作打补丁:
+// 整包回传才是图框损毁的成因(#186 —— `Device`/`Symbol` 的符号名被灌进 sheet 的
+// UUID 引用位)。现在只传用户点名的文本项,结构键根本不出现在 payload 里,也就
+// 不需要"按住"它们;连接器侧还有一道过滤兜底。**别再把它加回来** —— 要加回来
+// 就意味着又在整包回传了。
 // tbBoolOr 把读回来的 null / 非布尔折成一个确定的布尔。
 func tbBoolOr(v any, fallback bool) bool {
 	if b, ok := v.(bool); ok {
@@ -94,17 +77,15 @@ func schTitleBlockMerge(cfg *appConfig, window string, patch map[string]any) (ma
 	if full == nil {
 		return nil, false, fmt.Errorf("读不到当前页的明细项 —— 无法安全写入(平台传子集会崩)")
 	}
-	out := make(map[string]any, len(full)+len(patch))
-	for k, v := range full {
-		out[k] = tbPreserve(v)
-	}
-	// 结构开关(图框 / 明细表本身)在整包回传里**必须原值原样活下来**。
-	// 实测一次写图签把 `Title Block` 与 `Border` 双双变成 "0",图框和明细表被
-	// 整个关掉:sheet 图元消失 → `sheet-geometry` 读回 bbox=null → `layout-lint`
-	// 的 sheet-check 变 unavailable → `sch gate --strict` 四页全挂,而写图签的
-	// 那条命令只报了一句无关的「nothing was applied」(2026-08-15 esp32Mini E2E)。
-	// 页面看上去还在,判据却瞎了 —— 这是数据损坏,不是显示问题。
-	tbKeepStructural(full, out)
+	// **只回传用户点名要改的项** —— 不再整包回传(2026-08-26 改)。
+	//
+	// 原来这里读回全量明细项再整包下发,理由是「平台传子集会崩」。那条结论已被
+	// 平台版本淘汰:3.2.149 实测单传一个 `Drawed` 完全写得进去。而整包回传恰恰
+	// 是**图框损毁的成因** —— 社区 issue #186 复现:整包里的 `Device`/`Symbol`
+	// 的 value 是符号**名字**,被平台灌进了 sheet 的 UUID 引用位,保存后重启拒载。
+	// 连接器现在会在下发前过滤结构键(见 actions.ts 的 TITLE_BLOCK_STRUCTURAL_FIELDS),
+	// 所以这里整包回传既无必要、又会撞上那道拒绝 —— 直接做减法:传子集。
+	out := make(map[string]any, len(patch))
 	var unknown []string
 	for k, v := range patch {
 		if _, ok := full[k]; !ok {
