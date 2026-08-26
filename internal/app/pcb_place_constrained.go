@@ -687,6 +687,61 @@ func planConstrainedPlace(comps []cpComp, holes []cpHole, opt cpOptions) ([]apMo
 				shiftX += *alongCenter - (gx0+gx1)/2
 			}
 		}
+		// **沿边轴必须夹回板内**(ADR-0003 §6「每一层都要自己保证不出界」)。
+		//
+		// 上面只算了**贴边那一个轴**的 shift;沿边轴除非走 grouped 分支给了
+		// alongCenter,否则一动不动 —— 于是 `import-changes` 刚导进来、散布在
+		// 板框外的器件贴完边仍然留在板外。2026-08-26 实测:板框 2400×1700,
+		// U2(748×1030) 原始 anchor (4799,-1088) → 规划成 (1985,-1090):
+		// x 贴对了右边,y 几乎没动,整件在板外。
+		//
+		// 只夹沿边轴,**不碰贴边轴** —— 插接面器件(Type-C 等)的负边距外突是
+		// 有意的正确姿态(margin<0),夹它等于把插头挡在板外。
+		alongLo, alongHi := bx0, bx1
+		gLo, gHi := gx0+shiftX, gx1+shiftX
+		if edge.vertical() {
+			alongLo, alongHi = by0, by1
+			gLo, gHi = gy0+shiftY, gy1+shiftY
+		}
+		var fix float64
+		switch {
+		case gHi-gLo > alongHi-alongLo:
+			// 件比板这一边还长:夹不进去。居中放 —— 至少锚点落在板内,
+			// 后续 layout-lint / zone / DRC 才有个说得通的起点(硬报 off-board
+			// 是 lint 的职责,规划器的职责是不产出荒谬坐标)。
+			fix = (alongLo+alongHi)/2 - (gLo+gHi)/2
+		case gLo < alongLo:
+			fix = alongLo - gLo
+		case gHi > alongHi:
+			fix = alongHi - gHi
+		}
+		if fix != 0 {
+			if edge.vertical() {
+				shiftY += fix
+			} else {
+				shiftX += fix
+			}
+		}
+		// 贴边轴的兜底:只在**件比板这一边还厚**时居中。
+		// 这时 margin(乃至 plug-face 的负边距外突)已经没有意义 —— 贴哪边都会
+		// 探出另一边,把锚点留在板外只会让后续每一道判据从荒谬坐标起算。
+		// 正常件永远走不到这个分支,所以插接面外突的正确姿态不受影响。
+		crossLo, crossHi := by0, by1
+		cLo, cHi := gy0+shiftY, gy1+shiftY
+		if edge.vertical() {
+			crossLo, crossHi = bx0, bx1
+			cLo, cHi = gx0+shiftX, gx1+shiftX
+		}
+		if cHi-cLo > crossHi-crossLo {
+			center := (crossLo+crossHi)/2 - (cLo+cHi)/2
+			if edge.vertical() {
+				shiftX += center
+			} else {
+				shiftY += center
+			}
+			diags = append(diags, apDiag{Designator: c.designator,
+				Reason: "edge:oversized-for-board:centered(件比板这一边还大,已居中;off-board 交 layout-lint 判)"})
+		}
 		nx, ny := c.x+shiftX, c.y+shiftY
 		nr := cpRect{gx0 + shiftX - m, gy0 + shiftY - m, gx1 + shiftX + m, gy1 + shiftY + m}
 		addFixed(nr, c.layer)
