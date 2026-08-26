@@ -1166,13 +1166,19 @@ pull fresh ids before any follow-up mutation on it.`,
 				if err := dispatch(cfg, "schematic.group.move", window, payload, stdout, stderr); err != nil {
 					return err
 				}
+				// **「没能校验」不许降级成「校验通过」**(2026-08-26 实测):读不到
+				// 网表时,过去只往 stderr 打一行 warning 就 return nil —— 退出码 0、
+				// stdout 上与「自检通过」长得一模一样。连接器负载高时 readLiveNets
+				// 很容易失败,于是「搬走器件、把桩线留在原地」这种静默断网就被当成
+				// 成功放过去了(那一轮连移三件、6 个 orphan-tree,直到几步之后
+				// bridge-check 才把它翻出来)。同 gate 的 blocked ≠ pass。
 				if berr != nil {
-					return nil
+					return schMoveIDsUnverified(stdout, "移动前读不到网表", berr)
 				}
 				after, _, aerr := readLiveNets(cfg, window)
 				if aerr != nil {
-					fmt.Fprintf(stderr, "warning: 移动后读不到网表(%v)—— 电气自检未完成,请自行跑 `sch check`\n", aerr)
-					return nil
+					fmt.Fprintf(stderr, "warning: 移动后读不到网表(%v)—— 电气自检未完成\n", aerr)
+					return schMoveIDsUnverified(stdout, "移动后读不到网表", aerr)
 				}
 				if diff := groupRebuildNetDiff(groupRebuildSnapshotOf(before), groupRebuildSnapshotOf(after)); len(diff) > 0 {
 					fmt.Fprintf(stderr, "✗ 电气自检:平移改变了网表(--ids 只搬点名的图元,器件的桩线/旗不会自动跟随)\n")

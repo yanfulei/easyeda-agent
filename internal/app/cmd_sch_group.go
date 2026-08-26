@@ -1259,6 +1259,12 @@ netlist audit. reconcile needs BOTH --block-id and --roles (role→designator);
 					}
 				}
 				if !presenceKnown {
+					// **stdout 也要说**:没能校验与校验通过在列表上长得一模一样,
+					// 而两者的可信度天差地别(同 gate 的 blocked ≠ pass)。这行
+					// 过去只打在 stderr,一进管道就没了 —— 读的人会把一份未经
+					// 校验的清单当成「成员都在」。
+					fmt.Fprintln(stdout, "  ⚠ 本次未能读到画布成员表 —— 上面**没有**做在场校验,"+
+						"stale 成员不会被标出(`easyeda health` 确认连接器后重跑)")
 					fmt.Fprintln(stderr, "note: live presence check unavailable — stale members not marked")
 				}
 				return nil
