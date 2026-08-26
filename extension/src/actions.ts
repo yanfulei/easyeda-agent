@@ -510,6 +510,36 @@ async function readFocusedTitleBlock(): Promise<
  * 平台限制:官方签名无 pageUuid 参数,**只能改当前聚焦页**(titleblock.get 反而
  * 支持 pageUuid,两者不对称)。调用前请自行确认聚焦页是目标页。
  */
+/**
+ * 明细表(标题栏)里**不许写**的键 —— 图纸的结构与平台投影,不是给人填的文本。
+ *
+ * 为什么是黑名单而不是白名单:**文本项的键名由图框模板决定**,不是固定集合
+ * (实测默认 A4 用 `Name`/`Drawed`,另一些模板用 `Title`/`Designer`)。用白名单
+ * 会把自定义图框的合法字段全拒掉。反过来,下面这些结构键是 EasyEDA 图框
+ * **数据模型**的固有部分,与模板无关,可以稳定枚举。
+ *
+ * 真机字段分类(EasyEDA 3.2.x,`titleblock.get` 33 项):
+ *   - 图框身份:`Device` / `Symbol`(值是符号**名**如 "Drawing-Symbol_A4")、`ID`
+ *   - 纸张几何:`Size` / `Page Size` / `Width` / `Height` / `Blade Width` /
+ *     `Region Start` / `X Region Count` / `Y Region Count` / `Title Block Position`
+ *   - 开关:`Border` / `Title Block` / `Color`
+ *   - `@` 前缀:平台自动投影(页名/页号/工程名/创建时间…),只读,写了被丢弃
+ *
+ * 写前两类会**损毁文档**(#186 真机复现:符号名被灌进 sheet 的 component/device/
+ * symbol UUID 引用位 → EasyEDA 报「器件/符号属性有误」→ 保存后重启拒载 = 图框丢失)。
+ */
+const TITLE_BLOCK_STRUCTURAL_FIELDS: ReadonlySet<string> = new Set([
+	'Device', 'Symbol', 'ID',
+	'Size', 'Page Size', 'Width', 'Height', 'Blade Width',
+	'Region Start', 'X Region Count', 'Y Region Count', 'Title Block Position',
+	'Border', 'Title Block', 'Color',
+]);
+
+/** `@` 前缀是平台自动投影的只读项,与上表同样不许下发。 */
+function isTitleBlockStructuralKey(key: string): boolean {
+	return key.startsWith('@') || TITLE_BLOCK_STRUCTURAL_FIELDS.has(key);
+}
+
 export const schematicTitleBlockModify: Handler = async (payload) => {
 	const showTitleBlock = optionalBoolean(payload, 'showTitleBlock');
 	const titleBlockData = payload.titleBlockData;
@@ -522,12 +552,56 @@ export const schematicTitleBlockModify: Handler = async (payload) => {
 	if (showTitleBlock === undefined && titleBlockData === undefined) {
 		throw new ActionError(ErrorCodes.MISSING_PAYLOAD_FIELD, 'Pass at least one of "showTitleBlock" or "titleBlockData".');
 	}
-	const wanted = (titleBlockData ?? {}) as Record<string, TitleBlockPatch>;
-	const wantedKeys = Object.keys(wanted);
+	const requested = (titleBlockData ?? {}) as Record<string, TitleBlockPatch>;
 
 	// 改前快照:平台静默忽略不认识的明细项,「哪些 key 本来就存在」「哪些本来
 	// 就等于期望值」是区分 applied / alreadySet / unknownKeys 的唯一依据。
+	// 它同时是下面「结构键有没有被改动」判定的基准。
 	const before = await readFocusedTitleBlock();
+
+	// #186:只把**图签文本字段**下发给平台,结构/投影键一律不传。
+	//
+	// 真机复现(EasyEDA 3.2.186,社区 issue #186):调用方按最自然的用法——
+	// `titleblock.get` 拿完整 titleBlockData → 只改 `Name` → 整包传回 `modify`
+	// ——平台把 `Device`/`Symbol` 的 value(`"Drawing-Symbol_A4"`,那是**符号的
+	// 名字**)写进了 sheet 的 component/device/symbol **UUID 引用位**,
+	// `Border`/`Title Block` 从 1 变 0,EasyEDA 当场报「器件/符号属性有误」,
+	// 保存后重启即拒载 = **图框丢失**。这与 attrs 回填那次把库占位 Designator
+	// 灌进 otherProperty 是同一类事故:**读回来的投影字段不许原样写回去**。
+	//
+	// 所以这里用**白名单**(而不是黑名单):明细表里未知的新键风险不可预估,
+	// 宁可拒绝也不试写。要改纸张尺寸/边框/图框符号,那不是明细项,得走各自的
+	// 专用路径(换图框走 prim-delete --allow-sheet + place)。
+	const writableKeys = Object.keys(requested).filter(k => !isTitleBlockStructuralKey(k));
+	const structuralKeys = Object.keys(requested).filter(isTitleBlockStructuralKey);
+	// 结构键分两种:值与当前一致 = 调用方只是把 get 的结果原样带回来了(无意改动,
+	// 静默丢弃即可);值不一致 = 真的想改它,那是会损毁文档的操作,**零变异拒绝**。
+	const attemptedStructuralEdits = structuralKeys.filter(
+		k => !titleBlockFieldApplied(before?.titleBlockData?.[k], requested[k]),
+	);
+	if (attemptedStructuralEdits.length > 0) {
+		throw new ActionError(
+			ErrorCodes.PRECONDITION_REFUSED,
+			`明细表 modify 拒绝改这些非文本字段: ${attemptedStructuralEdits.join(', ')}。`
+			+ '它们是图纸结构/平台投影字段(图框符号、纸张尺寸、边框开关、@自动字段),'
+			+ '写它们会把符号名灌进图框的 UUID 引用位 → EasyEDA 报「器件/符号属性有误」,'
+			+ '保存后重启拒载 = 图框丢失(#186)。**本次一个字节都没写。**'
+			+ '明细项(图签上给人填的文本,键名随图框模板而异)照常可改。'
+			+ '换图框/改纸张请走 `sch prim-delete --allow-sheet` + `sch place` 重放图框符号。',
+		);
+	}
+	if (writableKeys.length === 0 && showTitleBlock === undefined) {
+		throw new ActionError(
+			ErrorCodes.PRECONDITION_REFUSED,
+			'没有可写的明细项:传入的 key 全是结构/投影字段(已按 #186 过滤),且未传 showTitleBlock。'
+			+ '先跑 `sch titleblock-get` 看本页有哪些明细项。本次未做任何修改。',
+		);
+	}
+	// 下发给平台的只有白名单键 —— 结构键连传都不传(传了就会被写)。
+	const wanted: Record<string, TitleBlockPatch> = {};
+	for (const k of writableKeys) wanted[k] = requested[k];
+	const wantedKeys = writableKeys;
+	const ignoredKeys = structuralKeys;
 
 	let ok;
 	try {
@@ -551,7 +625,7 @@ export const schematicTitleBlockModify: Handler = async (payload) => {
 		// 写调用已返回成功但回读不可用:画布可能已变,绝不降级成 ok:false
 		// (那会丢掉 autosave)。如实报 verified:false 交调用方判断(#151 同款)。
 		return {
-			result: { ok: true, verified: false, requestedKeys: wantedKeys },
+			result: { ok: true, verified: false, requestedKeys: wantedKeys, ...(ignoredKeys.length ? { ignoredKeys } : {}) },
 			warnings: ['明细表已下发但回读不可用,无法验证是否真的写入(verified:false)。'],
 		};
 	}
@@ -597,6 +671,7 @@ export const schematicTitleBlockModify: Handler = async (payload) => {
 				notApplied,
 				unknownKeys,
 				visibilityApplied,
+				...(ignoredKeys.length ? { ignoredKeys } : {}),
 				titleBlockBefore: before?.titleBlockData ?? {},
 			},
 			warnings: [
@@ -615,6 +690,7 @@ export const schematicTitleBlockModify: Handler = async (payload) => {
 			applied,
 			alreadySet,
 			visibilityApplied,
+			...(ignoredKeys.length ? { ignoredKeys } : {}),
 			titleBlockBefore: before?.titleBlockData ?? {},
 		},
 	};

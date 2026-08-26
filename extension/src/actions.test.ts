@@ -923,20 +923,58 @@ function installTitleBlockStub(opts: {
 	return calls;
 }
 
-test('titleblock: unknown items are reported as a hard failure, not the platform true', async () => {
+test('titleblock: 结构键(拿明细表当纸张属性写)= 零变异前置拒绝,平台调用根本不发生 (#186)', async () => {
 	// 复刻 audit log 里那次真实失败的 payload:拿明细表当纸张属性写。
-	installTitleBlockStub({ before: { Title: { value: 'old' } } });
+	//
+	// 行为已变(#186):以前是「照发给平台 → 回读发现没生效 → 报 nothing was applied」。
+	// 但真机证明这条路会**损毁文档** —— 平台会把结构键的 value 写进图框的 UUID
+	// 引用位(符号名灌进 component/device/symbol),保存后重启拒载 = 图框丢失。
+	// 所以现在在下发之前就拒,且必须证明**一次平台调用都没发出**。
+	const calls = installTitleBlockStub({
+		before: { Title: { value: 'old' }, Size: { value: 'A4' }, Width: { value: '1170' } },
+	});
 	await assert.rejects(
 		() => schematicTitleBlockModify({
 			titleBlockData: { Size: { value: 'A2' }, Width: { value: '2340' } },
 		}) as any,
 		(err: any) => {
-			assert.match(err.message, /nothing was applied/);
-			assert.match(err.message, /Size, Width/, 'the unknown items must be named');
-			assert.match(err.message, /titleblock-get/, 'must point at the way to discover valid keys');
+			assert.equal(err.code, 'PRECONDITION_REFUSED', '必须是零变异拒绝码,不能计进连接器健康度');
+			assert.match(err.message, /Size, Width/, 'the refused items must be named');
+			assert.match(err.message, /一个字节都没写/, '必须明说本次没有任何写入');
 			return true;
 		},
 	);
+	assert.equal(calls.length, 0, '结构键必须在下发之前被拦住 —— 一旦发出去就已经晚了');
+	delete (globalThis as any).eda;
+});
+
+test('titleblock: 把 get 的整包原样传回(只改一个文本项)= 结构键被静默丢弃,不再损毁图框 (#186)', async () => {
+	// issue #186 报告人的真实用法:titleblock.get 拿完整数据 → 只改 Title → 整包传回。
+	// 那 32 个结构/投影键的值与画布一致(他并不想改它们),所以不该拒绝整次调用,
+	// 而应把它们丢掉、只下发真正要改的文本项。
+	const structural = {
+		Device: { value: 'Drawing-Symbol_A4' },
+		Symbol: { value: 'Drawing-Symbol_A4' },
+		Border: { value: '1' },
+		'Title Block': { value: '1' },
+		'@Page No': { value: 1 },
+	};
+	const calls = installTitleBlockStub({
+		before: { Title: { value: 'old' }, ...structural },
+		after: { Title: { value: 'new' }, ...structural },
+	});
+	const res: any = await schematicTitleBlockModify({
+		titleBlockData: { Title: { value: 'new' }, ...structural },
+	});
+	assert.equal(res.result.ok, true);
+	assert.deepEqual(res.result.applied, ['Title']);
+	assert.equal(calls.length, 1, '仍然只发一次平台调用');
+	// 关键:下发的 payload 里**一个结构键都不许有**。
+	assert.deepEqual(Object.keys(calls[0].data as object), ['Title'],
+		'Device/Symbol/Border/@… 绝不能出现在下发数据里');
+	assert.deepEqual((res.result.ignoredKeys as Array<string>).sort(),
+		['@Page No', 'Border', 'Device', 'Symbol', 'Title Block'],
+		'被丢掉的结构键要如实报给调用方');
 	delete (globalThis as any).eda;
 });
 

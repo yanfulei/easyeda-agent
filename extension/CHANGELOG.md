@@ -4,6 +4,42 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.6] — 2026-08-26
+
+### Fixed — 明细表写入不再损毁图框(#186,社区报告 + 真机复现)
+
+`schematic.titleblock.modify` 把调用方给的 `titleBlockData` **原样**下发给平台。
+于是最自然的用法——`titleblock.get` 拿完整数据 → 只改一个文本项 → 整包传回——
+会把 `Device`/`Symbol` 的 value(`"Drawing-Symbol_A4"`,那是**符号的名字**)一起写下去,
+平台把它灌进了 sheet 的 **component/device/symbol UUID 引用位**:
+
+```
+修改前  component.uuid = 2cdbe1a3210dccf2   device.uuid = 2cdbe1a3210dccf2   symbol.uuid = bffa68140727fa20
+修改后  component.uuid = Drawing-Symbol_A4  device.uuid = Drawing-Symbol_A4  symbol.uuid = Drawing-Symbol_A4
+        Border 1→0    Title Block 1→0
+```
+
+EasyEDA 当场报「发现异常数据,以下元件的 器件/符号 属性有误」,保存后**重启即拒载 = 图框丢失**。
+而动作本身还返回 `ok:false`(「nothing was applied: Name」)—— **报失败、画布却已被写坏**,
+是最坏的一种组合。这与「库占位 Designator 被灌进 otherProperty」是同一类事故:
+**读回来的投影字段不许原样写回去**。
+
+修法:下发前按结构键过滤。
+
+- **黑名单而非白名单**:明细项的键名**由图框模板决定**(默认 A4 是 `Name`/`Drawed`,
+  另一些模板是 `Title`/`Designer`),白名单会把自定义图框的合法字段全拒掉;
+  而结构键是图框**数据模型**的固有部分,与模板无关,可以稳定枚举 ——
+  图框身份(`Device`/`Symbol`/`ID`)、纸张几何(`Size`/`Page Size`/`Width`/`Height`/
+  `Blade Width`/`Region Start`/`X·Y Region Count`/`Title Block Position`)、
+  开关(`Border`/`Title Block`/`Color`),外加 `@` 前缀的平台投影项。
+- **原样带回来的结构键静默丢弃**(值与画布一致 = 调用方并不想改它),回执给 `ignoredKeys`;
+- **真想改结构键则零变异拒绝**(`PRECONDITION_REFUSED`),报文点名字段并给出正路
+  (换图框走 `prim-delete --allow-sheet` + `place`)。审计日志里那次「拿明细表当纸张属性写」
+  (`Size`/`Width`)的真实失败,现在**在下发之前**就被拦住,而不是写下去再报「没生效」。
+
+两个新单测钉住:结构键拒绝时**一次平台调用都不许发出**;报告人的整包回传用法
+下发 payload 里**一个结构键都没有**、只有那个真正要改的文本项。
+
 ## [1.2.5] — 2026-08-26
 
 ### Fixed — 「用户参数写错」不再把连接器染成 DEGRADED
