@@ -32,6 +32,7 @@ import {
 	pickNamedCandidate,
 	requireNumber,
 	requireString,
+	requireStringArray,
 } from './util';
 
 type Payload = Record<string, unknown>;
@@ -7171,6 +7172,233 @@ const pcbReport: Handler = async () => {
 	return { result };
 };
 
+// ─── PCB length constraints: differential pairs + equal-length groups (#176) ─
+//
+// `pcb.report` could already READ these, but nothing could CREATE one — so on
+// any board driven purely by this CLI the report returned empty arrays forever.
+// The platform exposes the full surface (@beta; live-probed on 3.2.149:
+// create/delete/getAll all return true and read back correctly).
+//
+// House rules applied to every mutation below:
+//   - PRE-VALIDATE net names against the board. A constraint pointing at a
+//     non-existent net is silently useless — the platform accepts it anyway.
+//     Refuse before touching anything (#120 前置拒绝: zero mutation, exact blame).
+//   - READ BACK after every write and report `verified`. The platform's boolean
+//     is not proof — this repo has been burned by ok-but-not-applied enough
+//     times that回执不算数、回读才算数 is a standing rule.
+//   - IDEMPOTENT: creating an existing name reports `alreadyExists` instead of
+//     failing, so replaying a spec (or a playbook) is safe.
+
+interface DiffPairItem { name: string; positiveNet: string; negativeNet: string }
+interface EqLenGroupItem { name: string; nets: Array<string> }
+
+// Since EDA v3.4 getAllDifferentialPairs may return an object map instead of an
+// array (documented breaking change) — normalize both shapes, same as the report.
+export function constraintList<T>(raw: unknown): Array<T> {
+	return (Array.isArray(raw) ? raw : Object.values((raw ?? {}) as Record<string, T>)) as Array<T>;
+}
+
+async function readDiffPairs(): Promise<Array<DiffPairItem>> {
+	const raw = await eda.pcb_Drc.getAllDifferentialPairs();
+	return constraintList<DiffPairItem>(raw).filter(p =>
+		!!p && typeof p === 'object' && 'positiveNet' in p && 'negativeNet' in p);
+}
+
+async function readEqLenGroups(): Promise<Array<EqLenGroupItem>> {
+	const raw = await eda.pcb_Drc.getAllEqualLengthNetGroups();
+	return constraintList<EqLenGroupItem>(raw).filter(g => !!g && typeof g === 'object' && 'name' in g);
+}
+
+/** Refuse up front when a requested net isn't on this board. */
+async function assertNetsExist(nets: Array<string>, what: string): Promise<void> {
+	let known: Array<string> = [];
+	try { known = (await eda.pcb_Net.getAllNetsName()) ?? []; }
+	catch { return; } // can't read the board's nets — don't block on our own check
+	if (!known.length) return;
+	const missing = nets.filter(n => !known.includes(n));
+	if (!missing.length) return;
+	throw new ActionError(
+		ErrorCodes.INVALID_STATE,
+		`${what}: net(s) not on this PCB: ${missing.join(', ')}. `
+		+ `Nothing was created. List the board's nets with \`easyeda pcb nets\` and use those exact names `
+		+ `(net names are case-sensitive and come from the schematic).`,
+	);
+}
+
+const pcbConstraintList: Handler = async () => {
+	const [pairs, groups] = await Promise.all([
+		readDiffPairs().catch(err => { throw edaError(err, 'Failed to read differential pairs.'); }),
+		readEqLenGroups().catch(err => { throw edaError(err, 'Failed to read equal-length groups.'); }),
+	]);
+	return { result: { differentialPairs: pairs, equalLengthGroups: groups, count: pairs.length + groups.length } };
+};
+
+const pcbDiffPairCreate: Handler = async (payload) => {
+	const name = requireString(payload, 'name');
+	const positiveNet = requireString(payload, 'positiveNet');
+	const negativeNet = requireString(payload, 'negativeNet');
+	if (positiveNet === negativeNet) {
+		throw new ActionError(ErrorCodes.INVALID_STATE,
+			`differential pair "${name}": positiveNet and negativeNet are both "${positiveNet}" — a pair needs two different nets.`);
+	}
+	const existing = await readDiffPairs();
+	const already = existing.find(p => p.name === name);
+	if (already) {
+		// Idempotent only when it already describes the SAME pair; a name clash
+		// on different nets is a real conflict the caller must resolve.
+		if (already.positiveNet === positiveNet && already.negativeNet === negativeNet) {
+			return { result: { name, positiveNet, negativeNet, alreadyExists: true, verified: true } };
+		}
+		throw new ActionError(ErrorCodes.INVALID_STATE,
+			`differential pair "${name}" already exists on ${already.positiveNet}/${already.negativeNet}, `
+			+ `not ${positiveNet}/${negativeNet}. Delete it first (\`easyeda pcb diff-pair delete --name ${name}\`) or pick another name.`);
+	}
+	await assertNetsExist([positiveNet, negativeNet], `differential pair "${name}"`);
+
+	let ok = false;
+	try { ok = await eda.pcb_Drc.createDifferentialPair(name, positiveNet, negativeNet); }
+	catch (err) { throw edaError(err, `Failed to create differential pair "${name}".`); }
+
+	const after = (await readDiffPairs()).find(p => p.name === name);
+	const verified = !!after && after.positiveNet === positiveNet && after.negativeNet === negativeNet;
+	if (!verified) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED,
+			`createDifferentialPair("${name}") returned ${ok} but the pair is not on the board when read back. `
+			+ `Check that the PCB document is the foreground tab, then retry.`);
+	}
+	return { result: { name, positiveNet, negativeNet, created: true, verified } };
+};
+
+const pcbDiffPairDelete: Handler = async (payload) => {
+	const name = requireString(payload, 'name');
+	const before = await readDiffPairs();
+	if (!before.some(p => p.name === name)) {
+		return {
+			result: { name, deleted: false, notFound: true, verified: true },
+			warnings: [`differential pair "${name}" does not exist — nothing to delete (known: ${before.map(p => p.name).join(', ') || 'none'}).`],
+		};
+	}
+	let ok = false;
+	try { ok = await eda.pcb_Drc.deleteDifferentialPair(name); }
+	catch (err) { throw edaError(err, `Failed to delete differential pair "${name}".`); }
+	const stillThere = (await readDiffPairs()).some(p => p.name === name);
+	if (stillThere) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED,
+			`deleteDifferentialPair("${name}") returned ${ok} but the pair is still on the board when read back.`);
+	}
+	return { result: { name, deleted: true, verified: true } };
+};
+
+const pcbDiffPairRename: Handler = async (payload) => {
+	const name = requireString(payload, 'name');
+	const newName = requireString(payload, 'newName');
+	const before = await readDiffPairs();
+	if (!before.some(p => p.name === name)) {
+		throw new ActionError(ErrorCodes.INVALID_STATE,
+			`differential pair "${name}" does not exist (known: ${before.map(p => p.name).join(', ') || 'none'}).`);
+	}
+	if (before.some(p => p.name === newName)) {
+		throw new ActionError(ErrorCodes.INVALID_STATE, `a differential pair named "${newName}" already exists.`);
+	}
+	let ok = false;
+	try { ok = await eda.pcb_Drc.modifyDifferentialPairName(name, newName); }
+	catch (err) { throw edaError(err, `Failed to rename differential pair "${name}" → "${newName}".`); }
+	const after = await readDiffPairs();
+	const verified = after.some(p => p.name === newName) && !after.some(p => p.name === name);
+	if (!verified) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED,
+			`modifyDifferentialPairName("${name}","${newName}") returned ${ok} but the rename is not visible on read-back.`);
+	}
+	return { result: { name: newName, previousName: name, renamed: true, verified } };
+};
+
+const pcbEqGroupCreate: Handler = async (payload) => {
+	const name = requireString(payload, 'name');
+	const nets = requireStringArray(payload, 'nets');
+	if (nets.length < 2) {
+		throw new ActionError(ErrorCodes.INVALID_STATE,
+			`equal-length group "${name}" needs at least 2 nets (got ${nets.length}) — a one-net group constrains nothing.`);
+	}
+	const existing = await readEqLenGroups();
+	const already = existing.find(g => g.name === name);
+	if (already) {
+		const same = already.nets?.length === nets.length && nets.every(n => already.nets.includes(n));
+		if (same) return { result: { name, nets, alreadyExists: true, verified: true } };
+		throw new ActionError(ErrorCodes.INVALID_STATE,
+			`equal-length group "${name}" already exists with nets [${(already.nets ?? []).join(', ')}]. `
+			+ `Add to it with \`easyeda pcb eq-group add --name ${name} --nets …\`, or delete it first.`);
+	}
+	await assertNetsExist(nets, `equal-length group "${name}"`);
+
+	let ok = false;
+	try {
+		// color is required by the signature but the platform accepts undefined
+		// (live-probed: the group comes back with a default color).
+		ok = await eda.pcb_Drc.createEqualLengthNetGroup(name, nets, undefined as never);
+	}
+	catch (err) { throw edaError(err, `Failed to create equal-length group "${name}".`); }
+
+	const after = (await readEqLenGroups()).find(g => g.name === name);
+	const verified = !!after && nets.every(n => (after.nets ?? []).includes(n));
+	if (!verified) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED,
+			`createEqualLengthNetGroup("${name}") returned ${ok} but the group is not on the board when read back.`);
+	}
+	return { result: { name, nets: after.nets ?? nets, created: true, verified } };
+};
+
+const pcbEqGroupAddNets: Handler = async (payload) => {
+	const name = requireString(payload, 'name');
+	const nets = requireStringArray(payload, 'nets');
+	const before = (await readEqLenGroups()).find(g => g.name === name);
+	if (!before) {
+		throw new ActionError(ErrorCodes.INVALID_STATE,
+			`equal-length group "${name}" does not exist — create it first with \`easyeda pcb eq-group create --name ${name} --nets …\`.`);
+	}
+	const fresh = nets.filter(n => !(before.nets ?? []).includes(n));
+	if (!fresh.length) {
+		return { result: { name, nets: before.nets ?? [], added: [], alreadyMembers: nets, verified: true } };
+	}
+	await assertNetsExist(fresh, `equal-length group "${name}"`);
+
+	let ok = false;
+	try { ok = await eda.pcb_Drc.addNetToEqualLengthNetGroup(name, fresh); }
+	catch (err) { throw edaError(err, `Failed to add nets to equal-length group "${name}".`); }
+
+	const after = (await readEqLenGroups()).find(g => g.name === name);
+	const landed = fresh.filter(n => (after?.nets ?? []).includes(n));
+	const notApplied = fresh.filter(n => !landed.includes(n));
+	if (notApplied.length) {
+		// Canvas already changed for the ones that landed — report partial success
+		// rather than throwing (the 部分应用 convention, #151).
+		return {
+			result: { name, nets: after?.nets ?? [], added: landed, partial: true, notApplied, verified: false },
+			warnings: [`addNetToEqualLengthNetGroup("${name}") returned ${ok} but ${notApplied.join(', ')} `
+				+ `did not appear on read-back — retry those, or check they are real nets on this board.`],
+		};
+	}
+	return { result: { name, nets: after?.nets ?? [], added: landed, verified: true } };
+};
+
+const pcbEqGroupDelete: Handler = async (payload) => {
+	const name = requireString(payload, 'name');
+	const before = await readEqLenGroups();
+	if (!before.some(g => g.name === name)) {
+		return {
+			result: { name, deleted: false, notFound: true, verified: true },
+			warnings: [`equal-length group "${name}" does not exist — nothing to delete (known: ${before.map(g => g.name).join(', ') || 'none'}).`],
+		};
+	}
+	let ok = false;
+	try { ok = await eda.pcb_Drc.deleteEqualLengthNetGroup(name); }
+	catch (err) { throw edaError(err, `Failed to delete equal-length group "${name}".`); }
+	if ((await readEqLenGroups()).some(g => g.name === name)) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED,
+			`deleteEqualLengthNetGroup("${name}") returned ${ok} but the group is still on the board when read back.`);
+	}
+	return { result: { name, deleted: true, verified: true } };
+};
+
 // ─── PCB layout (Phase 2 — schematic→PCB sync + component layout) ─────
 
 /**
@@ -10503,6 +10731,13 @@ const HANDLERS: Record<string, Handler> = {
 	'pcb.silk.label_pads': pcbSilkLabelPads,
 	'pcb.nets.list': pcbNetsList,
 	'pcb.report': pcbReport,
+	'pcb.constraint.list': pcbConstraintList,
+	'pcb.differential_pair.create': pcbDiffPairCreate,
+	'pcb.differential_pair.delete': pcbDiffPairDelete,
+	'pcb.differential_pair.rename': pcbDiffPairRename,
+	'pcb.equal_length_group.create': pcbEqGroupCreate,
+	'pcb.equal_length_group.add_nets': pcbEqGroupAddNets,
+	'pcb.equal_length_group.delete': pcbEqGroupDelete,
 	'pcb.board.info': pcbBoardInfo,
 	'board.list': boardList,
 	'board.current': boardCurrent,

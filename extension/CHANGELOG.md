@@ -4,6 +4,38 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.4] — 2026-08-26
+
+### Added — 差分对 / 等长网络组终于能建了(#176)
+
+`pcb report` 一直能**测**差分对 skew 与等长组 spread,但没有任何路径能**建**这两类约束
+——于是纯 CLI 驱动的板子上,那两个数组永远是空的,测量能力等于空转。平台其实早就给了
+全套 `@beta` API(真机 probe:create/delete/getAll 都返回 true 且回读得到),是我们没做。
+
+新 7 个 typed action + 两组 Cobra 子命令:
+
+```
+easyeda pcb diff-pair create --name USB0 --positive USB_DP --negative USB_DM
+easyeda pcb diff-pair list | rename --name USB0 --to USB | delete --name USB
+easyeda pcb eq-group  create --name DDR_ADDR --nets A0,A1,A2
+easyeda pcb eq-group  list | add --name DDR_ADDR --nets A3,A4 | delete --name DDR_ADDR
+```
+
+每个 mutation 都按本仓库的规矩来:
+
+- **前置校验网名**:约束指向一个板上不存在的网,平台照收不误但等于没建 —— 现在动手前
+  先比对 `pcb_Net.getAllNetsName()`,对不上**一个字节都不写**就拒绝并列出缺失网名;
+- **写后回读**:平台返回的 boolean 不算证据,每次写完重读 `getAll` 比对,回执给 `verified`;
+  回读对不上直接报错而不是假报成功;
+- **幂等**:同名同内容重建 = `alreadyExists`(可重放);同名不同内容 = 明确拒绝并给出下一步
+  (改名 / 先删 / 用 `eq-group add` 扩展),不静默覆盖;
+- **部分应用**:`eq-group add` 若有的网落地有的没落地,回 `partial` + `notApplied`(画布已变
+  就不抛错,#151 约定),不整批回滚。
+
+读侧统一走 `constraintList` 归一化 —— 平台自 v3.4 起 `getAllDifferentialPairs` 可能返回
+**对象 map 而非数组**(官方标注的破坏性变更),两种形态都得当成同一份清单,否则形态一变
+就会读成「板上没有约束」。
+
 ## [1.2.3] — 2026-08-25
 
 > 1.2.2 只在 dev 循环里打过包(未发版),它的条目并入本版。

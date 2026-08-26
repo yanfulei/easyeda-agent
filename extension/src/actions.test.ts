@@ -13,6 +13,7 @@ import { test } from 'node:test';
 
 import {
 	connectPinEndpoint,
+	constraintList,
 	detectPolarityConventionOutliers,
 	getComponentOrThrow,
 	isGroundLikeNet,
@@ -1938,4 +1939,24 @@ test('planOtherPropertyBackfill: a real designator in otherProperty is left alon
 	const withReal = { ...FRESH_INSTANCE_OP, 'Designator': 'C9' };
 	const { merged } = planOtherPropertyBackfill(withReal, DEVICE_OP_C0805, { onlyExistingKeys: true });
 	assert.equal(merged['Designator'], 'C9');
+});
+
+// ── PCB length constraints (#176) ───────────────────────────────────────────
+//
+// Since EDA v3.4 `getAllDifferentialPairs` may hand back an object MAP instead
+// of an array (a documented breaking change). Both the report and the new
+// constraint handlers run every read through constraintList, so a shape change
+// on the platform side must not turn into "the board has no constraints".
+test('constraintList: normalizes both the array and the v3.4 object-map shape', () => {
+	const asArray = [{ name: 'USB', positiveNet: 'DP', negativeNet: 'DM' }];
+	const asMap = { USB: { name: 'USB', positiveNet: 'DP', negativeNet: 'DM' } };
+	assert.deepEqual(constraintList(asArray), asArray);
+	assert.deepEqual(constraintList(asMap), asArray);
+});
+
+test('constraintList: nullish and empty inputs read as an empty list, never throw', () => {
+	assert.deepEqual(constraintList(undefined), []);
+	assert.deepEqual(constraintList(null), []);
+	assert.deepEqual(constraintList([]), []);
+	assert.deepEqual(constraintList({}), []);
 });

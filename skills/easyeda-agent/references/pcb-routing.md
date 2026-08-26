@@ -116,6 +116,33 @@ shows same-net (usually GND) Connection Errors after routing surgery, that's **s
 pour connectivity**: run `pcb pour-rebuild`, let ratlines recompute, then re-judge — do
 **not** paper over it with fills.
 
+### Length constraints — differential pairs / equal-length groups (#176)
+
+**布线前声明,布线后量。** 差分对与等长组是**约束对象**,不是走线:建了它们,EasyEDA 的 DRC 才把
+两条网当一对查,`easyeda pcb report` 的 `skew`(|lenP−lenN|)/`spread`(max−min)才有东西可量。
+不建 → 那两个数组恒空,报告里的测量能力空转。
+
+```bash
+# 差分对(USB / 以太网 / HDMI 这类)
+easyeda pcb diff-pair create --name USB0 --positive USB_DP --negative USB_DM
+easyeda pcb diff-pair list                       # 约束清单(≠ pcb report 的测量值)
+easyeda pcb diff-pair rename --name USB0 --to USB
+easyeda pcb diff-pair delete --name USB
+
+# 等长网络组(并行总线 / 地址线),至少 2 条网
+easyeda pcb eq-group create --name DDR_ADDR --nets A0,A1,A2
+easyeda pcb eq-group add    --name DDR_ADDR --nets A3,A4     # 已是成员的自动跳过
+easyeda pcb eq-group delete --name DDR_ADDR
+```
+
+**要点**(真机验过):网名**前置校验**,指向板上没有的网 = 零写入拒绝并点名(网名大小写敏感、来自
+原理图,用 `easyeda pcb nets` 取准);回执的 `verified` 是连接器**重读比对**出来的,不是平台返回值;
+同名同内容重建 = `alreadyExists`(可重放),同名不同内容 = 拒绝并给下一步;差分对**只能改名**,
+要换绑定得删了重建。改完再读先 `easyeda doc reload`(铁律 5 的 `STALE_READ` 门会拦)。
+
+**在流程里的位置**:P7 布线之前建好 → `route-critical` / 手工布线 → `easyeda pcb report` 回读
+skew/spread 验收。
+
 ### Copper pour (铺铜)
 
 A pour is a net-bound copper region (usually GND/power plane). **The agent passes raw

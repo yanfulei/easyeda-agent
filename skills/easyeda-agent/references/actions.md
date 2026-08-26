@@ -120,6 +120,28 @@ rip-up/clear 等破坏性步骤——整册回放前先 `--dry-run` 看计划,�
 - `pcb.view.side` — 切到顶面/底面视图（选该面铜层为当前层 + 聚焦该面铜+丝印），随后 `pcb snapshot` 即反映该面。注意：EasyEDA 无原生画布翻面 API，这是「层聚焦」近似而非物理翻板 → `easyeda pcb view-side --side bottom`
 - `pcb.nets.list` — PCB 全部网络
 
+### 长度约束：差分对 / 等长网络组（#176）
+
+**布线前（P7 之前）声明,布线后用 `pcb report` 量。** 约束是让 DRC 与布线器知道「这两条是一对 /
+这组必须等长」的唯一途径,也是 `pcb report` 的 `skew`(|lenP−lenN|)与 `spread`(max−min)有意义的前提 ——
+不建约束,那两个数组永远是空的,报告里的测量能力等于空转。
+
+- `pcb.constraint.list` — 读回本板的**约束清单**(差分对 + 等长组)。注意与 `pcb.report` 分工:
+  这条给「有哪些约束」,`pcb.report` 给「量出来多少」→ `easyeda pcb diff-pair list` / `eq-group list`
+- `pcb.differential_pair.create|delete|rename` → `easyeda pcb diff-pair create --name USB0 --positive USB_DP --negative USB_DM`
+- `pcb.equal_length_group.create|add_nets|delete` → `easyeda pcb eq-group create --name DDR_ADDR --nets A0,A1,A2`
+
+四条行为约定(都已真机验过):
+
+1. **网名前置校验**:约束指向板上没有的网,平台照收不误但等于没建 —— 我方在动手前比对
+   `pcb nets`,对不上就**一个字节都不写**地拒绝并点名缺失网(网名大小写敏感,来自原理图);
+2. **写后回读**:回执的 `verified` 是连接器自己重读 `getAll` 比对出来的,平台返回的 boolean 不算数;
+3. **幂等**:同名同内容重建 = `alreadyExists`(可重放);同名**不同**内容 = 明确拒绝并给下一步
+   (改名 / 先删 / 用 `eq-group add` 扩展),绝不静默覆盖;
+4. **改绑定要删了重建**:平台对差分对只暴露「改名」,没有「改绑哪两条网」。
+
+⚠ 这些是 `Mutates` 动作 → 改完再读会撞铁律 5 的 `STALE_READ` 门,先 `easyeda doc reload`(实测如此)。
+
 ## Board（板子/组合 — 原理图↔PCB 绑定）
 
 一个 **Board = 1 张原理图 + 1 块 PCB**，原理图与 PCB 就是通过它「组合」在一起（`import_changes` 也沿此链接同步）。Board 以**名称**标识。CLI：`easyeda board …`。

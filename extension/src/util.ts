@@ -147,6 +147,26 @@ export function requireString(payload: PayloadRecord, field: string): string {
 }
 
 /**
+ * Require a non-empty string-array field, accepting a bare string as a 1-element
+ * list (CLI flags that take a CSV often collapse to one value).
+ *
+ * @param payload - request payload
+ * @param field - field name
+ * @returns the string values
+ */
+export function requireStringArray(payload: PayloadRecord, field: string): Array<string> {
+	const value = payload[field];
+	if (typeof value === 'string' && value.length > 0) return [value];
+	if (Array.isArray(value) && value.length > 0 && value.every(v => typeof v === 'string' && v.length > 0)) {
+		return value as Array<string>;
+	}
+	throw new ActionError(
+		ErrorCodes.MISSING_PAYLOAD_FIELD,
+		`Missing required string-array field "${field}".`,
+	);
+}
+
+/**
  * Require a number field from the payload, throwing a structured error if absent.
  *
  * @param payload - request payload
