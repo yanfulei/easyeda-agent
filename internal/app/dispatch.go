@@ -228,6 +228,25 @@ func requestAction(cfg *appConfig, action, window string, payload any) (*actionR
 // requestActionTimed is requestAction with a caller-chosen round-trip timeout,
 // for heavy actions (DRC on a real board routinely exceeds the default).
 func requestActionTimed(cfg *appConfig, action, window string, payload any, timeout time.Duration) (*actionResult, error) {
+	// 连接器队列被上一条 handler 堵住 → daemon 拒绝派发并明说「动作未发出、
+	// 等它排空就行」。这里统一等(见 queue_blocked_retry.go):这是所有动作的
+	// 唯一底层出口,--doc guard 的 pages.list 也从这里走 —— 而恢复段正是被
+	// 那道 guard 挡在门外的(2026-08-26 U2 七条连接因此丢失)。
+	var res *actionResult
+	err := retryWhileQueueBlocked(action, func() error {
+		var e error
+		res, e = requestActionOnce(cfg, action, window, payload, timeout)
+		return e
+	}, queueBlockRetryPolicy{Stderr: queueWaitProgress})
+	return res, err
+}
+
+// queueWaitProgress 是「正在等队列排空」的进度出口。默认 stderr:静默地等
+// 90 秒比直接失败更让人困惑,用户得看得见工具在等什么、还要等多久。
+var queueWaitProgress io.Writer = os.Stderr
+
+// requestActionOnce 是单次往返(不含队列阻塞等待)。
+func requestActionOnce(cfg *appConfig, action, window string, payload any, timeout time.Duration) (*actionResult, error) {
 	respBody, err := postAction(cfg, action, window, payload, timeout)
 	if err != nil {
 		return nil, err

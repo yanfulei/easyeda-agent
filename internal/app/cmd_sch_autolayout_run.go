@@ -364,6 +364,8 @@ func requireActionDocument(res *actionResult, targetUUID, phase string) error {
 }
 
 func requestAutolayoutAction(cfg *appConfig, action, window string, payload any, targetUUID, phase string) (*actionResult, error) {
+	// 队列阻塞的等待在 requestActionTimed 里统一做(见 queue_blocked_retry.go)——
+	// 那是唯一的底层出口,--doc guard 的 pages.list 也从那里走,恢复段才穿得过去。
 	res, err := requestAction(cfg, action, window, payload)
 	if err != nil {
 		if res != nil {
