@@ -684,3 +684,70 @@ func TestHealthEndpointExposesEffectDimensions(t *testing.T) {
 		t.Fatalf("actions bucket = %+v", a)
 	}
 }
+
+// 请求拒绝(调用方参数不对、零变异)绝不能进写健康度采样。
+//
+// 真实踩点:`pcb diff-pair create` 加了三处前置校验(网名不在板上 / 同名约束内容
+// 不同 / 正负网填成同一条)。用户连打错三次网名,连接器就被染成 DEGRADED 并点名
+// 该 action 是「最差路」——而连接器与平台全程健康。误报的代价不是难看,是**把真
+// 停摆信号淹掉**(#185 那类:socket 死了、register 被静默忽略,同一个 failureRate)。
+func TestWriteHealthIgnoresRequestRefusals(t *testing.T) {
+	tr := newWriteHealthTracker()
+
+	// 连打 5 次「参数不对」——一次都不该被记账。
+	for i := 0; i < 5; i++ {
+		tr.observe("w1", outcome{Action: "pcb.differential_pair.create", OK: false, ErrorCode: "PRECONDITION_REFUSED"})
+	}
+	if h := tr.snapshot("w1"); h.Samples != 0 || h.Degraded || h.ConsecutiveFailures != 0 {
+		t.Fatalf("request refusals must not be sampled at all, got %+v", h)
+	}
+
+	// 另外两个「请求根本没成形」的码同样豁免。
+	tr.observe("w1", outcome{Action: "a", OK: false, ErrorCode: "MISSING_PAYLOAD_FIELD"})
+	tr.observe("w1", outcome{Action: "a", OK: false, ErrorCode: "UNKNOWN_ACTION"})
+	if h := tr.snapshot("w1"); h.Samples != 0 {
+		t.Fatalf("malformed requests must not be sampled, got samples=%d", h.Samples)
+	}
+}
+
+// 豁免必须窄:真故障码照常计入,否则这个修复会把它要保护的信号一起吞掉。
+func TestWriteHealthStillCountsRealFailures(t *testing.T) {
+	tr := newWriteHealthTracker()
+
+	// INVALID_STATE 故意不豁免 —— 它既可能是「你要的事讲不通」,也可能是
+	// 「编辑器状态真的坏了」,一刀切会把真故障也吞掉。
+	for _, code := range []string{"EDA_CALL_FAILED", "INVALID_STATE", "ACTION_ABANDONED"} {
+		tr := newWriteHealthTracker()
+		for i := 0; i < 3; i++ {
+			tr.observe("w1", outcome{Action: "schematic.wire.create", OK: false, ErrorCode: code})
+		}
+		h := tr.snapshot("w1")
+		if h.Samples != 3 || !h.Degraded {
+			t.Errorf("code %s: want 3 samples and degraded, got %+v", code, h)
+		}
+	}
+
+	// 空错误码(旧调用点 / 传输层失败)也照常计入 —— 豁免只认白名单。
+	for i := 0; i < 3; i++ {
+		tr.observe("w1", outcome{Action: "schematic.wire.create", OK: false})
+	}
+	if h := tr.snapshot("w1"); h.Samples != 3 || !h.Degraded {
+		t.Fatalf("blank error code must still count, got %+v", h)
+	}
+}
+
+// 混合场景:拒绝穿插在真失败之间时,分母只算真失败,退化判定不被稀释。
+func TestWriteHealthRefusalsDoNotDiluteRate(t *testing.T) {
+	tr := newWriteHealthTracker()
+	for i := 0; i < 3; i++ {
+		tr.observe("w1", outcome{Action: "schematic.wire.create", OK: false, ErrorCode: "EDA_CALL_FAILED"})
+		// 每次真失败之间夹 4 次参数拒绝:若被当成样本,失败率会从 100% 稀释到 20%。
+		for j := 0; j < 4; j++ {
+			tr.observe("w1", outcome{Action: "pcb.differential_pair.create", OK: false, ErrorCode: "PRECONDITION_REFUSED"})
+		}
+	}
+	h := tr.snapshot("w1")
+	if h.Samples != 3 || h.FailureRate != 1 || !h.Degraded {
+		t.Fatalf("refusals must not dilute the real failure rate, got %+v", h)
+	}
+}

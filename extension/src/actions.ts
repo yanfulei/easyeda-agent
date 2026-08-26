@@ -7218,7 +7218,7 @@ async function assertNetsExist(nets: Array<string>, what: string): Promise<void>
 	const missing = nets.filter(n => !known.includes(n));
 	if (!missing.length) return;
 	throw new ActionError(
-		ErrorCodes.INVALID_STATE,
+		ErrorCodes.PRECONDITION_REFUSED,
 		`${what}: net(s) not on this PCB: ${missing.join(', ')}. `
 		+ `Nothing was created. List the board's nets with \`easyeda pcb nets\` and use those exact names `
 		+ `(net names are case-sensitive and come from the schematic).`,
@@ -7238,7 +7238,7 @@ const pcbDiffPairCreate: Handler = async (payload) => {
 	const positiveNet = requireString(payload, 'positiveNet');
 	const negativeNet = requireString(payload, 'negativeNet');
 	if (positiveNet === negativeNet) {
-		throw new ActionError(ErrorCodes.INVALID_STATE,
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED,
 			`differential pair "${name}": positiveNet and negativeNet are both "${positiveNet}" — a pair needs two different nets.`);
 	}
 	const existing = await readDiffPairs();
@@ -7249,7 +7249,7 @@ const pcbDiffPairCreate: Handler = async (payload) => {
 		if (already.positiveNet === positiveNet && already.negativeNet === negativeNet) {
 			return { result: { name, positiveNet, negativeNet, alreadyExists: true, verified: true } };
 		}
-		throw new ActionError(ErrorCodes.INVALID_STATE,
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED,
 			`differential pair "${name}" already exists on ${already.positiveNet}/${already.negativeNet}, `
 			+ `not ${positiveNet}/${negativeNet}. Delete it first (\`easyeda pcb diff-pair delete --name ${name}\`) or pick another name.`);
 	}
@@ -7294,11 +7294,11 @@ const pcbDiffPairRename: Handler = async (payload) => {
 	const newName = requireString(payload, 'newName');
 	const before = await readDiffPairs();
 	if (!before.some(p => p.name === name)) {
-		throw new ActionError(ErrorCodes.INVALID_STATE,
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED,
 			`differential pair "${name}" does not exist (known: ${before.map(p => p.name).join(', ') || 'none'}).`);
 	}
 	if (before.some(p => p.name === newName)) {
-		throw new ActionError(ErrorCodes.INVALID_STATE, `a differential pair named "${newName}" already exists.`);
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED, `a differential pair named "${newName}" already exists.`);
 	}
 	let ok = false;
 	try { ok = await eda.pcb_Drc.modifyDifferentialPairName(name, newName); }
@@ -7316,7 +7316,7 @@ const pcbEqGroupCreate: Handler = async (payload) => {
 	const name = requireString(payload, 'name');
 	const nets = requireStringArray(payload, 'nets');
 	if (nets.length < 2) {
-		throw new ActionError(ErrorCodes.INVALID_STATE,
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED,
 			`equal-length group "${name}" needs at least 2 nets (got ${nets.length}) — a one-net group constrains nothing.`);
 	}
 	const existing = await readEqLenGroups();
@@ -7324,7 +7324,7 @@ const pcbEqGroupCreate: Handler = async (payload) => {
 	if (already) {
 		const same = already.nets?.length === nets.length && nets.every(n => already.nets.includes(n));
 		if (same) return { result: { name, nets, alreadyExists: true, verified: true } };
-		throw new ActionError(ErrorCodes.INVALID_STATE,
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED,
 			`equal-length group "${name}" already exists with nets [${(already.nets ?? []).join(', ')}]. `
 			+ `Add to it with \`easyeda pcb eq-group add --name ${name} --nets …\`, or delete it first.`);
 	}
@@ -7352,7 +7352,7 @@ const pcbEqGroupAddNets: Handler = async (payload) => {
 	const nets = requireStringArray(payload, 'nets');
 	const before = (await readEqLenGroups()).find(g => g.name === name);
 	if (!before) {
-		throw new ActionError(ErrorCodes.INVALID_STATE,
+		throw new ActionError(ErrorCodes.PRECONDITION_REFUSED,
 			`equal-length group "${name}" does not exist — create it first with \`easyeda pcb eq-group create --name ${name} --nets …\`.`);
 	}
 	const fresh = nets.filter(n => !(before.nets ?? []).includes(n));

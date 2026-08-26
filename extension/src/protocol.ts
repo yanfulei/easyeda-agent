@@ -143,6 +143,22 @@ export const ErrorCodes = {
 	ACTION_ABANDONED: 'ACTION_ABANDONED',
 	/** 队列积压到上限,这次提交被明确拒绝(而不是无限堆积)。它**没有执行**。 */
 	QUEUE_OVERFLOW: 'QUEUE_OVERFLOW',
+	/**
+	 * **请求本身不合法,handler 在动手前就拒了 —— 画布一个字节都没改。**
+	 *
+	 * 与 `INVALID_STATE` 的分工:`INVALID_STATE` 说的是「编辑器/文档处在做不了这件事
+	 * 的状态」(可能是平台侧的真问题);这个码说的是「**你要我做的事本身讲不通**」——
+	 * 网名板上没有、同名约束已存在且内容不同、正负网填成同一条…… 属于**调用方的
+	 * 输入问题**,连接器与平台都工作正常。
+	 *
+	 * 为什么要单独一个码:daemon 的写健康度(`writehealth.go`)把 `ok:false` 一律计成
+	 * 失败,于是「用户把网名打错了」会把连接器染成 DEGRADED,**真正的停摆信号被误报
+	 * 淹没**。带这个码的响应**不进写健康度采样**——它不含任何关于连接器是否健康的信息。
+	 *
+	 * 用它的前提是**零变异**:一旦已经写了任何东西,就不许再用这个码(该走 partial /
+	 * 结构化成功那条路,见 #151 部分应用约定)。
+	 */
+	PRECONDITION_REFUSED: 'PRECONDITION_REFUSED',
 } as const;
 
 /**

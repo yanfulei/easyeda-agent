@@ -190,7 +190,40 @@ type outcome struct {
 	// Verdict carries通道 A 的证据(effectFromResponse):连接器在响应里自带的
 	// 回读结论。effectUnknown = 响应没给证据,不是"证明落地了"。
 	Verdict effectVerdict
+	// ErrorCode is the failing response's code (empty when ok). Used ONLY to
+	// drop request-refusal samples — see requestRefusalCodes.
+	ErrorCode string
 }
+
+// requestRefusalCodes 是「**请求本身讲不通,而且一个字节都没写**」的错误码。
+//
+// 这类响应**完全不进写健康度采样**:它不含任何关于连接器是否健康的信息。
+// 把它们计成失败会产生一种很坏的误报 —— 用户把网名打错三次,连接器就被染成
+// DEGRADED,而真正的停摆信号(#185 那类:socket 死了、register 被静默忽略)
+// 被淹没在同一个 failureRate 里。**健康度要衡量的是「这条路还通不通」,不是
+// 「调用方参数对不对」。**
+//
+// 判定必须机械、保守。这里只收三个码:
+//   - PRECONDITION_REFUSED:handler 动手前拒绝的专用码(零变异是它的使用前提);
+//   - MISSING_PAYLOAD_FIELD / UNKNOWN_ACTION:请求根本没成形,连接器无从执行。
+//
+// **INVALID_STATE 故意不在此列**:它既可能是「你要的事讲不通」,也可能是
+// 「编辑器状态真的坏了」,一刀切会把真故障也吞掉。要豁免的 handler 应显式
+// 改用 PRECONDITION_REFUSED,而不是放宽这里。
+var requestRefusalCodes = map[string]bool{
+	"PRECONDITION_REFUSED":  true,
+	"MISSING_PAYLOAD_FIELD": true,
+	"UNKNOWN_ACTION":        true,
+}
+
+// responseErrorCode pulls the error code out of a response, tolerating nil.
+func responseErrorCode(resp *protocol.Response) string {
+	if resp == nil || resp.Error == nil {
+		return ""
+	}
+	return resp.Error.Code
+}
+
 
 // ActionWriteHealth is one action's slice of a window's health — the bucket that
 // keeps "this one road is not working" from being averaged away.
@@ -281,6 +314,12 @@ func (t *writeHealthTracker) stateLocked(windowID string) *windowHealthState {
 // observe records one forwarded-action outcome for a window.
 func (t *writeHealthTracker) observe(windowID string, o outcome) {
 	if t == nil || windowID == "" {
+		return
+	}
+	// A request refusal says nothing about connector health — dropping it here
+	// (rather than counting it as a non-failure) keeps it out of `samples` too,
+	// so it can't dilute the denominator either way. See requestRefusalCodes.
+	if !o.OK && requestRefusalCodes[o.ErrorCode] {
 		return
 	}
 	t.mu.Lock()
@@ -711,7 +750,7 @@ func forwardWithAdaptiveRetry(ctx context.Context, req protocol.Request, dispatc
 	resp, err := dispatch(ctx, req)
 	ok := err == nil && resp != nil && resp.OK
 	if h.observe != nil {
-		h.observe(outcome{Action: req.Action, RequestID: req.ID, OK: ok, Verdict: effectFromResponse(&req, resp)})
+		h.observe(outcome{Action: req.Action, RequestID: req.ID, OK: ok, Verdict: effectFromResponse(&req, resp), ErrorCode: responseErrorCode(resp)})
 	}
 	if ok || !retryableOnFailure[req.Action] {
 		return resp, err, false
@@ -747,7 +786,7 @@ func forwardWithAdaptiveRetry(ctx context.Context, req protocol.Request, dispatc
 	resp2, err2 := dispatch(ctx, req)
 	ok2 := err2 == nil && resp2 != nil && resp2.OK
 	if h.observe != nil {
-		h.observe(outcome{Action: req.Action, RequestID: req.ID, OK: ok2, Verdict: effectFromResponse(&req, resp2)})
+		h.observe(outcome{Action: req.Action, RequestID: req.ID, OK: ok2, Verdict: effectFromResponse(&req, resp2), ErrorCode: responseErrorCode(resp2)})
 	}
 	if ok2 {
 		resp2.Warnings = append(resp2.Warnings, fmt.Sprintf(

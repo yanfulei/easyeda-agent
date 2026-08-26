@@ -4,6 +4,31 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.5] — 2026-08-26
+
+### Fixed — 「用户参数写错」不再把连接器染成 DEGRADED
+
+新增错误码 **`PRECONDITION_REFUSED`**:handler 在**动手之前**拒绝、**画布一个字节都没改**
+的那类失败。daemon 的写健康度(`writehealth.go`)**完全不采样**这个码。
+
+起因是 1.2.4 的差分对命令加了三处前置校验(网名不在板上 / 同名约束内容不同 / 正负网填成
+同一条)。真机连打几次错网名之后,`daemon health` 就把连接器判成 **DEGRADED** 并点名
+`pcb.differential_pair.create` 是「最差路」—— 而连接器与平台全程健康。根因:健康度的
+`failed()` 判据是「`ok:false` 且未证实落地 → 算失败」,它分不清**「这条路不通」**和
+**「你给的参数不对」**。
+
+误报的代价不是难看,是**把真信号淹掉**:同一个 `failureRate` 里既有「socket 死了、
+register 被静默忽略」(issue #185 那类真停摆),也有「网名打错了」。
+
+**豁免必须窄**,只收三个码:`PRECONDITION_REFUSED` / `MISSING_PAYLOAD_FIELD` /
+`UNKNOWN_ACTION`。**`INVALID_STATE` 故意不在其列** —— 它既可能是「你要的事讲不通」,
+也可能是「编辑器状态真的坏了」,一刀切会把真故障一起吞掉;要豁免的 handler 应显式改用
+新码,而不是放宽白名单。使用新码的前提是**零变异**:已经写了东西就不许再用它
+(该走 partial / 结构化成功,#151)。
+
+差分对与等长组的 8 处前置拒绝已全部迁移到新码。四个 Go 单测钉住:拒绝零采样、
+真故障码(含 `INVALID_STATE`、空码)照常计入、拒绝穿插在真失败之间不稀释失败率。
+
 ## [1.2.4] — 2026-08-26
 
 ### Added — 差分对 / 等长网络组终于能建了(#176)

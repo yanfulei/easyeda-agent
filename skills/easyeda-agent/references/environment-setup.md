@@ -220,6 +220,12 @@ extensionUuid 在 `extension/extension.json`。IndexedDB 结构非官方稳定 A
     不能读成"一切正常"。
   - `degradedActions[]` / `actions{}` 是逐 action 分桶:某条路(如 `connect_pin`
     一批 40% 失败)在混合流量里不会再被均值稀释,会被直接点名。
+  - **你自己参数写错不算连接器的账**(2026-08-26 修订):`PRECONDITION_REFUSED` /
+    `MISSING_PAYLOAD_FIELD` / `UNKNOWN_ACTION` 这三类「请求本身讲不通、画布零变更」
+    的失败**完全不进采样**(连分母都不占)。此前它们照常计失败,于是「网名连打错三次」
+    就能把连接器染成 DEGRADED —— 而真停摆(socket 死了、register 被忽略)混在同一个
+    `failureRate` 里被淹掉。**`INVALID_STATE` 仍然计入**:它可能是编辑器状态真坏了,
+    豁免必须窄。**读法**:看到 `degraded` 就是真的有条路不通,不用再猜是不是自己参数写错。
   `degraded:true` 时的正确动作:插一次轻读 + 短暂 settle;**写**失败先轻读复核
   「是不是其实已经落地」再决定,持续不恢复就 `easyeda doc reload`。
   daemon 只自动重发幂等导航动作(`document.open` / `schematic.page.open`),
