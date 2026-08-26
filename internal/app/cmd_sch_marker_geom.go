@@ -769,6 +769,22 @@ func partitionFindingForZones(parts, frameRects, labelTexts, textCount, zones in
 		return nil
 	}
 	var out []*checkFinding
+	// **判据是「够不够」不是「有没有」**(2026-08-26 实测):MCU_CORE 6 个模块只画上
+	// 2 个框(其余 4 个 text create 失败),check 却报 0 findings —— 因为 frameRects≠0。
+	// 「缺 4 个框」与「全都有」在旧口径里是同一个答案,用户当场问「都不缺了吗」
+	// 而工具答不上来。zones>0 时按模块数判缺口;zones==0(没有模块记账)证不出
+	// 「该有几个」,退回老口径只判「一个都没有」。
+	if zones > 0 && frameRects > 0 && frameRects < zones {
+		out = append(out, &checkFinding{
+			Type:  "missing-partition",
+			Level: "warn",
+			Count: zones - frameRects,
+			Message: fmt.Sprintf("%d 个功能模块只画上 %d 个分区框,还缺 %d 个 —— 重跑 `sch zone-draw --mode partition`(它只补缺的那几个);"+
+				"若被拒,先 `sch zone-plan` 看逐条 ✗ 点名是哪两个区顶住、差多少,照它给的 `sch zone move` 挪完再画。"+
+				"⚠ 画框会**部分失败**(平台 text create 偶发返回 undefined),所以画完必须回读复核,别只看退出码",
+				zones, frameRects, zones-frameRects),
+		})
+	}
 	if frameRects == 0 {
 		msg := fmt.Sprintf("%d 个器件的页没有功能分区框 — 铁律#15:`sch zones set` → `sch zone-draw`(整纸版式 `--mode partition`);交付前必须有", parts)
 		if zones > 0 {
@@ -789,12 +805,26 @@ func partitionFindingForZones(parts, frameRects, labelTexts, textCount, zones in
 			Message: msg,
 		})
 	}
-	if notes := schCircuitNoteCount(textCount, labelTexts); notes == 0 {
+	notes := schCircuitNoteCount(textCount, labelTexts)
+	switch {
+	case notes == 0:
 		out = append(out, &checkFinding{
 			Type:    "missing-note",
 			Level:   "warn",
 			Count:   parts,
 			Message: fmt.Sprintf("%d 个器件的页没有电路说明(区名标签不算)— 每模块 1~3 行 `sch note`:作用 + 关键参数 + 设计要点;交付前必须有", parts),
+		})
+	case zones > 0 && notes < zones:
+		// 同上:漏写一条与全都有,旧口径分不开。2026-08-26 实测 3 个模块只写成
+		// 2 条(第 3 条命令静默失败),check 照样绿。
+		out = append(out, &checkFinding{
+			Type:  "missing-note",
+			Level: "warn",
+			Count: zones - notes,
+			Message: fmt.Sprintf("%d 个功能模块只有 %d 条电路说明,还缺 %d 条(区名标签不算)— 每模块 1~3 行 "+
+				"`sch note --zone <模块名>`:作用 + 关键参数 + 设计要点。⚠ `sch note` 可能**静默失败**"+
+				"(落点装不下 / exec_js 抖动),写完用 `sch text-list` 回读复核,别只看退出码",
+				zones, notes, zones-notes),
 		})
 	}
 	return out
