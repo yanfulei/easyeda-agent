@@ -68,9 +68,25 @@ remap 之后的真值),所以整条命令**完全离线** —— 不需要连接
 				project, liveUUID = p, u
 				fmt.Fprintf(stderr, "工程 %s(由 --window %s 反查)\n", project, window)
 			}
-			res, patched, err := runSpecBackfill(args[0], project, liveUUID)
+			// 活页收窄是 best-effort:daemon 在跑就拿一次真实页表(挡住同工程内
+			// 删页重建留下的幽灵组),没跑就降级 —— 这条命令的离线契约不变。
+			live, lerr := fetchLiveSchematicPages(cfg, window)
+			livePages := specLivePageSet(live)
+			if lerr != nil || len(live) == 0 {
+				livePages = nil
+			}
+			res, patched, err := runSpecBackfillLive(args[0], project, liveUUID, livePages)
 			if err != nil {
 				return err
+			}
+			if livePages == nil {
+				// 说清楚这一趟**没有**做页存活校验,并给出补做的命令。
+				// 静默地不校验,正是 2026-08-26 那次污染没被任何人发现的原因。
+				res.Warnings = append(res.Warnings, fmt.Sprintf(
+					"未做页存活校验(离线或读不到活体页表)—— 若这个工程曾删页重建,"+
+						"状态里的旧页组仍会参与匹配。要校验:开着工程跑 "+
+						"`easyeda workflow pages --project %s --reap`(再 `--prune` 清掉判为外来的)",
+					project))
 			}
 			if write && len(res.Changes) > 0 {
 				if err := specWriteAtomic(args[0], patched); err != nil {
@@ -122,7 +138,15 @@ func bapBackfillSpec(cfg *appConfig, window, path string, ident schPageIdentity,
 		}
 		project = p
 	}
-	res, patched, err := runSpecBackfill(path, project, liveUUID)
+	// 在线路径顺手拿一次真实页表:同工程内删页重建留下的幽灵组只有它挡得住
+	// (projectUuid 收窄对同工程透明,见 specCollectGroupsLive)。
+	// 读不到就传 nil —— 降级成收窄前的行为,绝不因为一次抖动把整份记账判成外来。
+	live, lerr := fetchLiveSchematicPages(cfg, window)
+	livePages := specLivePageSet(live)
+	if lerr != nil || len(live) == 0 {
+		livePages = nil
+	}
+	res, patched, err := runSpecBackfillLive(path, project, liveUUID, livePages)
 	if err != nil {
 		fmt.Fprintf(stderr, "warn: spec 位号回填跳过(%v)—— %s\n",
 			err, specBackfillManualHint(path, project))
@@ -151,6 +175,32 @@ func bapBackfillSpec(cfg *appConfig, window, path string, ident schPageIdentity,
 // liveUUID 是活体工程 uuid(在线调用方传,离线传空):它决定跨页组表按谁收窄,
 // 是「同名重建的死工程组不再进回填分母」的唯一判据。
 func runSpecBackfill(path, project, liveUUID string) (specBackfillResult, []byte, error) {
+	return runSpecBackfillLive(path, project, liveUUID, nil)
+}
+
+// specLivePageSet 把页 uuid 列表折成集合;空列表返回 nil(= 拿不到,不收窄)。
+func specLivePageSet(pages []string) map[string]bool {
+	if len(pages) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(pages))
+	for _, p := range pages {
+		if p = strings.TrimSpace(p); p != "" {
+			out[p] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// runSpecBackfillLive 是 runSpecBackfill 带**活页集合**的形态。
+//
+// livePages 非 nil 时,不在其中的页整页不参与回填 —— 这是「同一个工程内把页删掉
+// 重建」的唯一解药:那些死页的归属戳就是当前工程,projectUuid 收窄对它们透明。
+// nil 表示拿不到页表(离线 / 读失败),行为与收窄前一致。
+func runSpecBackfillLive(path, project, liveUUID string, livePages map[string]bool) (specBackfillResult, []byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return specBackfillResult{}, nil, fmt.Errorf("read spec: %w", err)
@@ -172,14 +222,18 @@ func runSpecBackfill(path, project, liveUUID string) (specBackfillResult, []byte
 	// 纯离线的 CLI 拿不到,就退回文件自己记的 ProjectUUID —— 「最后绑定的那个
 	// 工程」同样能把带戳的死页挡在外面,而且一次往返都不用。
 	scope := st.ScopeUUID(liveUUID)
-	groups, skipped := specCollectGroups(st, scope)
+	groups, skipped := specCollectGroupsLive(st, scope, livePages)
 	want, res := specPlanBackfill(s, groups)
 	res.Spec, res.Project = path, project
 	if len(skipped) > 0 {
+		why := fmt.Sprintf("它们的虚拟组属于另一个工程(同名重建的残留,uuid ≠ %s)", scope)
+		if livePages != nil {
+			why = fmt.Sprintf("它们已经不在这个工程的活体页表里(%d 张活页),多半是删页重建留下的旧记账", len(livePages))
+		}
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
-			"跳过 %d 页:它们的虚拟组属于另一个工程(同名重建的残留,uuid ≠ %s;页 %s)——"+
-				"没有被算进回填的分母。要清掉残留:`easyeda workflow pages --project %s --prune`",
-			len(skipped), scope, strings.Join(skipped, ", "), project))
+			"跳过 %d 页:%s;页 %s —— 没有被算进回填的分母。要清掉残留:"+
+				"`easyeda workflow pages --project %s --reap` 后 `--prune`",
+			len(skipped), why, strings.Join(skipped, ", "), project))
 	}
 	if len(groups) == 0 {
 		res.Warnings = append(res.Warnings, fmt.Sprintf(

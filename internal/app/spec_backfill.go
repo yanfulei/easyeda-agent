@@ -122,6 +122,22 @@ type specGroupSource struct {
 //
 // liveUUID 为空(离线且文件里也没记过 uuid)时不收窄,行为与收窄前完全一致。
 func specCollectGroups(st *workflow.State, liveUUID string) (sources []specGroupSource, skippedPages []string) {
+	return specCollectGroupsLive(st, liveUUID, nil)
+}
+
+// specCollectGroupsLive 是 specCollectGroups 带**活页集合**的形态。
+//
+// liveUUID 的 projectUuid 收窄只挡得住「同名不同工程」;它对**同一个工程内把页
+// 删掉重建**完全透明 —— 死页的 owner 就是当前工程本身,PageInScope 照样放行。
+// 2026-08-26 实测:`ceshi` 里 5 张已删除页的组被照单全收,只落了一个 4 件的块,
+// 却把另外两个模块的 parts 改写成 12 / 7 个画布上不存在的位号,全程零报错。
+//
+// 所以再加一层判据:**页还在不在**。livePages 是当前工程实际存在的页 uuid 集合;
+// 不在其中的页整页丢掉并如实报出来。
+//
+// livePages 为 nil 表示「拿不到活页集合」(离线、连不上编辑器)—— 此时行为与收窄前
+// 完全一致,backfill 的离线契约不因这条修复而破。
+func specCollectGroupsLive(st *workflow.State, liveUUID string, livePages map[string]bool) (sources []specGroupSource, skippedPages []string) {
 	if st == nil {
 		return nil, nil
 	}
@@ -133,6 +149,12 @@ func specCollectGroups(st *workflow.State, liveUUID string) (sources []specGroup
 	sort.Strings(pages) // 同输入同输出
 	for _, p := range pages {
 		if !st.PageInScope(p, liveUUID) {
+			if len(st.GroupsByPage[p]) > 0 {
+				skippedPages = append(skippedPages, p)
+			}
+			continue
+		}
+		if livePages != nil && !livePages[p] {
 			if len(st.GroupsByPage[p]) > 0 {
 				skippedPages = append(skippedPages, p)
 			}
@@ -231,6 +253,22 @@ func specPlanBackfill(s *spec.Spec, groups []specGroupSource) (map[string][]stri
 			res.Unmatched = append(res.Unmatched, name)
 			continue
 		}
+		// 一个模块匹配到同一个块的**多个不同实例** = 歧义,跳过。
+		//
+		// 正常形态是「一个实例拆成多个功能子群」(U_3V3 / U_EN / …),它们的 Instance
+		// 相同,照常合并。出现两个不同 Instance 只有两种可能:板上真有两颗(那 spec
+		// 该写成两个模块),或者记账里混进了幽灵组(删页重建后的残留)。两种都不该
+		// **静默把两份位号并起来** —— 那正是 2026-08-26 把 MCU 写成 12 个器件的路径。
+		//
+		// 空 Instance(老状态没记过)一律视作同一实例,不因这条收紧而作废。
+		if insts := specDistinctInstances(hits); len(insts) > 1 {
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"模块 %s 跳过:块 %q 匹配到 %d 个不同实例(%s)—— 分不清哪个是这块板上活着的那个,"+
+					"不把它们并起来写。若板上真有多颗,请在 spec 里拆成多个模块;"+
+					"若是删页重建留下的旧记账,连上编辑器重跑(会按活页收窄)或清理 workflow 状态",
+				name, m.Block, len(insts), strings.Join(insts, ", ")))
+			continue
+		}
 		seen := map[string]bool{}
 		var parts, labels []string
 		for _, g := range hits {
@@ -261,6 +299,25 @@ func specPlanBackfill(s *spec.Spec, groups []specGroupSource) (map[string][]stri
 	sort.Strings(res.Unchanged)
 	sort.Strings(res.Unmatched)
 	return want, res
+}
+
+// specDistinctInstances 列出一批组里出现过的**非空**块实例 id(排序去重)。
+//
+// 空 Instance 不计入:老状态没记过这个字段,把它算成一个独立实例会让既有 spec
+// 一夜之间全变歧义。判据只针对「明确记了两个不同实例」这一种情况。
+func specDistinctInstances(groups []specGroupSource) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, g := range groups {
+		inst := strings.TrimSpace(g.Instance)
+		if inst == "" || seen[inst] {
+			continue
+		}
+		seen[inst] = true
+		out = append(out, inst)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // specSameParts 判两份位号表是否等价(大小写与顺序无关 —— 位号是集合语义)。
