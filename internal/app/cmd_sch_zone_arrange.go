@@ -24,6 +24,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -372,7 +373,12 @@ func planZoneArrangeScene(zones map[string]*schZoneClaim, comps []layoutComp, wi
 		// 是与 phase B(newZaSearch)同源的那一份域,选形与门共用它。
 		plan, ferr := planZoneFollowGated(name, groups, zopts, zfDomainFor(*sheet, keepout, opts))
 		if ferr != nil {
-			return nil, fmt.Errorf("phase A(%s): %w", name, ferr)
+			// 失败也要带出**这一区的端子明细**:phase A 一挂就只剩一行错误、
+			// `--json` 连 JSON 都不出(2026-08-26 实测:照着那一行反复试了 4 轮
+			// 也定位不到是哪支端子、走的哪条支路)。err 里挂上诊断,调用方
+			// (--json)照常序列化,人也能一眼看到每支端子的 kind/net/side/pin。
+			return nil, &zoneArrangePhaseAError{Zone: name, Err: ferr,
+				Groups: zaDiagGroups(groups)}
 		}
 		rawW, rawH := zoneArrangeRawFrame(raw, opts, noteSizes[name].H)
 		home := [2]float64{(raw.MinX + raw.MaxX) / 2, (raw.MinY + raw.MaxY) / 2}
@@ -477,6 +483,18 @@ A4-only:装不下的出路是收敛或 ` + "`sch page-new`" + ` 拆页,不建议
 			opts := partitionOptsFrom(margin, gutter, titleBand)
 			out, scene, err := computeZoneArrange(pinnedCfg, win, docUUID, opts)
 			if err != nil {
+				// phase A 失败也要给得出诊断:`--json` 承诺机器可读,失败路径
+				// 尤其需要(成功时人还能看输出,失败时人只有这一份)。
+				var pa *zoneArrangePhaseAError
+				if errors.As(err, &pa) {
+					if asJSON && !apply {
+						if werr := pa.writeJSON(stdout); werr != nil {
+							return werr
+						}
+						return fmt.Errorf("%v", pa)
+					}
+					zaDiagText(stderr, pa)
+				}
 				return err
 			}
 			if asJSON && !apply {

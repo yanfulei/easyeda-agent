@@ -584,7 +584,7 @@ func zfPlaceMeasuredTerms(out *zfPlacedGroup, terms []zfTerm, dirOf func(zfTerm)
 	for _, t := range terms {
 		dir := dirOf(t)
 		lateral := dir == "left" || dir == "right"
-		yields := !lateral || t.Kind == "netflag"
+		yields := zfTermYields(dir, t.Kind)
 		off := zfStub
 		var marker layoutBBox
 		// 让位循环:撞上同侧已放的盒就沿桩线方向让开「自己这一支的占地 + gap」。
@@ -627,14 +627,60 @@ func zfOverlapsAny(b layoutBBox, others []layoutBBox) bool {
 	return false
 }
 
+// zfTermYields 是「这支端子参不参与同侧让位」的**唯一**谓词 —— 让位循环
+// (zfPlaceMeasuredTerms)与 R5 检查(zfCheckTermOverlap)必须问同一个函数。
+//
+// 规则本身是首版就定下的(逐字保留):
+//
+//	左/右侧  只有旗(netflag)让位。port 恒水平、高 11 < 最小 pin pitch,保持短桩
+//	         不参与梯次 —— 把 port 也拉进来会当场毁掉版面(真机 U3 SOP-16:让 port
+//	         出让就得躲开 75 宽的相邻标签,区框 353→443,phase B 当场 blocked)。
+//	         port 那几个单位的重叠是 `sch check` 的账(marker-overlap / destagger),
+//	         不是布局器的。
+//	上/下侧  所有 kind 都参与 —— 那一侧的标签是竖起来的,谁压谁都是真压。
+//
+// **为什么 R5 也要问它**(2026-08-26 实测):让位的参与集与 R5 的检查集过去不一致 ——
+// 侧面的 netport 不让位、也不进 placedBySide,于是同侧的 netflag 以为左边没人、
+// 用默认桩长放下,正好压在 port 标签上;而 R5 检查**所有**端子,当场判死。
+// POWER 页 J2(KF301:VIN_EXT 是 netport、GND 是 netflag,两脚都在左缘)就是这样
+// 被自己的规划器判死的 —— 让位器不管的东西,判据不该拿它判死,否则就是
+// 「拦得住却放不开」。真正的自短路(同向且桩线共线)由 zfCheckPassiveOpposed
+// 单独把关,不受这条影响。
+func zfTermYields(dir, kind string) bool {
+	lateral := dir == "left" || dir == "right"
+	return !lateral || kind == "netflag"
+}
+
 // zfCheckTermOverlap 是 R5 的可执行形式:同件端子几何互不重叠。
 // 单独校验,不假设 R3 蕴含它 —— 判定与生成分离。
+//
+// **判据必须与 zfMarkerCollides 是同一把尺**(2026-08-26 实测):这里过去用裸
+// boxesOverlap「碰到就算」,而 zfMarkerCollides / `sch check` 的 marker-overlap
+// 用的是 overlapExtent + schMarkerOverlapEps 噪声地板。两把尺的后果是
+// POWER 页 J2(KF301-2P,两脚同侧、y 差 10)因为两支旗**擦边接触**被判自短路、
+// 整页 phase A 停手,而 `sch check` 对同一张画布一条 marker-overlap 都不报 ——
+// 规划器比判据严,于是「拦得住却放不开」。
+// 同文件 zfMarkerCollides 的注释早就写明了这条纪律,R5 这处漏了。
 func zfCheckTermOverlap(g zfPlacedGroup) error {
 	for i := 0; i < len(g.Terms); i++ {
 		for j := i + 1; j < len(g.Terms); j++ {
-			if boxesOverlap(g.Terms[i].BBox, g.Terms[j].BBox) {
-				return fmt.Errorf("%s: 端子重叠 %s(%s) × %s(%s) —— R5 硬不变式(自短路防线)",
-					g.Designator, g.Terms[i].Net, g.Terms[i].Dir, g.Terms[j].Net, g.Terms[j].Dir)
+			// 检查集 = 让位参与集(zfTermYields)。有一方压根不让位,这处重叠
+			// 布局器就无从解决 —— 判死它只会把一张合法拓扑挡在门外。
+			if !zfTermYields(g.Terms[i].Dir, g.Terms[i].Kind) ||
+				!zfTermYields(g.Terms[j].Dir, g.Terms[j].Kind) {
+				continue
+			}
+			if zfMarkerCollides(g.Terms[i].BBox, g.Terms[j].BBox) {
+				a, b := g.Terms[i], g.Terms[j]
+				ox, oy, _ := overlapExtent(a.BBox, b.BBox)
+				// 拒绝必须给得出**下一步** —— 只报「R5 硬不变式」等于把人挡在
+				// 门外还不说门在哪(2026-08-26 实测:照着这条错误反复试了 4 轮)。
+				return fmt.Errorf("%s: 端子标签重叠 %s(%s) × %s(%s),重叠 %.1f×%.1f > 容差 %g —— "+
+					"R5 硬不变式(自短路防线):两支标签叠在一起,平台会把相接的导线合并成一根,两张网当场并成一张。"+
+					"下一步二选一:① 把其中一支改派到本体另一条边(无源件转竖后由 R3「电源上 / GND 下」自然分开);"+
+					"② 若两脚本来就该同侧(KF301 这类端子),用 `easyeda sch list --include-pins` 核对两只引脚的实测坐标 —— "+
+					"两脚间距足够时标签本不该叠,叠了通常是桩长(offset)取值让它们撞上,减小其中一支的 offset 即可",
+					g.Designator, a.Net, a.Dir, b.Net, b.Dir, ox, oy, schMarkerOverlapEps)
 			}
 		}
 	}
