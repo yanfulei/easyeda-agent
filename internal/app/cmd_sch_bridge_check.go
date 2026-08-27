@@ -81,6 +81,10 @@ type bridgeReport struct {
 	Passed  bool          `json:"passed"`
 	Summary bridgeSummary `json:"summary"`
 	Trees   []bridgeTree  `json:"trees"`
+	// ToolProbes 是**工具自己**留下的探测残留(见 sch_tool_probe_residue.go),
+	// 已从 Trees / Summary 里摘出:它不是板子的问题,不该让 gate 挂掉,
+	// 但必须报出来 —— 静默忽略等于让垃圾永远留在画布上。
+	ToolProbes []bridgeTree `json:"toolProbes,omitempty"`
 }
 
 // runSchBridgeCheck runs the read-only tree-granularity bridge/orphan detection,
@@ -145,7 +149,37 @@ func parseBridgeReport(result map[string]any) (bridgeReport, error) {
 			}
 		}
 	}
+	// 工具自己的探测残留不算板子的问题(sch_tool_probe_residue.go):连接器的
+	// 旋转探测旗删除失败留在画布上,过去被算成一条 orphan-flag,`sch gate --strict`
+	// 当场 FAIL —— 电路完全正确的板子过不了自己的门。摘出来单独报,并重算计数
+	// (summary 与 trees 必须是同一份事实)。
+	real, probes := splitToolProbeResidue(rep.Trees)
+	if len(probes) > 0 {
+		rep.Trees = real
+		rep.ToolProbes = probes
+		rep.Summary = recountBridgeSummary(rep.Summary, real)
+		rep.Passed = rep.Summary.Bridges == 0
+	}
 	return rep, nil
+}
+
+// recountBridgeSummary 按摘完探测残留的树重算逐型计数。WireTreesTotal 是画布
+// 事实(总树数),不随分类改变 —— 探测旗确实占着一棵树。
+func recountBridgeSummary(s bridgeSummary, trees []bridgeTree) bridgeSummary {
+	out := bridgeSummary{WireTreesTotal: s.WireTreesTotal, Trees: len(trees)}
+	for _, t := range trees {
+		switch strings.ToUpper(t.Kind) {
+		case "BRIDGE":
+			out.Bridges++
+		case "ORPHAN":
+			out.Orphans++
+		case "ORPHAN_FLAG":
+			out.OrphanFlags++
+		case "ORPHAN_TREE":
+			out.OrphanTrees++
+		}
+	}
+	return out
 }
 
 func renderBridgeReport(rep bridgeReport, w io.Writer) {
@@ -180,6 +214,15 @@ func renderBridgeReport(rep bridgeReport, w io.Writer) {
 		if len(t.FlagIds) > 0 {
 			fmt.Fprintf(w, "          flags: %s\n", strings.Join(t.FlagIds, ", "))
 		}
+	}
+
+	// 工具自己的探测残留:不计进上面的账(它不是板子的问题、不该让 gate 挂掉),
+	// 但必须报出来并给一条能直接抄去跑的清理命令 —— 静默忽略等于让垃圾长住画布。
+	if len(rep.ToolProbes) > 0 {
+		ids := toolProbeResidueIDs(rep.ToolProbes)
+		fmt.Fprintf(w, "  NOTE   tool-probe-residue  %d 个**工具自己**的探测残留(不计入上面的问题数):"+
+			"连接器测旋转语义时造的一次性探测旗没删干净(平台删除会撒谎)。\n", len(rep.ToolProbes))
+		fmt.Fprintf(w, "         清掉它:easyeda sch prim-delete --ids %s\n", strings.Join(ids, ","))
 	}
 
 	if rep.Passed {
