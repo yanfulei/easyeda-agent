@@ -234,7 +234,14 @@ WARN orphan-flag ORPHAN_FLAG nets=[__ROTPROBE__]  flags: 2693f1f2f947e107
 orphan 账，但**报出来**并给一条可直接抄的 `prim-delete`。判据是精确网名（用户自己的
 `PROBE_5V` 不会被误摘）；挂着真网名的树不算残留。真机：`gate --strict` FAIL → PASS。
 
-**仍未做（治本）**：连接器侧给那句 delete 补回读验证 + 重试。需要重打 `.eext` 并重装。
+**治本也已修**（commit `25b0740`，连接器 v1.2.8）：delete → 回读 → 重试（至多 3 轮），
+仍在就经 `eda.sys_Log` 记一条并附清理命令。
+
+> **订正**：我原先说治本「需要重打 .eext 并重装」——**不必**。项目里有已实测的热加载链路
+> （`docs/dev-environment.md` §5）：WS 文件服务器 + `debug.exec_js` 灌 IndexedDB + bump
+> version → reload，不卸载、不重导入、不重启 EasyEDA。本次 `connectorVersion`
+> 1.2.7 → 1.2.8 当场生效，并在真机验证了 `presentBeforeDelete=true →
+> presentAfterDelete=false` 这条不变式（回读确实能证明删除是否生效）。
 
 ---
 
