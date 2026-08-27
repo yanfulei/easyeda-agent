@@ -5379,13 +5379,46 @@ async function detectRotationNegation(): Promise<boolean> {
 				break;
 			}
 		}
-		await eda.sch_PrimitiveComponent.delete([pid]);
+		await deleteProbeVerified(pid);
 		rotationNegates = stored === 270;
 	}
 	catch {
 		rotationNegates = false;
 	}
 	return rotationNegates;
+}
+
+// Delete the one-shot rotation probe and PROVE it is gone.
+//
+// A bare `delete([pid])` is not enough: the platform's delete LIES (it resolves
+// truthy while the primitive survives — the same defect that forces batched
+// deletes + read-back everywhere else in this file). When it lied here, the
+// probe flag stayed on the canvas forever, and `sch bridge-check` counted it as
+// an orphan-flag — which made `sch gate --strict` (the S5 per-page gate) FAIL on
+// an electrically perfect board (2026-08-26, esp32MiniRequire E2E).
+//
+// So: delete, re-read, retry. Give up loudly via sys_Log rather than silently —
+// the daemon-side classifier (sch_tool_probe_residue.go) still recognises the
+// residue by net name and tells the user how to clear it, but a probe that
+// leaked is a connector bug we want visible in the log too.
+async function deleteProbeVerified(pid: string): Promise<void> {
+	const log = (m: string) => { try { eda.sys_Log.add(`[rotprobe] ${m}`); } catch { /* ignore */ } };
+	const stillThere = async (): Promise<boolean> => {
+		for (const c of await eda.sch_PrimitiveComponent.getAll()) {
+			if (c.getState_PrimitiveId() === pid) return true;
+		}
+		return false;
+	};
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		try { await eda.sch_PrimitiveComponent.delete([pid]); }
+		catch (e) { log(`delete attempt ${attempt} threw: ${e}`); }
+		if (!(await stillThere())) {
+			if (attempt > 1) log(`probe ${pid} deleted on attempt ${attempt}`);
+			return;
+		}
+		log(`delete reported success but probe ${pid} survived (attempt ${attempt})`);
+	}
+	log(`probe ${pid} LEAKED after 3 attempts — clear it with \`sch prim-delete --ids ${pid}\``);
 }
 
 // Value to PASS so the flag's STORED rotation equals `desired` (what the linter reads).

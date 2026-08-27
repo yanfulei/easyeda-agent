@@ -4,6 +4,28 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.8] — 2026-08-27
+
+### Fixed — 旋转探测旗删不掉就漏在画布上,拖垮 `sch gate --strict`
+
+`detectRotationNegation()` 为测平台的旋转语义(createNetFlag 在某些 build 上**存储
+取负**)会在离画布极远处造一支一次性探测旗 `__ROTPROBE__`,读回 rotation 再删掉。
+
+那句 `delete` **没有回读验证** —— 而「删除撒谎」是本仓在别处早已按批处理 + 回读
+兜住的平台已知病(delete 返回真值而图元仍在);delete 抛错还会被 `catch` 吞掉。
+一旦撒谎,探测旗就永久留在画布上。
+
+代价不在电路,在**判据**:`sch bridge-check` 把它算成一条 orphan-flag,于是
+`sch gate --strict`(S5 逐页门用的就是它)在一块电路完全正确的板子上 FAIL
+(2026-08-26 esp32MiniRequire 端到端实测,POWER 页)。
+
+现在 delete → 回读 → 重试(至多 3 轮),仍在就经 `eda.sys_Log` 明着记一条并附上
+清理命令 —— 沙箱里 `console` 是死代码,sys_Log 是唯一诊断出口。
+
+> daemon 侧另有一层收口(`sch_tool_probe_residue.go`):按网名把探测残留归类成
+> 「工具自己的垃圾」,不计进板子的 orphan 账但照常报出 + 给清理命令。那一层对
+> **已经装好的**旧连接器立即生效;这一层才是治本。
+
 ## [1.2.7] — 2026-08-26
 
 ### Fixed — 图签**其实一直能写**:是回读太早把成功报成了失败(#186)
