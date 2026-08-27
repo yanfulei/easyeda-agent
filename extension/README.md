@@ -15,15 +15,15 @@ Skill / CLI -> Go daemon -> EDA Agent Connector -> 官方 eda.* API
 
 AI 从空白页开始生成原理图——不是生成一张电路图图片,而是在编辑器里一步步执行 typed actions,放真实 LCSC 库件、连真实导线:
 
-![AI 在 EasyEDA 中从空白页生成原理图](https://image.lceda.cn/extensions/images/ef5b8c6950034244b68d08ccd4080de4.png)
+![AI 在 EasyEDA 中从空白页生成原理图](images/demo-schematic-generation.png)
 
 切到 PCB:自动布局、板框贴合、铺铜、丝印,全程在真实画布上执行并回读校验:
 
-![AI 在 EasyEDA 中完成 PCB 布局、板框和铺铜](https://image.lceda.cn/extensions/images/dc39ac080e6c46a5a267e6db142cdc86.gif)
+![AI 在 EasyEDA 中完成 PCB 布局、板框和铺铜](images/demo-pcb-layout.gif)
 
 由 agent 驱动完整 PCB 流程产出的 ESP32-S3 成品板:自动布局 -> 板框贴合 -> 规则感知布线 -> 4 层电源平面 -> 丝印碰撞避让,DRC 在真实 EasyEDA 画布上验证通过:
 
-![ESP32-S3 成品板:4 层电源平面 + 圆角板框 + 位号对齐](https://image.lceda.cn/extensions/images/4bc708fd5af1463c88cd0bf388bcdcab.png)
+![ESP32-S3 成品板:4 层电源平面 + 圆角板框 + 位号对齐](images/demo-esp32-board.png)
 
 ## v1.0.0:原理图功能正式上线
 
