@@ -61,7 +61,7 @@ func (d *gateFakeDaemon) handle(w http.ResponseWriter, r *http.Request) {
 
 	dry, _ := req.Payload["dryRun"].(bool)
 	isPcb := strings.HasPrefix(req.Action, "pcb.")
-	mutates := isPcb && gateFakeMutates[req.Action] && !dry
+	mutates := isPcb && gateFakeMutates[req.Action] && !(dry && gateFakeSupportsDryRun[req.Action])
 	isRead := isPcb && !mutates
 
 	// BLOCK:门关着 + 这是一次 pcb 读 + 没带 forceReason → 拒。
@@ -136,6 +136,12 @@ var gateFakeMutates = map[string]bool{
 	"pcb.import_changes":   true,
 }
 
+// Keep the fake daemon's preview semantics explicit, just like the production
+// catalog. A caller-supplied dryRun field on any other mutation is still a write.
+var gateFakeSupportsDryRun = map[string]bool{
+	"pcb.page.clear": true,
+}
+
 func newGateFakeDaemon(t *testing.T) (*appConfig, *gateFakeDaemon) {
 	t.Helper()
 	d := &gateFakeDaemon{
@@ -194,6 +200,7 @@ func TestStaleReadEligibleRequestNarrowing(t *testing.T) {
 		{"原理图读(门管不着)", "schematic.components.list", nil, false},
 		{"page.clear 实删", "pcb.page.clear", map[string]any{"dryRun": false}, false},
 		{"page.clear 预览", "pcb.page.clear", map[string]any{"dryRun": true}, true},
+		{"普通写入伪造 dryRun", "pcb.line.create", map[string]any{"dryRun": true}, false},
 		{"page.clear 无载荷", "pcb.page.clear", nil, false},
 	}
 	for _, c := range cases {
