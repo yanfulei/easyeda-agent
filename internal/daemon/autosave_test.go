@@ -96,6 +96,29 @@ func TestMutatesActionMap(t *testing.T) {
 	}
 }
 
+func TestDryRunRequiresCatalogDeclaration(t *testing.T) {
+	for _, action := range []string{"schematic.page.clear", "pcb.page.clear", "pcb.beautify"} {
+		if !supportsDryRunAction[action] {
+			t.Fatalf("%s must explicitly declare SupportsDryRun", action)
+		}
+		if requestMutates(&protocol.Request{Action: action, Payload: map[string]any{"dryRun": true}}) {
+			t.Errorf("declared preview %s must not count as a mutation", action)
+		}
+	}
+	for _, action := range []string{"schematic.component.place", "pcb.line.create", "pcb.route.rip_up", "unknown.action"} {
+		if supportsDryRunAction[action] {
+			t.Fatalf("%s must not be in the dry-run allowlist", action)
+		}
+		req := &protocol.Request{Action: action, Payload: map[string]any{"dryRun": true}}
+		if mutatesAction[action] && !requestMutates(req) {
+			t.Errorf("unsupported dryRun=true on %s must remain a mutation", action)
+		}
+		if action == "schematic.component.place" && !requestWriteSensitive(req) {
+			t.Error("unsupported dryRun=true on schematic.component.place must remain write-sensitive")
+		}
+	}
+}
+
 func TestRequestWriteSensitiveIncludesContextChangesWithoutCallingThemMutations(t *testing.T) {
 	for _, action := range []string{"document.open", "document.close", "schematic.page.open"} {
 		req := &protocol.Request{Action: action}

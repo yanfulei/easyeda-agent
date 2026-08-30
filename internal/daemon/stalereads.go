@@ -53,10 +53,11 @@ import (
 //     bypasses /action entirely (dispatchSave), so neither path false-flags.
 //   - pcb.pour.rebuild: it is the FIX for stale pour connectivity, not a new
 //     hazard — it clears instead.
-//   - any request carrying `dryRun:true`: the catalog's Mutates flag is
-//     action-name granular and cannot see that a preview enumerates without
-//     touching the board. `pcb clear --dry-run` used to arm the flag and make
-//     every later read cry stale on an untouched board (issue #112).
+//   - a request carrying `dryRun:true` **only when its ActionSpec explicitly
+//     supports previews**: the payload is untrusted, so an arbitrary field on
+//     a real mutation must not suppress stale tracking or write safety gates.
+//     `pcb clear --dry-run` used to arm the flag and make every later read cry
+//     stale on an untouched board (issue #112).
 //   - view-only editor state (staleViewOnlyActions): added when the advisory
 //     became a refusal, because a false positive now costs a failed command
 //     instead of a stderr line. See that var for the argument.

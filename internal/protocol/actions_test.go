@@ -60,6 +60,35 @@ func TestEveryActionPublishesAnEffectiveTimeout(t *testing.T) {
 	}
 }
 
+func TestDryRunMetadataIsExplicitAndMatchesInputs(t *testing.T) {
+	want := map[string]bool{
+		"schematic.page.clear": true,
+		"pcb.page.clear":       true,
+		"pcb.beautify":         true,
+	}
+	for _, action := range AllActions() {
+		hasDryRunInput := false
+		for _, input := range action.Inputs {
+			if strings.HasPrefix(strings.TrimSpace(input), "dryRun") {
+				hasDryRunInput = true
+				break
+			}
+		}
+		if action.SupportsDryRun != hasDryRunInput {
+			t.Errorf("%s SupportsDryRun=%v but dryRun input present=%v", action.Name, action.SupportsDryRun, hasDryRunInput)
+		}
+		if action.SupportsDryRun && !want[action.Name] {
+			t.Errorf("unexpected dry-run action %s; review daemon write classification", action.Name)
+		}
+		if action.SupportsDryRun {
+			delete(want, action.Name)
+		}
+	}
+	for action := range want {
+		t.Errorf("expected dry-run action %s is missing from catalog", action)
+	}
+}
+
 func TestConnectPinActionDocumentsYUpContract(t *testing.T) {
 	var description string
 	for _, action := range AllActions() {

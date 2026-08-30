@@ -181,22 +181,17 @@ func staleReadOptIn(cfg *appConfig, reason string) *appConfig {
 // `pcb clear` 的收尾「还剩多少」计数就在这个洞里(runPcbClearVerified:
 // pass2 clear 之后那次 dry-run 计数)。
 //
-// 仍然目录驱动:哪些动作**支持** dryRun 直接从 Inputs 声明里读("dryRun optional …"),
-// 所以新增一个可 dry-run 的动作自动归位。三个收窄条件一个不放:PCB 域、
+// 仍然目录驱动:哪些动作**支持** dryRun 直接从 ActionSpec.SupportsDryRun
+// 声明,所以新增一个可 dry-run 的动作自动归位。三个收窄条件一个不放:PCB 域、
 // 无阶段门(RequiresGate == "",堵死「顺手解锁布线门」)、且必须真的带 dryRun:true
 // 才生效(见 staleReadEligibleRequest)—— 一个 dryRun:true 的请求按定义不落画布。
 var staleReadDryRunEligible = func() map[string]bool {
 	m := map[string]bool{}
 	for _, a := range protocol.AllActions() {
-		if a.Domain != protocol.DomainPcb || !a.Mutates || a.RequiresGate != "" {
+		if a.Domain != protocol.DomainPcb || !a.Mutates || a.RequiresGate != "" || !a.SupportsDryRun {
 			continue
 		}
-		for _, in := range a.Inputs {
-			if strings.HasPrefix(strings.TrimSpace(in), "dryRun") {
-				m[a.Name] = true
-				break
-			}
-		}
+		m[a.Name] = true
 	}
 	return m
 }()

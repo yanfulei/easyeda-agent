@@ -18,6 +18,10 @@ type ActionSpec struct {
 	Domain  Domain `json:"domain"`
 	Phase   int    `json:"phase"`
 	Mutates bool   `json:"mutates"`
+	// SupportsDryRun is true only when payload.dryRun=true is a real preview
+	// understood by the connector handler. A generic payload flag must never
+	// downgrade an arbitrary mutation and bypass the daemon's write gates.
+	SupportsDryRun bool `json:"supportsDryRun,omitempty"`
 	// ChangesContext marks actions that switch or close the foreground editor
 	// without changing document contents. They stay read-only for autosave and
 	// workflow purposes, but must be serialized like writes after an abandoned
@@ -256,16 +260,17 @@ func AllActions() []ActionSpec {
 			Outputs:      []string{"ok"},
 		},
 		{
-			Name:         "schematic.page.clear",
-			Domain:       DomainSchematic,
-			Phase:        1,
-			Mutates:      true,
-			NeedsWindow:  true,
-			NeedsConfirm: true,
-			Description:  "Clear the ACTIVE schematic page: delete every page-level primitive — components, net flags/ports/labels (all are components), wires, buses, and graphics (arcs/circles/rectangles/polygons/text) — optionally preserving the sheet/title block (图框). schematic.component.delete only removes components and silently leaves wires/buses/graphics behind, so the page looks clean in components.list while residual primitives remain; use this for a true page reset (generate → detect → clear → retry). No undo — dryRun reports counts without deleting.",
-			Inputs:       []string{"preserveSheet optional (default true)", "dryRun optional (default false)"},
-			Outputs:      []string{"deleted (counts by primitive type)", "total", "deletedIds", "preserveSheet", "dryRun"},
-			VerifyWith:   []string{"schematic.components.list"},
+			Name:           "schematic.page.clear",
+			Domain:         DomainSchematic,
+			Phase:          1,
+			Mutates:        true,
+			SupportsDryRun: true,
+			NeedsWindow:    true,
+			NeedsConfirm:   true,
+			Description:    "Clear the ACTIVE schematic page: delete every page-level primitive — components, net flags/ports/labels (all are components), wires, buses, and graphics (arcs/circles/rectangles/polygons/text) — optionally preserving the sheet/title block (图框). schematic.component.delete only removes components and silently leaves wires/buses/graphics behind, so the page looks clean in components.list while residual primitives remain; use this for a true page reset (generate → detect → clear → retry). No undo — dryRun reports counts without deleting.",
+			Inputs:         []string{"preserveSheet optional (default true)", "dryRun optional (default false)"},
+			Outputs:        []string{"deleted (counts by primitive type)", "total", "deletedIds", "preserveSheet", "dryRun"},
+			VerifyWith:     []string{"schematic.components.list"},
 		},
 		{
 			Name:        "schematic.rename",
@@ -1052,6 +1057,7 @@ func AllActions() []ActionSpec {
 			Domain:           DomainPcb,
 			Phase:            2,
 			Mutates:          true,
+			SupportsDryRun:   true,
 			NeedsWindow:      true,
 			NeedsConfirm:     true,
 			Description:      "One-shot PCB reset — the symmetric counterpart of schematic.page.clear. Enumerates and deletes every board CONTENT primitive: components, copper routing (tracks/arcs/vias on copper layers), copper areas (pours/fills), keep-out/rule regions, and free silkscreen artwork (strings + graphic lines/arcs on silk layers 3/4 only — copper-layer text and mechanical/assembly artwork are preserved). pcb.component.delete only removes components and silently leaves routing/pours/regions/silk behind (the board looks empty in components.list while copper remains), so use this for a true board reset (generate → detect → clear → retry). PRESERVES locked primitives and the board outline (layer 11) by default — the outline is a layout prerequisite, mirroring how schematic.page.clear keeps the sheet/图框. Set includeLocked=true to also delete locked primitives (danger), preserveOutline=false to also delete the board outline. `only` narrows to a comma list / string[] subset of {components,routing,copper,regions,silk} (omit = all). No undo — dryRun reports the counts-by-type without deleting anything; a per-class batch-delete that returns false surfaces in `failed` + `warnings`.",
@@ -1343,6 +1349,7 @@ func AllActions() []ActionSpec {
 			Domain:           DomainPcb,
 			Phase:            2,
 			Mutates:          true,
+			SupportsDryRun:   true,
 			NeedsWindow:      true,
 			Description:      "Beautify already-routed copper tracks (走线美化): round sharp corners into arcs on the ACTIVE PCB — the routing-aesthetics post-process. Groups connected same-net/same-layer segments into polylines, fillets each interior corner (radius = max(width)*cornerRadiusRatio), then deletes the originals and creates the trimmed lines + arcs. Diff-pair/equal-length nets get concentric-arc protection (best-effort; falls back to straight if the diff-pair/equal-length API is absent on this build). Deleting+recreating tracks makes same-net pour bonding stale, so it runs a DRC binary-search repair (shrinks or straightens violating corners) then rebuilds copper pours. `dryRun` computes the plan WITHOUT mutating — safe to preview on any board. Copper layers only (TOP/BOTTOM/inner); never touches silkscreen/outline. Algorithm absorbed from Easy_EDA_PCB_Beautify (m-RNA, Apache-2.0). PCB must be the active/foreground tab. Save at a known-good checkpoint after.",
 			Inputs:           []string{"scope (all|selected, default all)", "net optional (single) OR nets optional ([]string — beautify only these nets)", "layer optional", "cornerRadiusRatio optional (default 3)", "forceArc optional (default false)", "mergeTransitionSegments optional (default false)", "protect optional (diff/equal-length, default true)", "drc optional (default true)", "drcRetryCount optional (default 4)", "rebuildPour optional (default true)", "dryRun optional (default false)"},

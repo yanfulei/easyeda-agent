@@ -250,4 +250,7 @@ func TestIsDryRunRequest(t *testing.T) {
 	if isDryRunRequest(nil) {
 		t.Error("nil request must not be treated as a dry run")
 	}
+	if isDryRunRequest(staleReq("schematic.component.place", "w1", map[string]any{"dryRun": true})) {
+		t.Error("an undeclared dryRun field must never downgrade a placement to a preview")
+	}
 }

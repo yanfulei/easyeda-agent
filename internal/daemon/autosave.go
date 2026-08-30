@@ -38,14 +38,23 @@ var changesContextAction = func() map[string]bool {
 	return m
 }()
 
-// dryRunPayloadField is the payload key every dry-runnable action uses to mark a
-// request as a PREVIEW. It is a project-wide convention, not a per-action one:
-// the actions that forward a preview flag to the connector (pcb.page.clear,
-// schematic.page.clear, pcb.beautify) all send exactly `dryRun`, and every other
-// `--dry-run` CLI flag (mount-holes / power-planes / pour-fit / route-short /
-// autoconnect …) short-circuits inside the CLI and never dispatches a mutating
-// action at all. Keeping one key means the daemon needs no per-action catalog
-// entry to tell a preview from a write (issue #112).
+// supportsDryRunAction is catalog-owned. The payload is untrusted input; only
+// handlers that explicitly declare a dry-run preview may use dryRun=true to
+// become a read. An arbitrary dryRun=true field on a write remains a real
+// mutation and keeps all write safety gates armed.
+var supportsDryRunAction = func() map[string]bool {
+	m := map[string]bool{}
+	for _, a := range protocol.AllActions() {
+		if a.SupportsDryRun {
+			m[a.Name] = true
+		}
+	}
+	return m
+}()
+
+// dryRunPayloadField is the payload key every catalog-declared dry-runnable
+// action uses to mark a request as a PREVIEW. Other CLI --dry-run flags
+// short-circuit before dispatch and therefore do not need a daemon request.
 const dryRunPayloadField = "dryRun"
 
 // isDryRunRequest reports whether a request is a preview that changes nothing.
@@ -53,7 +62,7 @@ const dryRunPayloadField = "dryRun"
 // which is the safe direction to err (a missed preview only costs a redundant
 // save; a misread write would lose the safety net entirely).
 func isDryRunRequest(req *protocol.Request) bool {
-	if req == nil {
+	if req == nil || !supportsDryRunAction[req.Action] {
 		return false
 	}
 	v, ok := req.Payload[dryRunPayloadField]
@@ -65,9 +74,8 @@ func isDryRunRequest(req *protocol.Request) bool {
 }
 
 // requestMutates reports whether a request actually changes the document: the
-// catalog's Mutates flag (action-name granularity) MINUS dry-run previews, which
-// the catalog cannot see. `pcb.page.clear --dry-run` only enumerates, so it must
-// neither arm autosave nor the stale-read guard (issue #112).
+// catalog's Mutates flag minus previews explicitly supported by that same
+// catalog. An arbitrary dryRun=true field remains a real write.
 func requestMutates(req *protocol.Request) bool {
 	return req != nil && mutatesAction[req.Action] && !isDryRunRequest(req)
 }

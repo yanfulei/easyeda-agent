@@ -25,6 +25,8 @@ follow [SemVer](https://semver.org/).
   占用等情况增加 worker deadline、看门狗和 id 轮换;自动保存避开在途写与制造租约。
 - 原理图 note/titleblock/zone 写入补齐写后回读、异步落定与幂等恢复路径,避免平台
   `ok` 回执和真实画布状态不一致时误判成功或盲重试。
+- dry-run 预览现在由 action catalog 显式声明;任意写动作附带伪造的
+  `dryRun:true` 不再绕过 fingerprint、阶段门、租约、autosave 或 stale-read 保护。
 
 ### Packaging — 四件套统一为同一 release
 
