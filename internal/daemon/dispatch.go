@@ -410,6 +410,13 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		// of silence. See queueblock.go.
 		s.armQueueProbe(target, &req, err)
 		errResp := errorResponse(req.ID, "DISPATCH_FAILED", "connector did not respond", err.Error())
+		// A timeout is different from a rejected request: the connector may
+		// have started the handler and only lost the response.  Surface that
+		// distinction in the protocol so an agent cannot blindly replay a
+		// document mutation and create a duplicate.  Read-only calls remain
+		// explicitly retryable; context switches are write-sensitive because a
+		// late switch can still change the foreground target.
+		annotateDispatchTimeout(&req, &errResp, err)
 		s.writeHealth.annotateDegraded(&req, &errResp)
 		s.audit.Append(fromResponse(started, &req, &errResp))
 		writeJSON(w, http.StatusGatewayTimeout, errResp)
@@ -641,4 +648,26 @@ func errorResponse(id, code, message, detail string) protocol.Response {
 			Detail:  detail,
 		},
 	}
+}
+
+// annotateDispatchTimeout records the only safe retry semantics for a
+// connector wait that expired at the daemon boundary. A handler may already
+// be running in the editor even though no response reached us, so mutations
+// and foreground context switches are uncertain and must be inspected before
+// any replay. Pure reads have no document side effect and can be retried.
+//
+// Keep this helper separate from errorResponse: most daemon refusals are known
+// zero-dispatch outcomes and should not inherit timeout uncertainty.
+func annotateDispatchTimeout(req *protocol.Request, resp *protocol.Response, err error) {
+	if req == nil || resp == nil || resp.Error == nil || !isTimeoutErr(err) {
+		return
+	}
+	// Keep the mutation bit as a defensive fallback.  The daemon normally
+	// stamps both fields before dispatch, but transitional callers/connectors
+	// may only carry Mutates; a mutation must never become blindly retryable
+	// merely because the newer superset field was absent.
+	uncertain := req.WriteSensitive || req.Mutates
+	retryable := !uncertain
+	resp.Error.Uncertain = &uncertain
+	resp.Error.Retryable = &retryable
 }
