@@ -13,10 +13,10 @@ The connector runs inside EasyEDA's webview, which shapes the transport:
 
 ## Startup
 
-1. For each port in `127.0.0.1:60832-60841` (`0xEDA0`-`0xEDA9`), open a WebSocket to `ws://127.0.0.1:PORT/eda` via `eda.sys_WebSocket.register`.
+1. Open a WebSocket to the fixed `ws://127.0.0.1:60832/eda` endpoint via `eda.sys_WebSocket.register`. A user-configured `daemonPorts` list is the explicit non-standard escape hatch.
 2. Wait briefly (~1.5s) for the daemon to send a `handshake` frame. Verify `service === "easyeda-agent"`.
 3. On a valid handshake, generate a `windowId` and send `register`, then `context`.
-4. Start a `ping`/`pong` heartbeat; on consecutive missed pongs or a socket error, re-scan and reconnect.
+4. Start a `ping`/`pong` heartbeat; on consecutive missed pongs or a socket error, reconnect with bounded exponential backoff. Rotate the activation-scoped WebSocket id after repeated silent registration failures.
 
 ## Required Messages
 

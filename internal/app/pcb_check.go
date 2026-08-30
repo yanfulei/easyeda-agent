@@ -321,7 +321,10 @@ func analyzePcbCheckFull(pads []pcbPadP, tracks []pcbTrack, vias []pcbViaP, arcs
 		}
 	}
 	rep.Summary.Total = len(rep.Findings)
-	rep.Passed = rep.Summary.Total == 0
+	// INFO is advisory by contract (for example, local fiducials are optional
+	// when JLCPCB adds them on the panel rail). Only actionable ERROR/WARN
+	// findings fail the check and manufacturing release gate.
+	rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 	return rep
 }
 
@@ -1704,7 +1707,7 @@ func gatherPcbCheckReport(cfg *appConfig, window string, couplingW float64, chec
 		rep.Summary.Warnings++
 		rep.Summary.Total++
 	}
-	rep.Passed = rep.Summary.Total == 0
+	rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 
 	// Copper-near-edge is a LIVE-only rule (needs the board outline). The floor is
 	// the live copper-to-edge rule (fallback: JLC routed-edge 8mil, doc §5.1
@@ -1728,7 +1731,7 @@ func gatherPcbCheckReport(cfg *appConfig, window string, couplingW float64, chec
 				rep.Summary.Warnings++
 				rep.Summary.Total++
 			}
-			rep.Passed = rep.Summary.Total == 0
+			rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 		}
 	}
 
@@ -1747,7 +1750,7 @@ func gatherPcbCheckReport(cfg *appConfig, window string, couplingW float64, chec
 				rep.Summary.Warnings++
 				rep.Summary.Total++
 			}
-			rep.Passed = rep.Summary.Total == 0
+			rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 		}
 	}
 
@@ -1787,7 +1790,7 @@ func gatherPcbCheckReport(cfg *appConfig, window string, couplingW float64, chec
 			}
 			rep.Summary.Total++
 		}
-		rep.Passed = rep.Summary.Total == 0
+		rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 	}
 
 	// Antenna keep-out is a LIVE-only rule (needs component bboxes + regions, which
@@ -1801,7 +1804,7 @@ func gatherPcbCheckReport(cfg *appConfig, window string, couplingW float64, chec
 			rep.Summary.Warnings++
 			rep.Summary.Total++
 		}
-		rep.Passed = rep.Summary.Total == 0
+		rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 	}
 
 	// Netless-pour + via-crosses-plane + floating-track-island + power-not-poured
@@ -1871,7 +1874,7 @@ func gatherPcbCheckReport(cfg *appConfig, window string, couplingW float64, chec
 			rep.Summary.Warnings++
 			rep.Summary.Total++
 		}
-		rep.Passed = rep.Summary.Total == 0
+		rep.Passed = rep.Summary.Errors == 0 && rep.Summary.Warnings == 0
 	}
 
 	return &rep, nil

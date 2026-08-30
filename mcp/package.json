@@ -1,6 +1,6 @@
 {
   "name": "easyeda-agent-mcp",
-  "version": "0.18.3",
+  "version": "1.2.11",
   "private": true,
   "type": "module",
   "description": "Local stdio MCP adapter for easyeda-agent",

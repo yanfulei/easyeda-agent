@@ -1,9 +1,19 @@
 # easyeda-agent MCP
 
-Local stdio MCP adapter over the existing `easyeda` CLI/daemon. It exposes 11
-tools: connection health, action discovery, one tool for each of the seven safe
-action domains, circuit blocks, and the guarded workflow state machine. The
-arbitrary-JavaScript debug domain is deliberately not exposed.
+Local stdio MCP adapter over the existing `easyeda` CLI/daemon. It exposes a
+catalog-driven set of domain and guarded workflow tools. Arbitrary JavaScript
+and order/checkout/payment/submit action families are deliberately not exposed.
+
+Release users should run the repository's idempotent installer. It downloads the
+sha256-verified MCP bundle with locked production dependencies and registers Codex
+when detected:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
+codex mcp get easyeda-agent --json
+```
+
+For source development:
 
 ```bash
 npm ci --ignore-scripts
@@ -11,7 +21,7 @@ EASYEDA_BIN=/absolute/path/to/easyeda npm test
 EASYEDA_BIN=/absolute/path/to/easyeda npm start
 ```
 
-Codex registration:
+Manual Codex registration (re-adding the same name updates it in place):
 
 ```bash
 codex mcp add easyeda-agent \
@@ -21,9 +31,22 @@ codex mcp add easyeda-agent \
 
 The MCP process does not access EasyEDA directly. Mutations still pass through
 the Go daemon, connector, workflow gates, audit log, and official `eda.*` API.
-Mutating typed actions require both `project` and `doc`; use `easyeda_actions`
-before calling a domain tool to inspect its typed payload. Workflow operations
-use structured MCP fields instead of accepting arbitrary CLI options.
+Every schematic/PCB action (including read-only inspection and manufacturing
+exports) and every mutating typed action requires both `project` and `doc`. The
+CLI resolves these selectors to an exact project/document UUID binding, and
+rejects a `pcb.*` action aimed at a schematic (or the reverse). Catalog
+`timeoutMs` is forwarded to `easyeda call` instead of using one generic timeout.
+
+`easyeda_manufacturing_release` additionally requires the approved S0 `spec`.
+It will not publish a Gerber/BOM/CPL bundle unless strict intent validation,
+save/reload, PCB checks, native DRC, snapshot stability, and artifact audits all
+pass.
+
+Actions marked `needsConfirm` cannot run through ordinary domain tools. Call
+`easyeda_confirmed_action` with `operation=prepare`, review the returned target
+and hashes, then call it again with `operation=execute` and the token. Tokens are
+short-lived, single-use, and bound to the exact action, project, document,
+window, and payload.
 
 After registration, restart the MCP client so it discovers the new server. Run
 `easyeda_health` first, then use `easyeda_actions` to select the exact typed

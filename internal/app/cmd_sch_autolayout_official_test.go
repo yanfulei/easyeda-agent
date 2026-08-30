@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-const officialTestDocContext = `"context":{"documentUuid":"doc-1","documentType":"schematic"}`
+const officialTestDocContext = `"context":{"projectUuid":"project-1","documentUuid":"doc-1","documentType":"schematic"}`
 
 func officialTestOK(result string) string {
 	return fmt.Sprintf(`{"ok":true,"result":%s,%s}`, result, officialTestDocContext)

@@ -37,10 +37,9 @@ import (
 // State machine (per windowId, in-memory):
 //   SET    — a PCB-domain action with Mutates=true succeeds (catalog-driven,
 //            same source of truth as autosave), except the exempt sets below.
-//   CLEAR  — a `doc reload` completes. Reload is a CLI composite (save → close
-//            via debug.exec_js closeDocument → reopen), so the daemon keys on
-//            its unique discriminator: a successful debug.exec_js whose code
-//            calls closeDocument (a real close resets the per-doc engine
+//   CLEAR  — a `doc reload` completes. Reload is a CLI composite (save → typed
+//            document.close → reopen), so the daemon keys on the successful
+//            close action (a real close resets the per-doc engine
 //            state; a mere `doc switch`/document.open does NOT and must not
 //            clear). pcb.pour.rebuild also clears — it recomputes the pour
 //            connectivity that goes stale (pour-mediated Connection Errors).
@@ -106,6 +105,18 @@ var staleBlockExemptReads = map[string]bool{
 	"pcb.snapshot": true,
 }
 
+// staleIndependentReads are PCB-namespaced metadata calls whose result does
+// not come from the active PCB document's primitive/enumeration cache.
+//
+// pcb.documents.list reads the project document inventory. Blocking it after a
+// PCB mutation deadlocks the prescribed recovery path: `doc reload PCB1`
+// resolves the friendly name through this action before it can save, close and
+// reopen the document. The former classification surfaced as PCB1 disappearing
+// from `doc ls` while document.current still proved PCB1 was active.
+var staleIndependentReads = map[string]bool{
+	"pcb.documents.list": true,
+}
+
 // pcbStaleMarks reports whether a successful request should mark the window's
 // PCB engine state as possibly stale: any PCB-domain mutating request
 // (requestMutates = catalog Mutates minus dry-run previews, the same predicate
@@ -122,16 +133,19 @@ func pcbStaleMarks(req *protocol.Request) bool {
 // same engine state (so it earns the advisory) — `pcb clear --dry-run` on an
 // un-reloaded board is exactly the miscount that opened issue #112.
 func pcbStaleRead(req *protocol.Request) bool {
-	return docTypeForAction(req.Action) == "pcb" && !requestMutates(req)
+	return docTypeForAction(req.Action) == "pcb" && !requestMutates(req) &&
+		!staleIndependentReads[req.Action]
 }
 
 // pcbStaleClears reports whether a successful request resets the stale flag.
-// `doc reload` has no single typed action — its unique step is the
-// debug.exec_js closeDocument call (see package comment); pcb.pour.rebuild
+// `doc reload` has no single typed action — its unique step is document.close;
+// pcb.pour.rebuild
 // clears because rebuilding pours is the documented stale-connectivity fix.
 func pcbStaleClears(req *protocol.Request) bool {
 	switch req.Action {
 	case "pcb.pour.rebuild":
+		return true
+	case "document.close":
 		return true
 	case "debug.exec_js":
 		code, _ := req.Payload["code"].(string)

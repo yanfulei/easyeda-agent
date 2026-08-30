@@ -251,24 +251,36 @@ document afterward and reports it as "activeRestored", so the ★ does not drift
 // sub-call is pinned to the resolved windowId, so a second window appearing or a
 // single-window auto-target racing mid-command can't break it. Returns the
 // resolved windowId so a caller (e.g. `doc switch`) can pin its own follow-ups.
-// PCB-listing failures are tolerated (a project may have no PCB).
+// A project with no PCB returns a successful empty pcbs array. A listing error
+// is not equivalent: hiding it makes an active PCB disappear from `doc ls` and
+// turns the actionable error into a misleading "no document named" failure.
 func discoverDocs(cfg *appConfig, window string) (docs []openableDoc, activeUUID, resolvedWindow string, err error) {
+	docs, activeUUID, resolvedWindow, _, err = discoverDocsWithContext(cfg, window)
+	return docs, activeUUID, resolvedWindow, err
+}
+
+// discoverDocsWithContext is discoverDocs plus the live context sampled by its
+// document.current call. The --doc dispatch guard consumes that same sample to
+// bind the final request without inserting another action between confirmation
+// and dispatch.
+func discoverDocsWithContext(cfg *appConfig, window string) (docs []openableDoc, activeUUID, resolvedWindow string, current *actionContext, err error) {
 	resolvedWindow, err = resolveTargetWindow(cfg, window)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
 
 	cur, err := requestAction(cfg, "document.current", resolvedWindow, nil)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
+	current = cur.Context
 	if cur.Context != nil {
 		activeUUID = cur.Context.DocumentUUID
 	}
 
 	pages, err := requestAction(cfg, "schematic.pages.list", resolvedWindow, nil)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
 	for _, p := range mapsField(pages.Result, "pages") {
 		docs = append(docs, openableDoc{
@@ -279,16 +291,20 @@ func discoverDocs(cfg *appConfig, window string) (docs []openableDoc, activeUUID
 		})
 	}
 
-	// PCBs are optional — a schematic-only project legitimately has none.
-	if pcbs, perr := requestAction(cfg, "pcb.documents.list", resolvedWindow, nil); perr == nil {
-		for _, p := range mapsField(pcbs.Result, "pcbs") {
-			docs = append(docs, openableDoc{
-				UUID:   strField(p, "uuid"),
-				Type:   "pcb",
-				Name:   strField(p, "name"),
-				Parent: strField(p, "parentProjectUuid"),
-			})
-		}
+	// PCBs are optional, but the action itself is not: a schematic-only project
+	// returns {pcbs:[]}. Propagate transport/gate/SDK errors instead of silently
+	// converting them to an empty inventory.
+	pcbs, err := requestAction(cfg, "pcb.documents.list", resolvedWindow, nil)
+	if err != nil {
+		return nil, "", "", nil, fmt.Errorf("list PCB documents: %w", err)
+	}
+	for _, p := range mapsField(pcbs.Result, "pcbs") {
+		docs = append(docs, openableDoc{
+			UUID:   strField(p, "uuid"),
+			Type:   "pcb",
+			Name:   strField(p, "name"),
+			Parent: strField(p, "parentProjectUuid"),
+		})
 	}
 
 	for i := range docs {
@@ -302,7 +318,7 @@ func discoverDocs(cfg *appConfig, window string) (docs []openableDoc, activeUUID
 		}
 		return docs[i].Name < docs[j].Name
 	})
-	return docs, activeUUID, resolvedWindow, nil
+	return docs, activeUUID, resolvedWindow, current, nil
 }
 
 // resolveDoc maps a user-supplied name or uuid to exactly one openable doc.
@@ -390,15 +406,31 @@ func strField(m map[string]any, key string) string {
 // foreground first when it isn't already. Returns the document's type
 // ("pcb"/"schematic") so callers can branch.
 func reloadDocumentByUUID(cfg *appConfig, win, target string) (string, error) {
-	cur, err := requestAction(cfg, "document.current", win, nil)
+	return reloadDocumentByUUIDWithRuntime(cfg, win, target, reloadDocumentRuntime{
+		request: requestAction,
+		settle:  waitDocSettleFor,
+		sleep:   time.Sleep,
+		now:     time.Now,
+	})
+}
+
+type reloadDocumentRuntime struct {
+	request func(*appConfig, string, string, any) (*actionResult, error)
+	settle  func(*appConfig, string, string) bool
+	sleep   func(time.Duration)
+	now     func() time.Time
+}
+
+func reloadDocumentByUUIDWithRuntime(cfg *appConfig, win, target string, rt reloadDocumentRuntime) (string, error) {
+	cur, err := rt.request(cfg, "document.current", win, nil)
 	if err != nil {
 		return "", err
 	}
 	if cur.Context == nil || cur.Context.DocumentUUID != target || cur.Context.TabID == "" {
-		if _, err := requestAction(cfg, "document.open", win, map[string]any{"uuid": target}); err != nil {
+		if _, err := rt.request(cfg, "document.open", win, map[string]any{"uuid": target}); err != nil {
 			return "", err
 		}
-		cur, err = requestAction(cfg, "document.current", win, nil)
+		cur, err = rt.request(cfg, "document.current", win, nil)
 		if err != nil {
 			return "", err
 		}
@@ -411,27 +443,62 @@ func reloadDocumentByUUID(cfg *appConfig, win, target string) (string, error) {
 	if docType == "pcb" {
 		saveAction = "pcb.save"
 	}
-	if _, err := requestAction(cfg, saveAction, win, nil); err != nil {
+	saved, err := rt.request(cfg, saveAction, win, nil)
+	if err != nil {
 		return docType, fmt.Errorf("save before reload failed: %w", err)
 	}
-	closeJS := fmt.Sprintf("return await eda.dmt_EditorControl.closeDocument(%q)", cur.Context.TabID)
-	if _, err := requestAction(cfg, "debug.exec_js", win, map[string]any{"code": closeJS}); err != nil {
+	if err := requireConfirmedSave(saveAction, saved); err != nil {
+		return docType, fmt.Errorf("save before reload was not confirmed: %w", err)
+	}
+	closed, err := rt.request(cfg, "document.close", win, map[string]any{"tabId": cur.Context.TabID})
+	if err != nil {
 		return docType, fmt.Errorf("close document failed: %w", err)
 	}
-	time.Sleep(1 * time.Second)
-	if _, err := requestAction(cfg, "document.open", win, map[string]any{"uuid": target}); err != nil {
+	if err := requireConfirmedClose(closed); err != nil {
+		return docType, fmt.Errorf("close document was not confirmed: %w", err)
+	}
+	rt.sleep(1 * time.Second)
+	if _, err := rt.request(cfg, "document.open", win, map[string]any{"uuid": target}); err != nil {
 		return docType, fmt.Errorf("reopen after close failed: %w", err)
 	}
 	// Poll until the reopened document is the live active one.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := rt.now().Add(10 * time.Second)
 	for {
-		cur, err = requestAction(cfg, "document.current", win, nil)
+		cur, err = rt.request(cfg, "document.current", win, nil)
 		if err == nil && cur.Context != nil && cur.Context.DocumentUUID == target {
+			if !rt.settle(cfg, win, docType) {
+				return docType, fmt.Errorf("document %s reopened but its %s inventory did not settle", target, docType)
+			}
 			return docType, nil
 		}
-		if time.Now().After(deadline) {
+		if rt.now().After(deadline) {
 			return docType, fmt.Errorf("document %s did not become active within 10s after reopen", target)
 		}
-		time.Sleep(500 * time.Millisecond)
+		rt.sleep(500 * time.Millisecond)
 	}
+}
+
+// requireConfirmedSave is the destructive boundary for doc reload. An ok:true
+// envelope is insufficient: older connectors returned ok:true even when the SDK
+// save call returned false. Closing the tab is allowed only with saved:true.
+func requireConfirmedSave(action string, res *actionResult) error {
+	if res == nil || res.Result == nil {
+		return fmt.Errorf("%s returned no save result", action)
+	}
+	saved, ok := res.Result["saved"].(bool)
+	if !ok || !saved {
+		return fmt.Errorf("%s did not return saved:true", action)
+	}
+	return nil
+}
+
+func requireConfirmedClose(res *actionResult) error {
+	if res == nil || res.Result == nil {
+		return fmt.Errorf("document.close returned no result")
+	}
+	closed, ok := res.Result["closed"].(bool)
+	if !ok || !closed {
+		return fmt.Errorf("document.close did not return closed:true")
+	}
+	return nil
 }

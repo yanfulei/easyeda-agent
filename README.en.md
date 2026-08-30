@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zhoushoujianwork/easyeda-agent"><b>GitHub</b></a> ·
+  <a href="https://github.com/yanfulei/easyeda-agent"><b>GitHub</b></a> ·
   <a href="https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector"><b>Plugin marketplace</b></a> ·
   <a href="README.md">中文</a>
 </p>
@@ -84,9 +84,9 @@ parts point back into the standard-parts library (BOM-ready).
 ## Install Skills
 
 > **Full setup & usage notes: [Quick Start →](docs/quick-start.md)** — the
-> four-part suite (CLI / connector `.eext` / Skill / EasyEDA), version alignment,
+> runtime stack (CLI / connector `.eext` / Skill / EasyEDA, plus the Codex MCP entry), version alignment,
 > starting the daemon, upgrade discipline, and a troubleshooting table. **On
-> upgrade, bump all three (CLI + connector + Skill) to the same version**, or
+> upgrade, bump CLI + connector + Skill + MCP to the same release**, or
 > `easyeda daemon health` flags the lagging connector as stale.
 
 Install the `easyeda` CLI/daemon first, then add the EasyEDA connector — two
@@ -94,7 +94,7 @@ channels: import the **strictly CLI-version-locked** GitHub-Release `.eext` whos
 the installer prints, or one-click install from the
 [**official 立创EDA marketplace**](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)
 (the platform auto-updates it in place, but the listing can lag the CLI — use the
-Release `.eext` when the four-piece kit must be strictly same-version):
+Release `.eext` when the released components must be strictly same-version):
 
 > **ℹ️ Rename notice (2026-08)**: at the marketplace admins' request the extension's
 > **display name** changed to **"EDA Agent Connector"** (no "easyeda" in it). Per the
@@ -103,19 +103,22 @@ Release `.eext` when the four-piece kit must be strictly same-version):
 > installs is unaffected, no action needed.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 ```
 
-The one-line script installs/updates the `easyeda` CLI/daemon, auto-detects
+The idempotent one-line script installs/updates the `easyeda` CLI/daemon, auto-detects
 installed clients and installs/updates the `easyeda-agent` skill into each —
 Codex (`~/.codex/skills/easyeda-agent`) and Claude Code
-(`~/.claude/skills/easyeda-agent`) — and prints the connector `.eext` import URL.
+(`~/.claude/skills/easyeda-agent`). When Codex is present it also installs the
+release's locked MCP bundle and idempotently registers it, then prints the connector
+`.eext` import URL.
 Control skill install with env vars:
 
 ```bash
 EASYEDA_INSTALL_SKILLS=codex,claude curl -fsSL .../install.sh | sh  # force targets
 EASYEDA_INSTALL_SKILLS=none          curl -fsSL .../install.sh | sh  # skip skills
 EASYEDA_SKILL_PRESERVE=1             curl -fsSL .../install.sh | sh  # keep local edits
+EASYEDA_INSTALL_MCP=none             curl -fsSL .../install.sh | sh  # skip MCP
 EASYEDA_VERSION=v0.18.2              curl -fsSL .../install.sh | sh  # pin a release (skips the API)
 ```
 
@@ -131,7 +134,7 @@ gh auth login                 # an authenticated gh CLI is picked up automatical
 EASYEDA_VERSION=v0.18.2 curl -fsSL .../install.sh | sh   # or pin a tag and skip the API
 ```
 
-Available tags: [Releases](https://github.com/zhoushoujianwork/easyeda-agent/releases).
+Available tags: [Releases](https://github.com/yanfulei/easyeda-agent/releases).
 
 The published skill slug is `easyeda-agent` (suffix intentional: it distinguishes this
 community automation layer from official EasyEDA tooling). To install only the skill
@@ -153,18 +156,23 @@ The old split skills (`easyeda-schematic`, `easyeda-pcb`, `easyeda-design-flow`,
 
 ### Optional: MCP integration
 
-The repository's [`mcp/`](mcp) directory provides a local stdio MCP adapter for
+The release's [`mcp/`](mcp) directory provides a local stdio MCP adapter for
 agents such as Codex. It reuses the existing `easyeda` CLI/daemon and does not
 bypass typed actions, auditing, workflow gates, or the official `eda.*` API. The
 arbitrary-JavaScript `debug.exec_js` domain is intentionally not exposed through
 MCP.
 
+The one-line installer automatically installs and registers it when Codex is
+detected. Verify the resulting configuration with:
+
 ```bash
-npm --prefix mcp ci --ignore-scripts
-codex mcp add easyeda-agent \
-  --env EASYEDA_BIN="$(command -v easyeda)" \
-  -- node "$(pwd)/mcp/src/server.mjs"
+codex mcp get easyeda-agent --json
 ```
+
+For source development, run `npm --prefix mcp ci --ignore-scripts` and override
+the same registration with `codex mcp add easyeda-agent --env EASYEDA_BIN=... --
+node .../mcp/src/server.mjs`. Re-adding the same name updates it instead of creating
+a duplicate server.
 
 Restart the agent client after registration. Other MCP clients can use the same
 stdio command and environment configuration. See [`mcp/README.md`](mcp/README.md)
@@ -232,13 +240,13 @@ go run ./cmd/easyeda board list --project <name>
 go run ./cmd/easyeda call system.health
 ```
 
-`daemon start` starts the local server. It binds a **single fixed port `127.0.0.1:60832`** — never spilling to the next, so at most one daemon runs and the connector always finds it there. A stale easyeda daemon already holding `49620` is taken over automatically; a foreign process makes it ask (interactive) or refuse (headless) rather than start a second daemon elsewhere. It serves three endpoints, then runs until interrupted (Ctrl-C / SIGTERM):
+`daemon start` starts the local server. It binds a **single fixed port `127.0.0.1:60832`** — never spilling to the next, so at most one daemon runs and the connector always finds it there. A stale easyeda daemon already holding `60832` is taken over automatically; a foreign process makes it ask (interactive) or refuse (headless) rather than start a second daemon elsewhere. It serves three endpoints, then runs until interrupted (Ctrl-C / SIGTERM):
 
 - `GET /health` — service identity, version, and connected windows
 - `GET /eda` — WebSocket the EasyEDA connector registers on (daemon sends a `handshake` on connect)
 - `POST /action` — a typed action envelope to forward to a connected window
 
-`daemon health` scans the configured `--ports` range (default `60832-60841`) for an `easyeda-agent` daemon — which now lives on the fixed `49620`. With the daemon running it reports `status: found` and lists connected windows; otherwise a clean `not_found` result is expected.
+`daemon health` probes the configured `--ports` diagnostic range (default `60832-60841`) for an `easyeda-agent` daemon; the normal daemon itself always lives on fixed `60832`. With the daemon running it reports `status: found` and lists connected windows; otherwise a clean `not_found` result is expected.
 
 `call <action>` finds the running daemon and posts a typed action to it. `system.health` is answered by the daemon itself (no connector required); window-scoped actions need a connected EasyEDA window and return `NO_CONNECTOR` until the connector extension is running.
 

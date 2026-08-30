@@ -20,6 +20,7 @@ import {
 	isPowerRailNet,
 	normalizeDeviceRef,
 	planOtherPropertyBackfill,
+	pcbManufacturingSnapshot,
 	PROJECTED_STATE_KEYS,
 	runAction,
 	schematicComponentsList,
@@ -35,6 +36,41 @@ test('connect_pin endpoint contract is y-UP and matches Go autoconnect', () => {
 	// Both implementations score/place the snapped coordinate, not the raw 18-unit end.
 	assert.deepEqual(connectPinEndpoint(545, 290, 18, 'up'), { x: 545, y: 310 });
 	assert.deepEqual(connectPinEndpoint(545, 290, 18, 'down'), { x: 545, y: 270 });
+});
+
+test('save actions require an explicit SDK true; false is never reported as saved', async () => {
+	(globalThis as any).eda = {
+		sch_Document: { save: async () => false },
+		pcb_Document: { save: async () => false },
+	};
+	try {
+		for (const action of ['schematic.save', 'pcb.save']) {
+			await assert.rejects(
+				() => runAction(action, undefined),
+				/did not return true/,
+				`${action} must turn SDK false into ok:false`,
+			);
+		}
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('save actions return saved:true only after the SDK confirms persistence', async () => {
+	(globalThis as any).eda = {
+		sch_Document: { save: async () => true },
+		pcb_Document: { save: async () => true },
+	};
+	try {
+		for (const action of ['schematic.save', 'pcb.save']) {
+			const result = await runAction(action, undefined);
+			assert.equal(result.result?.saved, true);
+		}
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
 });
 
 /** A minimal mock of eda.sch_PrimitiveComponent exposing only the getters
@@ -262,6 +298,109 @@ test('place with designator: assigns atomically and returns final designator (is
 	assert.equal(res.result.primitiveId, 'p1');
 	assert.equal((res.result.component as any).designator, 'R12');
 	delete (globalThis as any).eda;
+});
+
+// ─── PCB manufacturing export actions ───────────────────────────────
+
+function installManufactureExportStub() {
+	const calls: Record<string, unknown[][]> = {
+		gerber: [],
+		pnp: [],
+		bom: [],
+	};
+	(globalThis as any).eda = {
+		pcb_ManufactureData: {
+			getGerberFile: async (...args: unknown[]) => {
+				calls.gerber.push(args);
+				return new File([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], String(args[0] ?? 'gerber.zip'), { type: 'application/zip' });
+			},
+			getPickAndPlaceFile: async (...args: unknown[]) => {
+				calls.pnp.push(args);
+				return new File(['Designator,Mid X\nR1,10\n'], String(args[0] ?? 'pick-and-place.csv'), { type: 'text/csv' });
+			},
+			getBomFile: async (...args: unknown[]) => {
+				calls.bom.push(args);
+				const type = String(args[1] ?? 'csv');
+				return new File(['Designator,Quantity\nR1,1\n'], `${String(args[0] ?? 'pcb-bom')}.${type}`, { type: type === 'csv' ? 'text/csv' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+			},
+		},
+		dmt_Project: { getCurrentProjectInfo: async () => ({ uuid: 'proj-1', name: 'Probe', friendlyName: 'Probe' }) },
+		dmt_SelectControl: { getCurrentDocumentInfo: async () => ({ uuid: 'pcb-1', tabId: 'tab-1', documentType: 4 }) },
+	};
+	return calls;
+}
+
+test('pcb.export.gerber: defaults include both drill classes and returns a ZIP artifact', async () => {
+	const calls = installManufactureExportStub();
+	try {
+		const res: any = await runAction('pcb.export.gerber', {});
+		assert.equal(calls.gerber.length, 1);
+		assert.equal(calls.gerber[0][0], 'gerber.zip');
+		assert.equal(calls.gerber[0][1], false);
+		assert.equal(calls.gerber[0][2], 'mm');
+		assert.deepEqual(calls.gerber[0][4], {
+			metallicDrillingInformation: true,
+			nonMetallicDrillingInformation: true,
+			drillTable: true,
+			flyingProbeTestingFile: false,
+		});
+		assert.equal(res.result.drillIncluded, true);
+		assert.equal(res.result.size, 4);
+		assert.equal(res.artifacts.length, 1);
+		assert.equal(res.artifacts[0].mimeType, 'application/zip');
+		assert.equal(typeof res.artifacts[0].inlineBase64, 'string');
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('pcb.export.pick_and_place: normalizes defaults and preserves explicit unit/type', async () => {
+	const calls = installManufactureExportStub();
+	try {
+		const res: any = await runAction('pcb.export.pick_and_place', { fileName: 'assembly', fileType: 'CSV', unit: 'MIL' });
+		assert.deepEqual(calls.pnp[0], ['assembly.csv', 'csv', 'mil']);
+		assert.equal(res.result.fileType, 'csv');
+		assert.equal(res.result.unit, 'mil');
+		assert.equal(res.result.fileName, 'assembly.csv');
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('pcb.export.bom: strips the extension before calling the SDK (avoids csvcsv)', async () => {
+	const calls = installManufactureExportStub();
+	try {
+		const res: any = await runAction('pcb.export.bom', { fileName: 'production.csv', fileType: 'csv' });
+		assert.equal(calls.bom.length, 1);
+		assert.equal(calls.bom[0][0], 'production');
+		assert.equal(calls.bom[0][1], 'csv');
+		assert.equal(res.result.fileName, 'production.csv');
+		assert.equal(res.result.fileType, 'csv');
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('PCB export actions reject malformed options before touching the EDA API', async () => {
+	const calls = installManufactureExportStub();
+	try {
+		await assert.rejects(
+			() => runAction('pcb.export.gerber', { unit: 'inchy' }),
+			(err: any) => err.code === 'MISSING_PAYLOAD_FIELD' && /Unsupported unit/.test(err.message),
+		);
+		await assert.rejects(
+			() => runAction('pcb.export.pick_and_place', { fileType: 'zip' }),
+			(err: any) => err.code === 'MISSING_PAYLOAD_FIELD' && /Unsupported fileType/.test(err.message),
+		);
+		assert.equal(calls.gerber.length, 0);
+		assert.equal(calls.pnp.length, 0);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
 });
 
 test('place without designator: no modify call, keeps placeholder (issue #68)', async () => {
@@ -2053,4 +2192,356 @@ test('titleblock: 始终不生效的项在轮询后仍如实报失败 (#186)', a
 		},
 	);
 	delete (globalThis as any).eda;
+});
+
+// ── Typed schematic annotations ─────────────────────────────────────────────
+
+function annotationPrimitive(id: string, content = ''): any {
+	return {
+		getState_PrimitiveId: () => id,
+		getState_Content: () => content,
+		getState_X: () => 100,
+		getState_Y: () => 200,
+	};
+}
+
+test('schematic.text.create returns the created primitive id without exec_js', async () => {
+	(globalThis as any).eda = {
+		sch_PrimitiveText: {
+			create: async () => annotationPrimitive('text-1', 'hello'),
+			delete: async () => true,
+		},
+	};
+	try {
+		const res: any = await runAction('schematic.text.create', {
+			x: 100, y: 200, content: 'hello', color: '#5A5A5A', fontSize: 10,
+		});
+		assert.equal(res.result.primitiveId, 'text-1');
+		assert.equal(res.result.content, 'hello');
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('schematic.partition.create compensates the rectangle when title creation fails', async () => {
+	const deleted: string[][] = [];
+	(globalThis as any).eda = {
+		sch_PrimitiveRectangle: {
+			create: async () => annotationPrimitive('rect-1'),
+		},
+		sch_PrimitiveText: {
+			create: async () => undefined,
+		},
+		sch_PrimitiveObject: {
+			delete: async (ids: string[]) => { deleted.push(ids); return true; },
+		},
+	};
+	try {
+		await assert.rejects(
+			() => runAction('schematic.partition.create', {
+				minX: 10, minY: 20, maxX: 110, maxY: 220,
+				title: 'POWER', titleX: 14, titleY: 206,
+			}),
+			/title create returned no primitive/,
+		);
+		assert.deepEqual(deleted, [['rect-1']]);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('schematic.graphics.survey returns rectangle ids and text anchors', async () => {
+	(globalThis as any).eda = {
+		sch_PrimitiveRectangle: { getAllPrimitiveId: async () => ['rect-1'] },
+		sch_PrimitiveText: { getAll: async () => [annotationPrimitive('text-1', 'POWER')] },
+	};
+	try {
+		const res: any = await runAction('schematic.graphics.survey', {});
+		assert.deepEqual(res.result.rects, ['rect-1']);
+		assert.deepEqual(res.result.texts, [{ id: 'text-1', content: 'POWER', x: 100, y: 200 }]);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+// ── pcb.manufacturing.snapshot ─────────────────────────────────────────────
+
+type ManufacturingSnapshotState = {
+	lineEndX: number;
+	pouredPath: Array<number | string>;
+};
+
+function manufacturingPad(id: string, padNumber: string): any {
+	return {
+		getState_PrimitiveId: () => id,
+		getState_PrimitiveType: () => 'pad',
+		getState_PadNumber: () => padNumber,
+		getState_Net: () => padNumber === '1' ? 'GND' : '+3V3',
+		getState_Layer: () => 1,
+		getState_X: () => Number(padNumber) * 10,
+		getState_Y: () => Number(padNumber) * 20,
+		getState_Rotation: () => 0,
+		getState_Pad: () => ({ shape: 'rectangle', width: 60, height: 40 }),
+		getState_Hole: () => ({ shape: 'circle', diameter: 20 }),
+		getState_HoleOffsetX: () => 0,
+		getState_HoleOffsetY: () => 0,
+		getState_HoleRotation: () => 0,
+		getState_Metallization: () => true,
+		getState_PadType: () => 'through',
+		getState_SpecialPad: () => undefined,
+		getState_SolderMaskAndPasteMaskExpansion: () => ({ solderMask: 4, pasteMask: 0 }),
+		getState_HeatWelding: () => ({ spokeCount: 4, spokeWidth: 10 }),
+		getState_PrimitiveLock: () => false,
+	};
+}
+
+function manufacturingComponent(id: string, designator: string, layer: number): any {
+	return {
+		getState_PrimitiveId: () => id,
+		getState_PrimitiveType: () => 'component',
+		getState_Component: () => ({ libraryUuid: `device-lib-${id}`, uuid: `device-${id}`, name: `Device ${id}` }),
+		getState_Footprint: () => ({ libraryUuid: `footprint-lib-${id}`, uuid: `footprint-${id}`, name: `FP ${id}` }),
+		getState_Model3D: () => ({ libraryUuid: `model-lib-${id}`, uuid: `model-${id}`, name: `Model ${id}` }),
+		getState_Layer: () => layer,
+		getState_X: () => id === 'component-a' ? 100 : 300,
+		getState_Y: () => id === 'component-a' ? 200 : 400,
+		getState_Rotation: () => id === 'component-a' ? 90 : 0,
+		getState_PrimitiveLock: () => false,
+		getState_AddIntoBom: () => true,
+		getState_Designator: () => designator,
+		getState_Name: () => `Part ${designator}`,
+		getState_UniqueId: () => `unique-${id}`,
+		getState_Manufacturer: () => 'ACME',
+		getState_ManufacturerId: () => `MPN-${designator}`,
+		getState_Supplier: () => 'LCSC',
+		getState_SupplierId: () => designator === 'U1' ? 'C123456' : 'C654321',
+		getState_OtherProperty: () => ({ Value: '3.3V', Tolerance: '1%' }),
+		getState_Pads: () => [{ primitiveId: `pad-ref-${id}`, padNumber: '1', net: 'GND' }],
+	};
+}
+
+function installManufacturingSnapshotStub(
+	state: ManufacturingSnapshotState = { lineEndX: 100, pouredPath: [0, 0, 'L', 50, 0, 50, 50, 0, 0] },
+): any {
+	const componentA = manufacturingComponent('component-a', 'U1', 1);
+	const componentB = manufacturingComponent('component-b', 'U2', 2);
+	const line = (id: string, layer: number) => ({
+		getState_PrimitiveId: () => id,
+		getState_PrimitiveType: () => 'line',
+		getState_Net: () => id === 'line-a' ? undefined : 'GND',
+		getState_Layer: () => layer,
+		getState_StartX: () => 0,
+		getState_StartY: () => 0,
+		getState_EndX: () => id === 'line-a' ? state.lineEndX : 25,
+		getState_EndY: () => 10,
+		getState_LineWidth: () => 8,
+		getState_PrimitiveLock: () => false,
+	});
+	const poured = {
+		getState_PrimitiveId: () => 'poured-a',
+		getState_PrimitiveType: () => 'poured',
+		getState_PourPrimitiveId: () => 'pour-a',
+		getState_PourFills: () => [
+			{ id: 'fill-b', lineWidth: 8, fill: true, path: { getSource: () => [100, 100, 'L', 110, 100] } },
+			{ id: 'fill-a', lineWidth: 8, fill: true, path: { getSource: () => state.pouredPath } },
+		],
+	};
+	const emptyInventory = () => ({ getAll: async () => [] });
+	const stub: any = {
+		pcb_PrimitiveComponent: {
+			getAll: async () => [componentB, componentA],
+			getAllPinsByPrimitiveId: async (id: string) => (
+				id === 'component-a'
+					? [manufacturingPad('pad-a2', '2'), manufacturingPad('pad-a1', '1')]
+					: []
+			),
+		},
+		pcb_PrimitivePad: { getAll: async () => [manufacturingPad('standalone-pad', '3')] },
+		pcb_PrimitiveLine: { getAll: async () => [line('line-b', 11), line('line-a', 1)] },
+		pcb_PrimitiveArc: emptyInventory(),
+		pcb_PrimitivePolyline: emptyInventory(),
+		pcb_PrimitiveVia: emptyInventory(),
+		pcb_PrimitivePour: emptyInventory(),
+		pcb_PrimitivePoured: { getAll: async () => [poured] },
+		pcb_PrimitiveFill: emptyInventory(),
+		pcb_PrimitiveRegion: emptyInventory(),
+		pcb_PrimitiveString: emptyInventory(),
+		pcb_PrimitiveAttribute: emptyInventory(),
+		pcb_PrimitiveImage: emptyInventory(),
+		pcb_PrimitiveObject: emptyInventory(),
+		pcb_PrimitiveDimension: emptyInventory(),
+		pcb_Layer: {
+			getAllLayers: async () => [
+				{ id: 10, name: 'Inner1', type: 'SIGNAL', locked: false },
+				{ id: 2, name: 'Bottom', type: 'SIGNAL', locked: false },
+				{ id: 1, name: 'Top', type: 'SIGNAL', locked: false },
+			],
+			getTheNumberOfCopperLayers: async () => 4,
+		},
+		pcb_Net: { getAllNets: async () => [{ id: 'net-b', name: '+3V3' }, { id: 'net-a', name: 'GND' }] },
+		pcb_Drc: {
+			getCurrentRuleConfigurationName: async () => 'JLC-4L',
+			getCurrentRuleConfiguration: async () => ({ trackWidth: 8, clearance: 6 }),
+			getNetRules: async () => [{ id: 'rule-b', width: 10 }, { id: 'rule-a', width: 8 }],
+			getNetByNetRules: async () => ({ GND: { '+3V3': { clearance: 8 } } }),
+			getRegionRules: async () => [{ id: 'region-rule-a', clearance: 12 }],
+		},
+		dmt_Board: { getCurrentBoardInfo: async () => ({ uuid: 'board-1', name: 'Probe board' }) },
+		dmt_Pcb: { getCurrentPcbInfo: async () => ({ uuid: 'pcb-1', name: 'PCB1' }) },
+	};
+	(globalThis as any).eda = stub;
+	return stub;
+}
+
+test('pcb.manufacturing.snapshot returns a complete deterministic assembly and fabrication inventory', async () => {
+	const state: ManufacturingSnapshotState = {
+		lineEndX: 100,
+		pouredPath: [0, 0, 'L', 50, 0, 50, 50, 0, 0],
+	};
+	installManufacturingSnapshotStub(state);
+	try {
+		const response: any = await runAction('pcb.manufacturing.snapshot', {});
+		const snapshot = response.result;
+		assert.equal(snapshot.schemaVersion, 'easyeda.pcb.manufacturing-snapshot/v1');
+		assert.equal(snapshot.complete, true);
+		for (const field of [
+			'components', 'pads', 'lines', 'arcs', 'polylines', 'vias', 'pours', 'poured',
+			'fills', 'regions', 'strings', 'layers',
+		]) assert.ok(Array.isArray(snapshot[field]), `${field} must be an array`);
+
+		assert.deepEqual(snapshot.components.map((item: any) => item.primitiveId), ['component-a', 'component-b']);
+		const component = snapshot.components[0];
+		assert.deepEqual(component.component, {
+			libraryUuid: 'device-lib-component-a', name: 'Device component-a', uuid: 'device-component-a',
+		});
+		assert.deepEqual(component.footprint, {
+			libraryUuid: 'footprint-lib-component-a', name: 'FP component-a', uuid: 'footprint-component-a',
+		});
+		assert.deepEqual(component.model3D, {
+			libraryUuid: 'model-lib-component-a', name: 'Model component-a', uuid: 'model-component-a',
+		});
+		assert.deepEqual({
+			designator: component.designator, uniqueId: component.uniqueId,
+			manufacturer: component.manufacturer, manufacturerId: component.manufacturerId,
+			supplier: component.supplier, supplierId: component.supplierId,
+			x: component.x, y: component.y, rotation: component.rotation, layer: component.layer, side: component.side,
+		}, {
+			designator: 'U1', uniqueId: 'unique-component-a',
+			manufacturer: 'ACME', manufacturerId: 'MPN-U1', supplier: 'LCSC', supplierId: 'C123456',
+			x: 100, y: 200, rotation: 90, layer: 1, side: 'top',
+		});
+		assert.deepEqual(component.otherProperty, { Tolerance: '1%', Value: '3.3V' });
+		assert.deepEqual(component.pads.map((pad: any) => pad.primitiveId), ['pad-a1', 'pad-a2']);
+		assert.deepEqual(component.pads[0].pad, { height: 40, shape: 'rectangle', width: 60 });
+		assert.deepEqual(snapshot.lines.map((item: any) => item.primitiveId), ['line-a', 'line-b']);
+		assert.equal(snapshot.lines[0].net, null, 'undefined SDK values must normalize to JSON null');
+		assert.deepEqual(snapshot.layers.map((item: any) => item.id), [1, 2, 10]);
+		assert.deepEqual(snapshot.poured[0].pourFills.map((item: any) => item.id), ['fill-a', 'fill-b']);
+		assert.deepEqual(snapshot.poured[0].pourFills[0].path, state.pouredPath);
+		assert.deepEqual(snapshot.outlineAndCutouts.lines.map((item: any) => item.primitiveId), ['line-b']);
+		assert.equal(snapshot.copperLayerCount, 4);
+		assert.equal(snapshot.drcRules.configurationName, 'JLC-4L');
+		assert.doesNotThrow(() => JSON.stringify(snapshot));
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('pcb.manufacturing.snapshot changes when track or poured geometry drifts', async () => {
+	const state: ManufacturingSnapshotState = {
+		lineEndX: 100,
+		pouredPath: [0, 0, 'L', 50, 0, 50, 50, 0, 0],
+	};
+	installManufacturingSnapshotStub(state);
+	try {
+		const before: any = await pcbManufacturingSnapshot({});
+		state.lineEndX = 125;
+		state.pouredPath = [0, 0, 'L', 75, 0, 75, 50, 0, 0];
+		const after: any = await pcbManufacturingSnapshot({});
+		assert.notEqual(JSON.stringify(before.result), JSON.stringify(after.result));
+		assert.equal(before.result.lines[0].endX, 100);
+		assert.equal(after.result.lines[0].endX, 125);
+		assert.notDeepEqual(before.result.poured[0].pourFills[0].path, after.result.poured[0].pourFills[0].path);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+const manufacturingFailureCases: Array<{
+	name: string;
+	breakStub: (stub: any) => void;
+	message: RegExp;
+}> = [
+	{
+		name: 'required primitive getAll returns undefined',
+		breakStub: stub => { stub.pcb_PrimitiveLine.getAll = async () => undefined; },
+		message: /lines did not return an array/,
+	},
+	{
+		name: 'required primitive getAll throws',
+		breakStub: stub => { stub.pcb_PrimitiveVia.getAll = async () => { throw new Error('via read failed'); }; },
+		message: /could not read vias/,
+	},
+	{
+		name: 'layer inventory is not an array',
+		breakStub: stub => { stub.pcb_Layer.getAllLayers = async () => ({ 1: { name: 'Top' } }); },
+		message: /layers did not return an array/,
+	},
+	{
+		name: 'DRC configuration is unavailable',
+		breakStub: stub => { stub.pcb_Drc.getCurrentRuleConfiguration = async () => undefined; },
+		message: /no current DRC rule configuration/,
+	},
+	{
+		name: 'component pad inventory is unavailable',
+		breakStub: stub => { stub.pcb_PrimitiveComponent.getAllPinsByPrimitiveId = async () => undefined; },
+		message: /pads did not return an array/,
+	},
+];
+
+for (const failureCase of manufacturingFailureCases) {
+	test(`pcb.manufacturing.snapshot fails closed when ${failureCase.name}`, async () => {
+		const stub = installManufacturingSnapshotStub();
+		failureCase.breakStub(stub);
+		try {
+			await assert.rejects(
+				() => pcbManufacturingSnapshot({}),
+				(err: any) => {
+					assert.match(err.message, failureCase.message);
+					assert.ok(['INVALID_STATE', 'EDA_CALL_FAILED'].includes(err.code));
+					return true;
+				},
+			);
+		}
+		finally {
+			delete (globalThis as any).eda;
+		}
+	});
+}
+
+test('document.close requires the official API to confirm closed:true', async () => {
+	const calls: Array<string> = [];
+	(globalThis as any).eda = {
+		dmt_EditorControl: {
+			closeDocument: async (tabId: string) => { calls.push(tabId); return true; },
+		},
+	};
+	try {
+		const response: any = await runAction('document.close', { tabId: 'tab-pcb-1' });
+		assert.deepEqual(calls, ['tab-pcb-1']);
+		assert.deepEqual(response.result, { closed: true, tabId: 'tab-pcb-1' });
+		(globalThis as any).eda.dmt_EditorControl.closeDocument = async () => false;
+		await assert.rejects(
+			() => runAction('document.close', { tabId: 'tab-pcb-1' }),
+			(err: any) => err.code === 'EDA_CALL_FAILED' && /did not confirm/.test(err.message),
+		);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
 });

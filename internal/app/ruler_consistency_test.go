@@ -80,6 +80,15 @@ func TestRuler_SettleReadBudgetSane(t *testing.T) {
 	}
 }
 
+func TestRuler_SchematicTextRetryBudgetMatchesLiveThrottle(t *testing.T) {
+	if schematicTextRetryDelay < 15*time.Second || schematicTextRetryDelay > 20*time.Second {
+		t.Errorf("schematicTextRetryDelay=%v, want the live-measured 15-20s recovery window", schematicTextRetryDelay)
+	}
+	if schematicTextRetryDelay <= settleDelay {
+		t.Errorf("schematicTextRetryDelay=%v must exceed generic settleDelay=%v", schematicTextRetryDelay, settleDelay)
+	}
+}
+
 func TestRuler_ConnectPinBudgetExceedsConnectorWorstCase(t *testing.T) {
 	// CLI 的预算必须大于连接器内部最坏路径(wire 7s + 0.25s + wire 重试 7s +
 	// netflag 7s = 21.25s),否则 daemon 先放弃、对方还在跑 —— 报出来的是我们

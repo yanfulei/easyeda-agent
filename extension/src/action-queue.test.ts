@@ -1,11 +1,13 @@
 /**
  * action-queue 的单测 —— 判据全部机械可验,不靠"看起来对了"。
  *
- * 覆盖四条硬性质(缺任何一条,读写对齐就退回启发式):
+ * 覆盖六条硬性质(缺任何一条,读写对齐就退回启发式):
  *   1. FIFO 保序:提交顺序 === 执行顺序 === 完成顺序,且 seq 逐个 +1。
  *   2. 超时放弃后队列继续流动,seqAbandoned 递增并点名 request id。
  *   3. 截止时间来自**请求自带的 timeoutMs**,不是写死常数(长操作不被误杀)。
- *   4. 旁路响应打 unordered 且不动 seq;队列溢出被明确拒绝且**没有执行**。
+ *   4. 排队已经耗尽 absolute deadline 的任务**不得执行**。
+ *   5. 被放弃的写进入 quarantine,原 handler settle 前后续写不得执行。
+ *   6. 旁路响应打 unordered 且不动 seq;队列溢出被明确拒绝且**没有执行**。
  */
 
 import assert from 'node:assert/strict';
@@ -140,6 +142,117 @@ test('截止时间用请求自带的 timeoutMs —— 长操作不被误杀,短�
 	assert.equal(short.stamp.seqAbandoned, 1);
 });
 
+test('absolute deadline 包含排队时间:轮到时已过期的动作根本不执行', async () => {
+	const q = testQueue();
+	const head = deferred<number>();
+	const createdAtMs = Date.now();
+	const first = q.submit({ id: 'head', timeoutMs: 3_600_000, createdAtMs, run: () => head.promise });
+
+	let expiredRan = false;
+	const expired = q.submit({
+		id: 'expired-in-queue',
+		timeoutMs: 20,
+		createdAtMs: createdAtMs - 1_000,
+		run: async () => { expiredRan = true; return 2; },
+	});
+
+	head.resolve(1);
+	assert.equal((await first).status, 'ok');
+	const outcome = await expired;
+	assert.equal(outcome.status, 'expired');
+	assert.equal(expiredRan, false, 'deadline 已耗尽的晚到写/读都不得再碰编辑器');
+	assert.equal(outcome.stamp.seq, 1, '未执行的过期任务不得推进 handler 完成序号');
+});
+
+test('mutating abandon 进入 quarantine:只读可诊断,后续写等原 handler settle 后才恢复', async () => {
+	const q = testQueue();
+	const stuck = deferred<number>();
+	const abandoned = q.submit({
+		id: 'ghost-write',
+		action: 'schematic.component.place',
+		mutates: true,
+		timeoutMs: 3_600_000,
+		run: () => stuck.promise,
+	});
+	await Promise.resolve(); // runHead 已登记 deadline;不用墙钟制造竞态
+	sweepDeadlines(Date.now() + 7_200_000);
+
+	let queuedWriteRan = false;
+	const queuedWrite = q.submit({
+		id: 'queued-write',
+		action: 'schematic.wire.create',
+		mutates: true,
+		timeoutMs: 500,
+		run: async () => { queuedWriteRan = true; return 2; },
+	});
+	const read = q.submit({ id: 'diagnostic-read', action: 'schematic.components.list', timeoutMs: 500, run: async () => 3 });
+
+	const firstOutcome = await abandoned;
+	assert.equal(firstOutcome.status, 'abandoned');
+	if (firstOutcome.status === 'abandoned') assert.equal(firstOutcome.mutates, true);
+	const blockedQueued = await queuedWrite;
+	assert.equal(blockedQueued.status, 'quarantined');
+	assert.equal(queuedWriteRan, false, 'abandoned write 未 settle 时绝不能让下一笔写交错进去');
+	assert.equal((await read).status, 'ok', 'quarantine 期仍需保留只读诊断面');
+
+	let immediateWriteRan = false;
+	const blockedImmediate = await q.submit({
+		id: 'autosave',
+		action: 'schematic.save',
+		mutates: true,
+		timeoutMs: 500,
+		run: async () => { immediateWriteRan = true; return 4; },
+	});
+	assert.equal(blockedImmediate.status, 'quarantined');
+	assert.equal(immediateWriteRan, false);
+
+	stuck.resolve(1);
+	await sleep(0); // late settlement clears this exact quarantine generation
+	const recovered = await q.submit({
+		id: 'write-after-settle',
+		action: 'schematic.save',
+		mutates: true,
+		timeoutMs: 500,
+		run: async () => 5,
+	});
+	assert.equal(recovered.status, 'ok', '原 handler settle 后写通道必须自动恢复');
+});
+
+test('abandoned write 隔离所有前台上下文切换,不让晚到写跨文档落地', async () => {
+	for (const action of ['document.open', 'document.close', 'schematic.page.open']) {
+		const q = testQueue();
+		const stuck = deferred<number>();
+		const abandoned = q.submit({
+			id: `ghost-before-${action}`,
+			action: 'schematic.component.place',
+			mutates: true,
+			writeSensitive: true,
+			timeoutMs: 3_600_000,
+			run: () => stuck.promise,
+		});
+		// Let the FIFO microtask enter runHead and register its deadline before
+		// simulating the worker tick. A single Promise microtask is insufficient
+		// when the test runner has queued the chain continuation behind it.
+		await sleep(0);
+		sweepDeadlines(Date.now() + 7_200_000);
+		assert.equal((await abandoned).status, 'abandoned');
+
+		let switched = false;
+		const blocked = await q.submit({
+			id: `switch-${action}`,
+			action,
+			mutates: false,
+			writeSensitive: true,
+			timeoutMs: 5_000,
+			run: async () => { switched = true; return 1; },
+		});
+		assert.equal(blocked.status, 'quarantined', `${action} 必须被 abandoned-write quarantine 拦下`);
+		assert.equal(switched, false, `${action} 被拒后不能触碰编辑器上下文`);
+		stuck.resolve(1);
+		await sleep(0);
+	}
+});
+
 test('放弃闸不依赖 setTimeout —— 只靠 worker tick 的 sweepDeadlines 也必须到点', async () => {
 	// 2026-08-24 真机定案的直接回归:后台窗口里主线程 setTimeout 被节流/冻结,
 	// 22s 的放弃闸在 6 分钟里一次没响,队首把后面 12 条全堵死。这里把预算设成
@@ -224,11 +337,18 @@ test('溢出:队列满时明确拒绝,且被拒的动作根本没有执行', asy
 
 test('abandonedIds 是有界环形缓冲,不会无限增长', async () => {
 	const q = testQueue();
-	const outcomes: Array<Promise<QueueOutcome<number>>> = [];
+	let last: QueueOutcome<number> | undefined;
 	for (let i = 0; i < ABANDONED_ID_RING + 3; i++) {
-		outcomes.push(q.submit({ id: `a-${i}`, timeoutMs: 1, run: () => new Promise<number>(() => { /* 永不 settle */ }) }));
+		const pending = q.submit({
+			id: `a-${i}`,
+			timeoutMs: 3_600_000,
+			run: () => new Promise<number>(() => { /* 永不 settle */ }),
+		});
+		await sleep(0);
+		sweepDeadlines(Date.now() + 7_200_000);
+		last = await pending;
 	}
-	const last = await outcomes[outcomes.length - 1];
+	assert.ok(last);
 	assert.equal(last.status, 'abandoned');
 	assert.equal(last.stamp.seqAbandoned, ABANDONED_ID_RING + 3, 'seqAbandoned 是累计数,绝不受缓冲长度影响');
 	assert.equal(last.stamp.abandonedIds?.length, ABANDONED_ID_RING);

@@ -364,7 +364,7 @@ func updateNotes(rep updateReport) []string {
 			"connector %s is behind v%s and cannot be updated from here — re-import the .eext "+
 				"(https://github.com/%s/releases/download/v%s/easyeda-agent-connector.eext), "+
 				"then fully quit and relaunch EasyEDA so open windows load it",
-			strings.Join(rep.Connector.Versions, ","), rep.Target, selfupdate.RepoSlug, rep.Target))
+			strings.Join(rep.Connector.Versions, ","), rep.Target, selfupdate.RepoSlug(), rep.Target))
 	}
 	for _, s := range rep.Skills {
 		if s.Status == "not-installed" {

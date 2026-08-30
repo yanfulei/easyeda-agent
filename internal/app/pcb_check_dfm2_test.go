@@ -1,6 +1,9 @@
 package app
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // ── silk-over-pad (§11.2) ────────────────────────────────────────────────────
 
@@ -178,6 +181,22 @@ func TestFindFiducialMissing(t *testing.T) {
 	// Small hand-solder board (few pads) → rule silent.
 	if out := findFiducialMissing(pads[:10]); len(out) != 0 {
 		t.Fatalf("small board must not be flagged, got %+v", out)
+	}
+}
+
+func TestPCBCheckInfoFindingDoesNotFailGate(t *testing.T) {
+	// Keep this fixture above the SMT-scale threshold used by the rule. A
+	// twelve-pad hand-solder board is intentionally exempt from fiducial advice.
+	pads := make([]pcbPadP, 40)
+	for i := range pads {
+		pads[i] = pcbPadP{Designator: fmt.Sprintf("U%d", i+1), Layer: pcbSideTop, X: float64(i * 100)}
+	}
+	rep := analyzePcbCheck(pads, nil, nil, 0)
+	if !rep.Passed || rep.Summary.Errors != 0 || rep.Summary.Warnings != 0 || rep.Summary.Total != 1 {
+		t.Fatalf("INFO-only board must pass with one retained advisory: %+v", rep)
+	}
+	if rep.Findings[0].Level != "INFO" || rep.Findings[0].Type != "fiducial-missing" {
+		t.Fatalf("unexpected INFO finding: %+v", rep.Findings)
 	}
 }
 

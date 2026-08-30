@@ -40,6 +40,20 @@ type Request struct {
 	// (e.g. DRC recompute on a background window never finishes). 0 = daemon
 	// default.
 	TimeoutMs int `json:"timeoutMs,omitempty"`
+	// Mutates is a daemon-owned classification copied from the typed action
+	// catalog (minus dry-run previews) before forwarding to the connector. The
+	// connector uses it to quarantine later writes after an abandoned mutation.
+	// Raw callers cannot opt out: handleAction overwrites this field.
+	Mutates bool `json:"mutates,omitempty"`
+	// WriteSensitive is the daemon-owned superset used by connector quarantine:
+	// actual document mutations plus foreground context changes. It is separate
+	// from Mutates so page switches do not arm autosave or invalidate workflow
+	// stages, while still being unable to race a late abandoned write.
+	WriteSensitive bool `json:"writeSensitive,omitempty"`
+	// ExpectedContext binds an action to the exact project/document the caller
+	// selected. The connector re-reads live context inside its FIFO immediately
+	// before the handler and refuses a drifted foreground document.
+	ExpectedContext *ExpectedContext `json:"expectedContext,omitempty"`
 	// ClientID identifies the calling client process for audit attribution and
 	// the concurrent-writer advisory (issue #108): multiple CLIs/agents can
 	// drive the same board through one daemon, and without an identity field
@@ -48,6 +62,12 @@ type Request struct {
 	// raw HTTP callers that omit it simply stay unattributed.
 	ClientID string         `json:"clientId,omitempty"`
 	Payload  map[string]any `json:"payload,omitempty"`
+}
+
+type ExpectedContext struct {
+	ProjectUUID  string `json:"projectUuid,omitempty"`
+	DocumentUUID string `json:"documentUuid,omitempty"`
+	DocumentType string `json:"documentType,omitempty"`
 }
 
 type Response struct {
@@ -140,7 +160,9 @@ type Artifact struct {
 }
 
 type ErrorInfo struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Detail  string `json:"detail,omitempty"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Detail    string `json:"detail,omitempty"`
+	Uncertain *bool  `json:"uncertain,omitempty"`
+	Retryable *bool  `json:"retryable,omitempty"`
 }

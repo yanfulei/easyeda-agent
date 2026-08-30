@@ -7,8 +7,11 @@
 // Replaced at build time by esbuild `define` with extension.json's version
 // (see config/esbuild.common.ts). Falls back for non-esbuild contexts (tsc).
 declare const __CONNECTOR_VERSION__: string;
+declare const __BUILD_FINGERPRINT__: string;
 export const CONNECTOR_VERSION =
 	typeof __CONNECTOR_VERSION__ === 'undefined' ? '0.0.0-dev' : __CONNECTOR_VERSION__;
+export const BUILD_FINGERPRINT =
+	typeof __BUILD_FINGERPRINT__ === 'undefined' ? 'dev' : __BUILD_FINGERPRINT__;
 export const PROTOCOL_VERSION = 'v1';
 export const SERVICE_ID = 'easyeda-agent';
 export const CAPABILITIES = ['schematic.v1', 'pcb.v1'];
@@ -19,6 +22,19 @@ export interface HandshakeFrame {
 	type: 'handshake';
 	service: string;
 	version?: string;
+	fingerprints?: RuntimeFingerprints;
+}
+
+export interface RuntimeFingerprints {
+	build?: string;
+	actionCatalog?: string;
+	schema?: string;
+}
+
+export interface ExpectedContext {
+	projectUuid?: string;
+	documentUuid?: string;
+	documentType?: string;
 }
 
 export interface RequestFrame {
@@ -34,6 +50,14 @@ export interface RequestFrame {
 	 * 这类合法长操作能跑 60 秒以上。缺省 → ABANDON_FALLBACK_MS。
 	 */
 	timeoutMs?: number;
+	/** daemon stamping time; timeout is absolute from here, including queue wait. */
+	createdAt?: string;
+	/** daemon-owned catalog classification (dry-run previews are false). */
+	mutates?: boolean;
+	/** Mutations plus foreground context changes; drives abandoned-write quarantine. */
+	writeSensitive?: boolean;
+	/** Exact live target selected by the caller; checked inside the FIFO. */
+	expectedContext?: ExpectedContext;
 }
 
 export interface PingFrame {
@@ -61,6 +85,7 @@ export interface RegisterFrame {
 	connectorVersion: string;
 	easyedaVersion: string;
 	capabilities: Array<string>;
+	fingerprints: RuntimeFingerprints;
 }
 
 export interface ContextFrame {
@@ -95,6 +120,10 @@ export interface ResponseError {
 	code: string;
 	message: string;
 	detail?: string;
+	/** true means the handler ran but its final document effect is unknown. */
+	uncertain?: boolean;
+	/** Whether an automated caller may safely retry this exact request now. */
+	retryable?: boolean;
 }
 
 export interface ResponseFrame {
@@ -141,6 +170,10 @@ export const ErrorCodes = {
 	 * **它的效果可能稍后才落地** —— 收到这个码 = 关于这次写的任何结论都不成立。
 	 */
 	ACTION_ABANDONED: 'ACTION_ABANDONED',
+	/** Absolute request deadline elapsed in the queue; handler never started. */
+	ACTION_EXPIRED: 'ACTION_EXPIRED',
+	/** A prior abandoned mutation still runs; this mutation was not executed. */
+	MUTATION_QUARANTINED: 'MUTATION_QUARANTINED',
 	/** 队列积压到上限,这次提交被明确拒绝(而不是无限堆积)。它**没有执行**。 */
 	QUEUE_OVERFLOW: 'QUEUE_OVERFLOW',
 	/**
@@ -159,6 +192,10 @@ export const ErrorCodes = {
 	 * 结构化成功那条路,见 #151 部分应用约定)。
 	 */
 	PRECONDITION_REFUSED: 'PRECONDITION_REFUSED',
+	/** Live foreground project/document no longer matches the bound request. */
+	TARGET_CONTEXT_MISMATCH: 'TARGET_CONTEXT_MISMATCH',
+	/** Daemon and connector have explicitly different build/API/schema identities. */
+	RUNTIME_FINGERPRINT_MISMATCH: 'RUNTIME_FINGERPRINT_MISMATCH',
 } as const;
 
 /**
@@ -179,11 +216,20 @@ export interface ActionResult {
 export class ActionError extends Error {
 	public readonly code: string;
 	public readonly detail?: string;
+	public readonly uncertain?: boolean;
+	public readonly retryable?: boolean;
 
-	constructor(code: string, message: string, detail?: string) {
+	constructor(
+		code: string,
+		message: string,
+		detail?: string,
+		options?: { uncertain?: boolean; retryable?: boolean },
+	) {
 		super(message);
 		this.name = 'ActionError';
 		this.code = code;
 		this.detail = detail;
+		this.uncertain = options?.uncertain;
+		this.retryable = options?.retryable;
 	}
 }

@@ -52,9 +52,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Identify ourselves first so the connector can verify it reached an
 	// easyeda-agent daemon before it registers.
 	if err := c.write(ctx, protocol.Handshake{
-		Type:    protocol.TypeHandshake,
-		Service: Service,
-		Version: s.opts.Version,
+		Type:         protocol.TypeHandshake,
+		Service:      Service,
+		Version:      s.opts.Version,
+		Fingerprints: protocol.CurrentRuntimeFingerprints(),
 	}); err != nil {
 		s.logf("handshake write failed to %s: %v", r.RemoteAddr, err)
 		return

@@ -96,6 +96,27 @@ func TestMutatesActionMap(t *testing.T) {
 	}
 }
 
+func TestRequestWriteSensitiveIncludesContextChangesWithoutCallingThemMutations(t *testing.T) {
+	for _, action := range []string{"document.open", "document.close", "schematic.page.open"} {
+		req := &protocol.Request{Action: action}
+		if requestMutates(req) {
+			t.Errorf("%s changes foreground context but must not arm autosave", action)
+		}
+		if !requestWriteSensitive(req) {
+			t.Errorf("%s must be isolated from abandoned writes", action)
+		}
+	}
+	if requestWriteSensitive(&protocol.Request{Action: "document.current"}) {
+		t.Fatal("document.current must remain available as an unordered diagnostic read")
+	}
+	if !requestWriteSensitive(&protocol.Request{Action: "schematic.component.place"}) {
+		t.Fatal("every real mutation must also be write-sensitive")
+	}
+	if requestWriteSensitive(&protocol.Request{Action: "pcb.page.clear", Payload: map[string]any{"dryRun": true}}) {
+		t.Fatal("a dry-run preview must not enter write quarantine")
+	}
+}
+
 // TestMaybeAutosave_DryRunDoesNotArm pins issue #112b on the autosave side: a
 // `--dry-run` preview writes nothing, so there is nothing to save — arming the
 // debounce would fire a pointless save (and, on pcb.page.clear, one that looks
@@ -231,5 +252,21 @@ func TestRequestMutates(t *testing.T) {
 	}
 	if requestMutates(nil) {
 		t.Error("nil request must not count as a mutation")
+	}
+}
+
+func TestAutosaveResponseRetryableOnlyForTransientQueueStates(t *testing.T) {
+	for _, code := range []string{"MUTATION_QUARANTINED", "ACTION_EXPIRED", "QUEUE_OVERFLOW", "ACTION_ABANDONED"} {
+		if !autosaveResponseRetryable(&protocol.Response{Error: &protocol.ErrorInfo{Code: code}}) {
+			t.Errorf("%s must re-arm idempotent autosave", code)
+		}
+	}
+	for _, code := range []string{"EDA_CALL_FAILED", "PRECONDITION_REFUSED", ""} {
+		if autosaveResponseRetryable(&protocol.Response{Error: &protocol.ErrorInfo{Code: code}}) {
+			t.Errorf("permanent %s must not create an infinite autosave retry loop", code)
+		}
+	}
+	if autosaveResponseRetryable(nil) || autosaveResponseRetryable(&protocol.Response{}) {
+		t.Fatal("missing response/error is not a structured retry signal")
 	}
 }

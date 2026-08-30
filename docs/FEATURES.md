@@ -14,8 +14,8 @@ planned. Ground truth for the action catalog is `make actions`
 > [`ecosystem-survey.md`](ecosystem-survey.md) 系统对比了官方开源扩展用到的 API、我们的盲区,
 > 以及一份带优先级的可吸收功能清单(A1–A9),是下一阶段 roadmap 的主要输入。
 
-**94 typed actions** total — 49 `pcb`, 26 `schematic`, 7 `board`, 6 `document`,
-2 `system`, 2 `artifact`, and one each in `project`, `debug`.
+**127 typed actions** total — 66 `pcb`, 36 `schematic`, 8 `board`, 7 `document`,
+6 `artifact`, 2 `system`, and one each in `project`, `debug`.
 All but `system.health` are dispatched to the connector; `system.health` is
 answered by the daemon itself (daemon/connector liveness, no window required).
 (Run `make actions` for the authoritative list — this prose count can lag.)
@@ -379,10 +379,11 @@ Workspace → Project → **Board** → schematic + PCB. Map to `eda.dmt_Board.*
     daemon-free — the local companion to the JSON, like `parts-select.py` is for
     parts. Schematic instantiation is the phase-2 write path (see Roadmap →
     `sch block apply`).
-- **Connector self-healing reconnect** — the connector port-scans 60832-60841,
-  validates a handshake, and reconnects on liveness loss. It **never permanently
-  gives up**: after 5 fast retries it drops to a quiet 10s background poll, so a
-  daemon started/restarted later auto-reconnects with no manual action. A
+- **Connector self-healing reconnect** — the connector pins `60832`, validates a
+  handshake, and reconnects on liveness loss with bounded exponential backoff.
+  A worker watchdog survives background timer throttling, force-resets wedged connect
+  flows, and rotates the activation-scoped WebSocket id after repeated silent
+  registration failures, so a daemon started/restarted later reconnects without manual action. A
   low-volume `log` frame surfaces connection-lifecycle diagnostics in the daemon
   log (`connector LOG: …`).
 - **`make eext` release flow** — bumps the PATCH version and builds an importable
@@ -400,6 +401,8 @@ Workspace → Project → **Board** → schematic + PCB. Map to `eda.dmt_Board.*
   `--check --exit-code` exits **10** when anything is behind, so agents/CI can
   gate on version drift. A **dev build is never overwritten** without `--force`
   (air rebuilds it anyway; silently replacing it would make the dev loop lie).
+  The full-stack one-line installer additionally updates the release MCP bundle and
+  idempotently refreshes Codex registration.
 
 ---
 

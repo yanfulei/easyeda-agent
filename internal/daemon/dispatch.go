@@ -237,6 +237,71 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	}
 	req.CreatedAt = time.Now().UTC()
 	req.WindowID = target.id()
+	// Server-authoritative write classification for the connector quarantine.
+	// Never trust a raw caller's JSON value: the catalog minus dry-run previews
+	// is the same predicate autosave/stale-read gates already use.
+	req.Mutates = requestMutates(&req)
+	// Context switches stay non-mutating for autosave/stale-read/workflow logic,
+	// but are write-sensitive for abandoned-handler quarantine and release leases.
+	// Raw callers cannot forge either classification.
+	req.WriteSensitive = requestWriteSensitive(&req)
+	// Manufacturing write lease: admission and lease acquisition share one
+	// mutex, so another client cannot slip a mutation through between "lease
+	// acquired" and the first release action. Reads stay available for
+	// diagnostics; document switches are treated like writes because they drift
+	// the foreground target.
+	if s.writeLeases != nil {
+		releaseAdmission, held, leaseErr := s.writeLeases.admit(
+			writeLeaseTargetFromWindow(target.snapshot()),
+			req.ClientID,
+			req.WriteSensitive,
+		)
+		if leaseErr != nil {
+			started := time.Now().UTC()
+			detail := "wait for manufacturing release to finish or for its TTL to expire; do not retry this mutation in a loop"
+			if held != nil {
+				detail = fmt.Sprintf("%s (leaseId=%s target=%s/%s)", detail, held.LeaseID, held.ProjectUUID, held.DocumentUUID)
+			}
+			errResp := errorResponse(req.ID, "WRITE_LEASE_HELD",
+				"manufacturing release holds the project write lease; action was NOT dispatched",
+				detail)
+			uncertain, retryable := false, true
+			errResp.Error.Uncertain = &uncertain
+			errResp.Error.Retryable = &retryable
+			s.audit.Append(fromResponse(started, &req, &errResp))
+			writeJSON(w, http.StatusLocked, errResp)
+			return
+		}
+		defer releaseAdmission()
+	}
+	// A same-version stale .eext is indistinguishable by semver but can expose a
+	// different action/schema surface. Reads remain available for diagnosis;
+	// writes fail closed before anything reaches the editor.
+	if req.WriteSensitive {
+		daemonFP := protocol.CurrentRuntimeFingerprints()
+		connectorFP := target.runtimeFingerprints()
+		missing := connectorFP.MissingFields()
+		mismatches := protocol.FingerprintMismatches(daemonFP, connectorFP)
+		if len(missing) > 0 || len(mismatches) > 0 {
+			started := time.Now().UTC()
+			problems := make([]string, 0, 2)
+			if len(missing) > 0 {
+				problems = append(problems, "missing fields: "+strings.Join(missing, ", "))
+			}
+			if len(mismatches) > 0 {
+				problems = append(problems, "mismatched fields: "+strings.Join(mismatches, ", "))
+			}
+			errResp := errorResponse(req.ID, "RUNTIME_FINGERPRINT_MISMATCH",
+				"daemon and EasyEDA connector runtime identity is incomplete or different; action was NOT dispatched",
+				strings.Join(problems, "; ")+"; diagnostics/read actions remain available. Rebuild/re-import the connector and restart the daemon from the same source tree")
+			uncertain, retryable := false, false
+			errResp.Error.Uncertain = &uncertain
+			errResp.Error.Retryable = &retryable
+			s.audit.Append(fromResponse(started, &req, &errResp))
+			writeJSON(w, http.StatusConflict, errResp)
+			return
+		}
+	}
 
 	// Workflow stage gate (issue #97): routing actions refuse until the
 	// project's persisted stage state authorizes them — enforced HERE, at the
@@ -322,6 +387,13 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	defer s.beginClientAction(req.WindowID)()
 	resp, err, _ := forwardWithAdaptiveRetry(ctx, req, target.dispatch, hooks)
 	if err != nil {
+		// A timed-out mutation may still land after the caller has gone. Arm the
+		// durability safety net now: save is idempotent, and the connector's write
+		// quarantine will refuse/reschedule it until the original handler settles.
+		// Without this, a late ghost write could remain only in memory forever.
+		if req.Mutates && isTimeoutErr(err) {
+			s.maybeAutosave(&req)
+		}
 		// One timed-out FIFO action is not yet proof of a blocked queue — a light
 		// queued read that stays unanswered IS. Fire that probe now (never awaited)
 		// so the NEXT command gets an instant answer instead of another full budget
@@ -503,10 +575,22 @@ func (s *Server) persistArtifacts(resp *protocol.Response, dir string) {
 
 // systemHealthResponse reports daemon liveness and the connected windows.
 func (s *Server) systemHealthResponse(id string) protocol.Response {
-	windows := s.hub.list()
+	windows := s.hub.listAnnotated(s.opts.Version)
 	ids := make([]string, 0, len(windows))
 	for _, w := range windows {
 		ids = append(ids, w.WindowID)
+	}
+	result := map[string]any{
+		"service":      Service,
+		"version":      s.opts.Version,
+		"fingerprints": protocol.CurrentRuntimeFingerprints(),
+		"windows":      windows,
+		"windowIds":    ids,
+	}
+	if s.writeLeases != nil {
+		if leases := s.writeLeases.list(); len(leases) > 0 {
+			result["writeLeases"] = leases
+		}
 	}
 	return protocol.Response{
 		Envelope: protocol.Envelope{
@@ -515,13 +599,8 @@ func (s *Server) systemHealthResponse(id string) protocol.Response {
 			Version:   "v1",
 			CreatedAt: time.Now().UTC(),
 		},
-		OK: true,
-		Result: map[string]any{
-			"service":   Service,
-			"version":   s.opts.Version,
-			"windows":   windows,
-			"windowIds": ids,
-		},
+		OK:     true,
+		Result: result,
 	}
 }
 

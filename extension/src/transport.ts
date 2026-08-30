@@ -32,8 +32,9 @@
 
 import { ActionQueue, isBypassAction } from './action-queue';
 import { sweepDeadlines } from './deadlines';
-import { buildContextFrame, readEasyEdaVersion } from './eda-context';
+import { buildContextFrame, readEasyEdaVersion, readResponseContext } from './eda-context';
 import { runAction } from './actions';
+import { currentRuntimeFingerprints, fingerprintMismatches, missingFingerprintFields } from './runtime-fingerprints';
 import { createWebSocketId } from './transport-identity';
 import {
 	ActionError,
@@ -156,6 +157,8 @@ const STORAGE_KEY_AUTO_CONNECT = 'autoConnectEnabled';
 // ─── State ────────────────────────────────────────────────────────────
 
 let currentPort: number | null = null;
+const connectorFingerprints = currentRuntimeFingerprints();
+let daemonFingerprints: import('./protocol').RuntimeFingerprints | undefined;
 // The last port that completed a handshake. Survives disconnects on purpose —
 // it is the hint that makes a reconnect a single attempt instead of a sweep.
 let lastGoodPort: number | null = null;
@@ -560,6 +563,7 @@ function tryConnectToPort(port: number, sessionId: number): Promise<boolean> {
 						// Handshake phase.
 						if (msg.type === 'handshake') {
 							if ((msg as { service?: string }).service === SERVICE_ID) {
+								daemonFingerprints = (msg as import('./protocol').HandshakeFrame).fingerprints;
 								handshakeVerified = true;
 								windowId = crypto.randomUUID();
 								lastContextSig = '';
@@ -612,6 +616,7 @@ function sendRegister(): void {
 		connectorVersion: CONNECTOR_VERSION,
 		easyedaVersion: readEasyEdaVersion(),
 		capabilities: CAPABILITIES,
+		fingerprints: connectorFingerprints,
 	};
 	sendFrame(frame);
 }
@@ -902,9 +907,15 @@ async function handleRequest(request: RequestFrame): Promise<void> {
 	// 换成先 await 再入队,FIFO 立刻退化回原来的并发。
 	const outcome = await actionQueue.submit({
 		id: request.id,
+		action: request.action,
 		timeoutMs: request.timeoutMs,
+		createdAtMs: request.createdAt === undefined ? undefined : Date.parse(request.createdAt),
+		mutates: request.mutates === true,
+		// Mutations are always sensitive even when talking to a transitional daemon
+		// that predates the explicit writeSensitive wire field.
+		writeSensitive: request.writeSensitive === true || request.mutates === true,
 		bypass: isBypassAction(request.action),
-		run: () => runAction(request.action, request.payload),
+		run: () => runBoundAction(request),
 	});
 
 	let response: ResponseFrame;
@@ -940,10 +951,44 @@ async function handleRequest(request: RequestFrame): Promise<void> {
 				error: {
 					code: ErrorCodes.ACTION_ABANDONED,
 					message: `action "${request.action}" was abandoned after ${outcome.waitedMs}ms so the queue could keep flowing`,
-					detail: 'the handler is still running; its effect may land later — treat any conclusion about this write as unproven (seqAbandoned was incremented)',
+					detail: outcome.writeSensitive
+						? 'the write-sensitive handler is still running and its effect may land later; later mutations, autosave, and context switches are quarantined until it settles'
+						: 'the read handler is still running; no result is available (seqAbandoned was incremented)',
+					uncertain: outcome.writeSensitive,
+					retryable: !outcome.writeSensitive,
 				},
 			};
 			break;
+		case 'expired':
+			response = {
+				...base,
+				ok: false,
+				error: {
+					code: ErrorCodes.ACTION_EXPIRED,
+					message: `action "${request.action}" expired in the connector queue after ${outcome.waitedMs}ms and was NOT executed`,
+					detail: 'the absolute createdAt + timeoutMs deadline elapsed before its handler could start',
+					uncertain: false,
+					retryable: true,
+				},
+			};
+			break;
+		case 'quarantined': {
+			const blocker = outcome.blockerAction
+				? `${outcome.blockerAction} (${outcome.blockerId})`
+				: outcome.blockerId;
+			response = {
+				...base,
+				ok: false,
+				error: {
+					code: ErrorCodes.MUTATION_QUARANTINED,
+					message: `write-sensitive action "${request.action}" was NOT executed because abandoned action ${blocker} is still running`,
+					detail: `write quarantine has been active for ${outcome.blockedMs}ms; wait for the original handler to settle, then verify what landed before issuing a write or switching documents`,
+					uncertain: false,
+					retryable: false,
+				},
+			};
+			break;
+		}
 		case 'overflow':
 			response = {
 				...base,
@@ -952,6 +997,8 @@ async function handleRequest(request: RequestFrame): Promise<void> {
 					code: ErrorCodes.QUEUE_OVERFLOW,
 					message: `connector action queue is full (${outcome.depth} waiting) — this action was NOT executed`,
 					detail: 'the editor is not draining actions; wait for the backlog to settle (each head is abandoned after its own timeoutMs) or restart EasyEDA',
+					uncertain: false,
+					retryable: true,
 				},
 			};
 			break;
@@ -975,7 +1022,9 @@ function toResponseError(err: unknown): ResponseFrame['error'] {
 		return {
 			code: err.code,
 			message: err.message,
-			detail: err.detail,
+				detail: err.detail,
+				uncertain: err.uncertain,
+				retryable: err.retryable,
 		};
 	}
 	const message = describeThrown(err);
@@ -983,4 +1032,47 @@ function toResponseError(err: unknown): ResponseFrame['error'] {
 		code: ErrorCodes.INTERNAL_ERROR,
 		message,
 	};
+}
+
+/** Execute both pre-handler gates from inside the FIFO task. No await may move
+ * before ActionQueue.submit in handleRequest: synchronous submission is what
+ * makes message arrival order equal queue order. */
+async function runBoundAction(request: RequestFrame): Promise<import('./protocol').ActionResult> {
+	if (request.mutates === true) {
+		const missing = missingFingerprintFields(daemonFingerprints);
+		const mismatches = fingerprintMismatches(daemonFingerprints, connectorFingerprints);
+		if (missing.length > 0 || mismatches.length > 0) {
+			const problems = [
+				missing.length > 0 ? `missing ${missing.join(', ')}` : '',
+				mismatches.length > 0 ? `mismatched ${mismatches.join(', ')}` : '',
+			].filter(Boolean).join('; ');
+			throw new ActionError(
+				ErrorCodes.RUNTIME_FINGERPRINT_MISMATCH,
+				`daemon runtime identity is incomplete or differs from the connector (${problems}); mutation was NOT executed`,
+				'rebuild/re-import the connector and restart the daemon from the same source tree; read and health actions remain available',
+				{ uncertain: false, retryable: false },
+			);
+		}
+	}
+
+	const expected = request.expectedContext;
+	if (expected) {
+		const live = await readResponseContext();
+		const mismatches: Array<string> = [];
+		for (const field of ['projectUuid', 'documentUuid', 'documentType'] as const) {
+			if (expected[field] !== undefined && expected[field] !== '' && live[field] !== expected[field]) {
+				mismatches.push(`${field}: expected=${JSON.stringify(expected[field])} live=${JSON.stringify(live[field] ?? '')}`);
+			}
+		}
+		if (mismatches.length > 0) {
+			throw new ActionError(
+				ErrorCodes.TARGET_CONTEXT_MISMATCH,
+				`active EasyEDA target changed before "${request.action}"; action was NOT executed`,
+				mismatches.join('; '),
+				{ uncertain: false, retryable: false },
+			);
+		}
+	}
+
+	return runAction(request.action, request.payload);
 }

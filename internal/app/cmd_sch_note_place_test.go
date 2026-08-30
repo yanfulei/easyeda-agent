@@ -302,3 +302,30 @@ func TestWrapNoteContentUsesItsOwnFontRuler(t *testing.T) {
 		t.Errorf("窄预算下折行仍应保持可读宽度 ≈%.0f,实际 %.1f", noteMinReadableWidth, w)
 	}
 }
+
+func TestWrapNoteContentPrefersEnglishWordBoundaries(t *testing.T) {
+	const content = "POWER LED: red LED with 1k series resistor\nOUTPUT: 3.3V and GND screw terminal"
+	wrapped := wrapNoteContent(content, 10, 160)
+	for _, broken := range []string{"res\nistor", "sc\nrew", "ter\nminal"} {
+		if strings.Contains(wrapped, broken) {
+			t.Fatalf("English word was split despite an available space boundary (%q):\n%s", broken, wrapped)
+		}
+	}
+	for _, line := range strings.Split(wrapped, "\n") {
+		if w, _ := noteSizeOf(line, 10); w > 160+acOverlapEps {
+			t.Fatalf("wrapped line exceeds budget: %.1f > 160: %q", w, line)
+		}
+	}
+}
+
+func TestWrapNoteContentHardWrapsSingleOverlongToken(t *testing.T) {
+	wrapped := wrapNoteContent(strings.Repeat("x", 80), 10, 120)
+	if !strings.Contains(wrapped, "\n") {
+		t.Fatalf("an overlong token still needs a rune-boundary fallback: %q", wrapped)
+	}
+	for _, line := range strings.Split(wrapped, "\n") {
+		if w, _ := noteSizeOf(line, 10); w > 120+acOverlapEps {
+			t.Fatalf("hard-wrapped line exceeds budget: %.1f > 120: %q", w, line)
+		}
+	}
+}

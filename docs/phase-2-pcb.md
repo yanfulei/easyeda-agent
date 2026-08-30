@@ -67,7 +67,7 @@ PCB **沿用同一条链路,原则不变**:typed actions(新增 `pcb` Domain)→
 ## 3. 架构改动清单(具体)
 
 - **Go 目录**(`internal/protocol/actions.go:5-12`):枚举加 `DomainPcb Domain = "pcb"`,`Phase1Actions()` 追加约 20 条 `pcb.*` spec。`dispatch.go` 的 `knownActions` 自动派生——**daemon 零路由改动**。复用 `Mutates/NeedsWindow/NeedsConfirm/Phase/VerifyWith`(如 `pcb.component.delete`、`pcb.clear_routing`、`pcb.pour.delete` 都置 `NeedsConfirm=true`)。
-- **连接器能力标签**(`extension/src/protocol.ts:10`):`CAPABILITIES = ['schematic.v1']` → 加 `'pcb.v1'`。transport(端口扫描 49620-49629、握手、心跳重连)与帧协议**无原理图语义,原样复用**。
+- **连接器能力标签**(`extension/src/protocol.ts:10`):`CAPABILITIES = ['schematic.v1']` → 加 `'pcb.v1'`。transport(当前固定 `60832`、握手、心跳重连)与帧协议**无原理图语义,原样复用**。
 - **连接器 handlers**(`extension/src/actions.ts:817`):向 `HANDLERS: Record<string,Handler>` 追加 `pcb.*`;`runAction` 已按 `HANDLERS[action]` 派发。新增 PCB 版 `serializeComponent/serializePrimitive`(镜像 actions.ts:59-83)。
 - **PCB 文档守卫**:`document.current` 已暴露 `documentType`——`NeedsWindow` 守卫可断言"当前文档是 PCB",小 helper,无新 transport。
 - **新单位/坐标模块**(原理图无对应):统一 PCB 数据单位 = mil;会话开始 `setCanvasOrigin(0,0)`;暴露 `sys_Unit.mmToMil/milToMm`(同步);约定所有 `pcb.*` 的 x/y 为 mil、y-up、已网格取整。

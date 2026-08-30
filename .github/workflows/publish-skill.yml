@@ -53,6 +53,15 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "发布版本: $VERSION (来自 '$RAW')"
 
+      # release tag、连接器、MCP、DSH bundle、npm lock 与 skill 必须同版。
+      # 这道门在任何外部发布/认证之前跑，版本漂移时不会发出半套资产。
+      - name: Verify all release metadata matches the tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          python3 scripts/sync-skill-version.py "$VERSION" --check
+          grep -Eq "^## \\[${VERSION//./\\.}\\]" extension/CHANGELOG.md
+
       # 门禁:官方 Agent Skills 规范验证器,校验的是 repo 里那份**未加工**的
       # SKILL.md。注意它和 skillhub 的要求是互斥的(它拒收 slug/displayName),
       # 所以这一步必须跑在注入之前 —— 注入只发生在 make 目标的临时副本里。

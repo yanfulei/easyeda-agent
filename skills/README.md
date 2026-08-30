@@ -21,12 +21,13 @@ Install the `easyeda` CLI/daemon first, then import the EasyEDA connector URL pr
 by the installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 ```
 
 The installer auto-detects your AI clients and installs/updates the
 `easyeda-agent` skill into each: Codex (`~/.codex/skills/easyeda-agent`) and
-Claude Code (`~/.claude/skills/easyeda-agent`). Set
+Claude Code (`~/.claude/skills/easyeda-agent`). When Codex is present it also
+installs the locked MCP release bundle and idempotently registers it. Set
 `EASYEDA_INSTALL_SKILLS=codex,claude` to force targets, `none` to skip, or
 `EASYEDA_SKILL_PRESERVE=1` to keep local edits during an update.
 
@@ -41,9 +42,10 @@ To install only the skill from a registry:
 # ClawHub
 clawhub install easyeda-agent
 
-# 国内 SkillHub
-skillhub install easyeda-agent --registry https://skillhub.cn
 ```
+
+skillhub.cn currently has no working CLI install API; use the release installer
+instead of a registry command there.
 
 ## Internal Layout
 
@@ -58,7 +60,7 @@ The merged skill keeps the old separation internally through progressive disclos
 - `references/orientation.json`: netflag/netport rotation truth。
 - `references/standard-parts.json`: curated standard parts library。
 - `scripts/`: lint, BOM enrichment, part cache write-back, selection, calibration tools。
-- **电路块库不在技能里** —— 20 个块住在 CLI(`easyeda blocks ls/show/search`,`internal/blocks/data/*.json`
+- **电路块库不在技能里** —— 块住在 CLI(`easyeda blocks ls/show/search`,`internal/blocks/data/*.json`
   经 go:embed,离线、零 daemon 依赖);技能只**指向**它(铁律 8 + 块地图速查)。别到 `references/` 找块 JSON。
 
 ## Removed Split Directories

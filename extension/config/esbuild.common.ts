@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 import type esbuild from 'esbuild';
@@ -11,6 +12,15 @@ import type esbuild from 'esbuild';
 const extJson = JSON.parse(
 	readFileSync(join(__dirname, '..', 'extension.json'), 'utf-8'),
 );
+const repoRoot = join(__dirname, '..', '..');
+let buildFingerprint = 'dev';
+try {
+	buildFingerprint = execFileSync('sh', [join(repoRoot, 'scripts', 'build-fingerprint.sh')], {
+		cwd: repoRoot,
+		encoding: 'utf-8',
+	}).trim() || 'dev';
+}
+catch { /* source archive without git metadata: retain the explicit unknown */ }
 
 export default {
 	entryPoints: {
@@ -30,6 +40,7 @@ export default {
 	ignoreAnnotations: true,
 	define: {
 		__CONNECTOR_VERSION__: JSON.stringify(extJson.version ?? '0.0.0-dev'),
+		__BUILD_FINGERPRINT__: JSON.stringify(buildFingerprint),
 	},
 	external: [],
 } satisfies Parameters<(typeof esbuild)['build']>[0];

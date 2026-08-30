@@ -6,8 +6,8 @@ DSH（`@deepseek-ai/dsh`，Cordis 插件化框架）原生支持 skill 与 MCP c
 | DSH 形态 | 本项目资产 | 落地方式 | 开发量 |
 |---|---|---|---|
 | **Skill**（SKILL.md 自动发现） | `skills/easyeda-agent/SKILL.md` | 软链进 DSH skill 根 | 0 |
-| **MCP client**（`dsh-mcp-client` 桥接） | `mcp/`（stdio MCP server，11 工具） | `cordis.patch.yml` 加一行插件实例 | 几行 YAML |
-| **Bundle 插件包**（`dsh.bundle.patch` 声明） | 仓库根 `package.json` + `cordis.patch.yml` | `dsh plugin add github:zhoushoujianwork/easyeda-agent#<tag>` 一行装 | 已完成 |
+| **MCP client**（`dsh-mcp-client` 桥接） | `mcp/`（stdio MCP server，至少 19 工具） | `cordis.patch.yml` 加一行插件实例 | 几行 YAML |
+| **Bundle 插件包**（`dsh.bundle.patch` 声明） | 仓库根 `package.json` + `cordis.patch.yml` | `dsh plugin add github:yanfulei/easyeda-agent#<tag>` 一行装 | 已完成 |
 | **原生 Cordis 插件**（`ctx.tools` / client-plugin UI） | 暂无 | 新建 npm 包，注册结构化工具 / daemon 状态面板 | 中等，跟 rc 版本 |
 
 ## 团队/他人接入（推荐：Bundle 一键安装）
@@ -15,7 +15,7 @@ DSH（`@deepseek-ai/dsh`，Cordis 插件化框架）原生支持 skill 与 MCP c
 **任何人 `dsh plugin add` 一行装完**（skill + MCP 全部就位，无需 clone、无需改配置）：
 
 ```sh
-dsh plugin --profile web add "github:zhoushoujianwork/easyeda-agent#<tag>"
+dsh plugin --profile web add "github:yanfulei/easyeda-agent#<tag>"
 # 重启 dsh web 生效；升级/卸载走 Settings → Plugins
 ```
 
@@ -31,12 +31,14 @@ profile 的活跃 bundle 层，注入两个行：
    skill-filesystem 被官方 bundle 禁用、preset 自有发现，故用隔离实例，不冲突）。
 
 **已验证（2026-08-14）**：`dsh plugin add file:...` 到 headless profile → 自动
-提升为 bundle 层 → headless 会话实测模型可见全部 11 个 `mcp__easyeda__*` 工具
+提升为 bundle 层 → headless 会话实测模型可见完整的 `mcp__easyeda__*` 工具集
 + `easyeda-agent` skill。`.npmignore` 已排除 bin/dist 等构建产物，`github:`
-  安装只会打包 package.json / cordis.patch.yml / mcp/ / skills/ 等。
+   安装只会打包 package.json / cordis.patch.yml / mcp/ / skills/ 等。
+根 `package.json` 精确声明 `@modelcontextprotocol/sdk` 依赖,因此 bundle 内的
+`mcp/src/server.mjs` 不依赖 DSH 宿主碰巧预装同名 SDK。
 
-**版本同步**：根 `package.json` 的 `version` 应与 release tag 对齐（`make release`
-目前不自动改它，发版前手动同步一次即可）。
+**版本同步**：根 `package.json`、MCP/连接器 package 与 lock、Skill metadata 均由
+`make release-sync VERSION=vX.Y.Z` 同步；`make release-check` 会在发布前机械复核。
 
 ## 团队/他人接入（兜底：一键脚本）
 
@@ -45,13 +47,13 @@ profile 的活跃 bundle 层，注入两个行：
 防重复）：
 
 ```bash
-git clone https://github.com/zhoushoujianwork/easyeda-agent.git
+git clone https://github.com/yanfulei/easyeda-agent.git
 bash easyeda-agent/scripts/dsh-install.sh                  # profile 默认 web
 # bash easyeda-agent/scripts/dsh-install.sh --profile headless
 # DSH_HOME=/custom/.dsh bash easyeda-agent/scripts/dsh-install.sh
 ```
 
-前提：已装 `easyeda` CLI（`curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh`）、
+前提：已装 `easyeda` CLI（`curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh`）、
 `web` profile 至少启动过一次（先 `dsh web` 初始化）。脚本会：①软链 skill
 （watcher 即时发现）；②注入/更新 `cordis.patch.yml` 里的 `easyeda-mcp` 条目
 （含 MCP server 与 `EASYEDA_BIN` 的绝对路径）；③打印验证与重启提示。之后
@@ -91,7 +93,7 @@ DSH 的 skill-filesystem 提供者扫描根：`<projectRoot>/.dsh/skills`、
 ```
 
 生效后模型看到 `mcp__easyeda__easyeda_health`、`mcp__easyeda__easyeda_schematic`
-等 11 个结构化工具（参数走 MCP 字段而非 shell 文本）。
+等至少 19 个结构化工具（参数走 MCP 字段而非 shell 文本）。
 
 **版本坑（已踩）**：DSH 的插件解析顺序是 profile 自己的 `node_modules` 优先，
 其次才是 `$DSH_HOME/profiles/node_modules` 的扁平 fallback（由 `dsh` 启动时的
@@ -108,7 +110,7 @@ API 与当前 dsh 不匹配。**in-box 插件不需要装进 profile**——只�
 # 配置合并树（不启动服务）：应出现 easyeda-mcp 条目
 dsh --profile web --dump-config | grep -A 16 easyeda-mcp
 
-# MCP server 自身握手：应列出 11 个 easyeda_* 工具
+# MCP server 自身握手：应列出至少 19 个 easyeda_* 工具
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' | \
   EASYEDA_BIN=$(which easyeda) node mcp/src/server.mjs
 ```
@@ -120,7 +122,7 @@ skill 软链则由 watcher 即时发现。重启方式：找到 dsh 进程 kill 
 ## 演进方向 — 路径 C（原生插件）
 
 写一个 profile 本地插件 / npm 包：
-- `ctx.tools.register()`：把 20 个 typed actions 直接映射成结构化 DSH 工具，
+- `ctx.tools.register()`：把 `make actions` 生成的完整 typed-action catalog 直接映射成结构化 DSH 工具，
   摆脱 CLI 文本解析（比 MCP 更"第一方"，可拿 `ctx.skills`/approval/scope 集成）；
 - `ctx.skills.register()`：runtime 注册 skill（rank 250，可被项目级覆盖）；
 - client-plugin：daemon 状态 / 连接器健康 / `layout-lint` 结果 / audit 基线

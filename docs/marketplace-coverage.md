@@ -42,7 +42,7 @@
 | **manufacturing-output** | | | |
 | eext-mcad-integration | 板 3D STEP 导出 + 与 FreeCAD/Fusion/SW 双向 live-sync | ⬜none | 零 3D/STEP。live-sync 是交互胶水不吸;但 `get3DFile` 单调用可做 `pcb export-3d` |
 | **infra** | | | |
-| eext-run-api-gateway | 官方 WS 桥,让外部 AI 工具在 EDA 内跑 eda.* | ✅full | 与我们 `transport.ts` 端口扫描 49620-49629 + daemon 逐字撞型;我们是其严格超集 |
+| eext-run-api-gateway | 官方 WS 桥,让外部 AI 工具在 EDA 内跑 eda.* | ✅full | WS/握手架构与我们撞型;其扫描 49620-49629,我们固定 60832 并保留覆盖列表逃生口 |
 
 > 注:表中无 🧱wall——各插件评估**逐一证伪**了原调研的平台墙 (diff-pair/fanout/length-match/teardrop/net-length 均可达),需回写 KNOWN PLATFORM WALLS 笔记。
 
@@ -71,4 +71,4 @@
 ## 4. 已覆盖 — 验证方向正确
 
 - **eext-netlist-explorer** (✅full):其核心数据源 `sch_ManufactureData.getNetlistFile()` 与我们 `sch read`/`sch check`/`sch netlist` 完全同一权威 API——证明我们的 netlist 语义快照选对了源头,剩余差异全是我们刻意不做的 web 可视化。
-- **eext-run-api-gateway** (✅full):官方 WS 桥端口扫描 49620-49629 + `/health` 握手 + 心跳重连,与我们 `transport.ts` + Go daemon (`/health`/`/eda`/`/action`) **逐字撞型**。⚠撞型也撞端口:两家外部工具会抢同一个 49620 绑定——**0.15.0 起我们已迁到专属段 `60832-60841`(`0xEDA0`-`0xEDA9`)**,彻底避开。我们当年刻意自建 (connector-architecture-decision),并在其上叠 20 typed actions + Cobra CLI + skill——是它面向 agent 的严格超集。这两个 full 项证明:**架构选型与权威数据源都押对了**。
+- **eext-run-api-gateway** (✅full):官方 WS 桥端口扫描 49620-49629 + `/health` 握手 + 心跳重连,与我们 `transport.ts` + Go daemon (`/health`/`/eda`/`/action`) **架构撞型**。⚠两边最初也撞端口;**0.15.0 起我们迁到专属段 `60832-60841`(`0xEDA0`-`0xEDA9`),当前默认只连接固定 `60832`**,彻底避开。我们当年刻意自建 (connector-architecture-decision),并在其上叠完整 typed-action catalog + Cobra CLI + skill——是它面向 agent 的严格超集。这两个 full 项证明:**架构选型与权威数据源都押对了**。

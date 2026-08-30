@@ -1,4 +1,4 @@
-// Bump the connector version in extension.json + package.json in lock-step.
+// Bump the connector version in extension.json + npm metadata in lock-step.
 //
 // EasyEDA dedups installed extensions by (uuid, version): re-importing an .eext
 // whose version equals the installed one is a no-op. So every connector change
@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extPath = path.join(here, '..', 'extension.json');
 const pkgPath = path.join(here, '..', 'package.json');
+const lockPath = path.join(here, '..', 'package-lock.json');
 const changelogPath = path.join(here, '..', 'CHANGELOG.md');
 
 // Does CHANGELOG.md carry a `## [<version>]` heading for this version?
@@ -56,6 +57,10 @@ function writeJsonTabs(file, obj) {
 	fs.writeFileSync(file, `${JSON.stringify(obj, null, '\t')}\n`, 'utf-8');
 }
 
+function writeJsonSpaces(file, obj) {
+	fs.writeFileSync(file, `${JSON.stringify(obj, null, 2)}\n`, 'utf-8');
+}
+
 const args = process.argv.slice(2);
 const mode = args.find((a) => !a.startsWith('--')) ?? 'patch';
 const freshUuid = args.includes('--uuid'); // opt-in fallback: mint a new uuid
@@ -65,6 +70,7 @@ const requireChangelog = args.includes('--require-changelog');
 
 const ext = JSON.parse(fs.readFileSync(extPath, 'utf-8'));
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+const lock = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
 
 const from = ext.version;
 const to = nextVersion(from, mode);
@@ -81,11 +87,18 @@ const toUuid = freshUuid ? crypto.randomUUID().replaceAll('-', '') : fromUuid;
 ext.version = to;
 ext.uuid = toUuid;
 pkg.version = to;
+lock.version = to;
+if (!lock.packages?.['']) {
+	throw new Error('package-lock.json has no root packages[""] entry');
+}
+lock.packages[''].version = to;
+lock.packages[''].license = pkg.license;
 
 writeJsonTabs(extPath, ext);
 writeJsonTabs(pkgPath, pkg);
+writeJsonSpaces(lockPath, lock);
 
-console.log(`version ${from} -> ${to}  (extension.json + package.json)`);
+console.log(`version ${from} -> ${to}  (extension.json + package.json + package-lock.json)`);
 console.log(freshUuid
 	? `uuid    ${fromUuid} -> ${toUuid}  (FRESH uuid — imports as a new extension; delete the old one)`
 	: `uuid    ${toUuid}  (unchanged — update in place: uninstall old in 已安装, then import)`);

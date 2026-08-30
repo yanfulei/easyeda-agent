@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/zhoushoujianwork/easyeda-agent/internal/protocol"
@@ -109,6 +110,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newBoardCmd(cfg, stdout, stderr),
 		newViewCmd(cfg, stdout, stderr),
 		newBomCmd(cfg, stdout, stderr),
+		newManufacturingCmd(cfg, stdout, stderr),
 		newLibCmd(cfg, stdout, stderr),
 		newBlocksCmd(stdout, stderr),
 		newApiCmd(stdout, stderr),
@@ -186,6 +188,7 @@ func newActionsCmd(stdout, _ io.Writer) *cobra.Command {
 
 func newCallCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command {
 	var window, payload string
+	var timeout time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "call <action>",
@@ -193,6 +196,7 @@ func newCallCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		Example: `  easyeda call system.health
   easyeda call schematic.components.list --window win-1
+	  easyeda call pcb.drc.check --timeout 2m
   easyeda call schematic.component.place --payload '{"libraryUuid":"...","uuid":"...","x":100,"y":200}'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			action := args[0]
@@ -204,10 +208,14 @@ func newCallCmd(cfg *appConfig, stdout, stderr io.Writer) *cobra.Command {
 				}
 			}
 
-			return dispatch(cfg, action, window, payloadMap, stdout, stderr)
+			if timeout <= 0 {
+				timeout = catalogActionTimeout(action)
+			}
+			return dispatchTimed(cfg, action, window, payloadMap, timeout, stdout, stderr)
 		},
 	}
 	cmd.Flags().StringVar(&window, "window", "", "EasyEDA window ID")
 	cmd.Flags().StringVar(&payload, "payload", "", "action payload as a JSON object")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "end-to-end timeout (default: action catalog timeoutMs; examples: 90s, 2m)")
 	return cmd
 }

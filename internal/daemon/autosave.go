@@ -28,6 +28,16 @@ var mutatesAction = func() map[string]bool {
 	return m
 }()
 
+// changesContextAction is catalog-owned for the same reason as mutatesAction:
+// callers cannot downgrade a document switch to escape connector quarantine.
+var changesContextAction = func() map[string]bool {
+	m := map[string]bool{}
+	for _, a := range protocol.AllActions() {
+		m[a.Name] = a.ChangesContext
+	}
+	return m
+}()
+
 // dryRunPayloadField is the payload key every dry-runnable action uses to mark a
 // request as a PREVIEW. It is a project-wide convention, not a per-action one:
 // the actions that forward a preview flag to the connector (pcb.page.clear,
@@ -60,6 +70,13 @@ func isDryRunRequest(req *protocol.Request) bool {
 // neither arm autosave nor the stale-read guard (issue #112).
 func requestMutates(req *protocol.Request) bool {
 	return req != nil && mutatesAction[req.Action] && !isDryRunRequest(req)
+}
+
+// requestWriteSensitive is the connector-quarantine predicate. A context
+// switch is not a document mutation, but it must wait for an abandoned write to
+// settle or that late write can race onto the newly focused document.
+func requestWriteSensitive(req *protocol.Request) bool {
+	return requestMutates(req) || (req != nil && changesContextAction[req.Action])
 }
 
 // saveActionForDocType returns the typed save action for a documentType, or ""
@@ -204,6 +221,19 @@ func (s *Server) deferAutosave(windowID, saveAction string) bool {
 	if s.autosave == nil {
 		return false
 	}
+	// A manufacturing release owns every write in the project, including
+	// daemon-originated saves. Do not apply autosaveMaxDefer here: forcing a save
+	// after 60s would violate the lease exactly when a slow DRC/export needs it
+	// most. Keep the timer armed; explicit release or TTL expiry resumes it.
+	if s.writeLeases != nil && s.hub != nil {
+		if target, ok := s.hub.target(windowID); ok {
+			if held, _ := s.writeLeases.held(writeLeaseTargetFromWindow(target.snapshot())); held != nil {
+				s.autosave.deferredFor(windowID, time.Now())
+				s.autosave.schedule(windowID, saveAction)
+				return true
+			}
+		}
+	}
 	busy := s.clientActionsInFlight(windowID) > 0
 	if _, _, blocked := s.queueBlocks.blocked(windowID); blocked {
 		// 队列已经堵死:再灌一条保存只会加长积压,而它照样得排队。
@@ -234,6 +264,25 @@ func (s *Server) dispatchSave(windowID, saveAction string) {
 	if s.deferAutosave(windowID, saveAction) {
 		return
 	}
+	// Close the final acquire-vs-autosave race. The lease check above and the
+	// connector dispatch are not one atomic operation; reserving a normal
+	// sensitive-action admission here means either this save is already in
+	// flight (lease acquire returns WRITE_LEASE_BUSY) or the lease wins first
+	// (this save is re-armed without touching EasyEDA).
+	var releaseAdmission func()
+	if s.writeLeases != nil {
+		var leaseErr error
+		releaseAdmission, _, leaseErr = s.writeLeases.admit(
+			writeLeaseTargetFromWindow(target.snapshot()),
+			"",
+			true,
+		)
+		if leaseErr != nil {
+			s.retryAutosave(windowID, saveAction)
+			return
+		}
+		defer releaseAdmission()
+	}
 	req := protocol.Request{
 		Envelope: protocol.Envelope{
 			ID:        s.nextRequestID(),
@@ -242,16 +291,48 @@ func (s *Server) dispatchSave(windowID, saveAction string) {
 			WindowID:  windowID,
 			CreatedAt: time.Now().UTC(),
 		},
-		Action: saveAction,
+		Action:    saveAction,
+		TimeoutMs: protocol.ActionTimeoutMs(saveAction),
+		Mutates:   true,
 	}
-	ctx, cancel := context.WithTimeout(s.connCtx, dispatchTimeout)
+	ctx, cancel := context.WithTimeout(s.connCtx, requestTimeout(&req))
 	defer cancel()
 	started := time.Now().UTC()
 	resp, err := target.dispatch(ctx, req)
 	if err != nil {
 		s.logf("autosave: %s on %s failed: %v", saveAction, windowID, err)
+		s.retryAutosave(windowID, saveAction)
 		return
 	}
 	s.audit.Append(fromResponse(started, &req, resp))
 	s.logf("autosave: %s on %s (ok=%v)", saveAction, windowID, resp.OK)
+	if !resp.OK && autosaveResponseRetryable(resp) {
+		// Save is idempotent. A quarantine/queue refusal explicitly means it did
+		// not execute; ACTION_ABANDONED is uncertain but re-saving after its
+		// quarantine clears is still idempotent. Permanent SDK errors are not
+		// hammered forever.
+		s.retryAutosave(windowID, saveAction)
+	}
+}
+
+func autosaveResponseRetryable(resp *protocol.Response) bool {
+	if resp == nil || resp.Error == nil {
+		return false
+	}
+	switch resp.Error.Code {
+	case "MUTATION_QUARANTINED", "ACTION_EXPIRED", "QUEUE_OVERFLOW", "ACTION_ABANDONED":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) retryAutosave(windowID, saveAction string) {
+	if s.autosave == nil || windowID == "" || saveAction == "" {
+		return
+	}
+	if s.connCtx != nil && s.connCtx.Err() != nil {
+		return
+	}
+	s.autosave.schedule(windowID, saveAction)
 }

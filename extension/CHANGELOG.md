@@ -4,6 +4,35 @@ All notable changes to the **EDA Agent Connector** (the easyeda-agent project's 
 The format follows [Keep a Changelog](https://keepachangelog.com/); versions
 follow [SemVer](https://semver.org/).
 
+## [1.2.11] — 2026-08-30
+
+### Added — 可验收的制造交付闭环
+
+- 新增 `easyeda manufacturing release-bundle --spec ...`:锁定唯一 PCB 文档和写租约,
+  依次保存/重载、确认稳定快照、执行 `pcb check` 与原生 DRC,再导出并核验 Gerber、
+  钻孔、BOM、CPL。任一门禁、文件结构、层数或 BOM/CPL 位号对账失败都不发布产物;
+  manifest 记录绑定、检查结果、哈希和 `orderSubmitted:false`,工具永不下单。
+- MCP 增加制造 release、原理图 gate/reconcile/nets、PCB check、spec validate 等
+  guarded workflow 工具;运行时从 `mcp/package.json` 读取握手版本,工具清单与 package
+  同源。
+
+### Fixed — 稳定性与错误文档零容忍
+
+- daemon/连接器增加 runtime fingerprint 与写租约,所有 MCP 原理图/PCB 读写及制造导出
+  强制精确 `project + doc + document type` 绑定;catalog timeout 原样透传。需确认动作改为
+  短时、单次、绑定窗口/文档/载荷的两阶段 token,不再把普通布尔值当授权。
+- 连接器对后台计时器节流、队首动作卡死、daemon 重启后旧 WebSocket id 被平台静默
+  占用等情况增加 worker deadline、看门狗和 id 轮换;自动保存避开在途写与制造租约。
+- 原理图 note/titleblock/zone 写入补齐写后回读、异步落定与幂等恢复路径,避免平台
+  `ok` 回执和真实画布状态不一致时误判成功或盲重试。
+
+### Packaging — 四件套统一为同一 release
+
+- CLI、连接器、Skill、MCP 与 DSH bundle 统一为 `1.2.11`;发布前机械校验 manifest、
+  package-lock、Skill metadata 和 changelog,且只允许从 clean `main` 发版。
+- GitHub Release 新增带锁定生产依赖的 `mcp.tar.gz`;一键安装器校验 sha256 后原子替换
+  MCP 目录,并在检测到 Codex 时幂等执行 `codex mcp add easyeda-agent`。
+
 ## [1.2.10] — 2026-08-27
 
 ### Fixed — README 演示图改回包内相对路径(1.2.9 换版本号重传未解决,定位到真因)

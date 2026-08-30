@@ -3,7 +3,7 @@
 	"uuid": "4dae27407c1d43be98e8e210d45fe587",
 	"displayName": "EDA Agent Connector",
 	"description": "Bridges the local agent daemon to the official eda.* API over a local WebSocket, dispatching typed schematic and PCB actions.",
-	"version": "1.2.10",
+	"version": "1.2.11",
 	"publisher": "zhoushoujian",
 	"engines": {
 		"eda": "~3.2.0"
@@ -11,9 +11,9 @@
 	"license": "MIT",
 	"repository": {
 		"type": "github",
-		"url": "https://github.com/zhoushoujianwork/easyeda-agent"
+		"url": "https://github.com/yanfulei/easyeda-agent"
 	},
-	"homepage": "https://github.com/zhoushoujianwork/easyeda-agent",
+	"homepage": "https://github.com/yanfulei/easyeda-agent",
 	"categories": "Other",
 	"keywords": [
 		"agent",

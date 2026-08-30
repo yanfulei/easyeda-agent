@@ -48,10 +48,8 @@ func TestStaleGuard_ReloadClears(t *testing.T) {
 	runStale(g, "pcb.via.create", "w1", true, nil)
 
 	// `doc reload` is a CLI composite; its daemon-visible discriminator is the
-	// debug.exec_js closeDocument step (a doc switch/document.open must NOT clear).
-	runStale(g, "debug.exec_js", "w1", true, map[string]any{
-		"code": `return await eda.dmt_EditorControl.closeDocument("tab-1")`,
-	})
+	// typed document.close step (a doc switch/document.open must NOT clear).
+	runStale(g, "document.close", "w1", true, map[string]any{"tabId": "tab-1"})
 
 	if resp := runStale(g, "pcb.drc.check", "w1", true, nil); resp.StaleRisk != "" {
 		t.Errorf("read after reload: want no staleRisk, got %q", resp.StaleRisk)
@@ -170,8 +168,25 @@ func TestStaleGuard_CatalogClassification(t *testing.T) {
 			t.Errorf("pcbStaleRead(%q) = false, want true", a)
 		}
 	}
+	if pcbStaleRead(staleReq("pcb.documents.list", "w1", nil)) {
+		t.Error("pcb.documents.list is project metadata, not stale PCB engine state")
+	}
 	if pcbStaleRead(staleReq("schematic.components.list", "w1", nil)) {
 		t.Error("schematic reads must not be classified as PCB stale reads")
+	}
+}
+
+func TestStaleGuard_DocumentInventoryRemainsAvailableForReload(t *testing.T) {
+	g := newStaleGuard()
+	runStale(g, "pcb.component.modify", "w1", true, nil)
+
+	req := staleReq("pcb.documents.list", "w1", nil)
+	if mutation := g.blockedBy(req); mutation != "" {
+		t.Fatalf("pcb.documents.list blocked by %q; doc reload cannot resolve a named PCB", mutation)
+	}
+	resp := runStale(g, "pcb.documents.list", "w1", true, nil)
+	if resp.StaleRisk != "" {
+		t.Fatalf("project document inventory must not carry a PCB-engine stale warning: %q", resp.StaleRisk)
 	}
 }
 

@@ -65,8 +65,10 @@ func tbBoolOr(v any, fallback bool) bool {
 
 // schTitleBlockMerge 读回当前页的全量明细项,把用户的 patch 合并进去。
 //
-// patch 接受两种写法:`{"Name":{"value":"X"}}`(与读回来的形状一致)与
-// `{"Name":"X"}`(顺手写)。被改的项一律带上 showTitle/showValue=true。
+// patch 接受两种写法:`{"Name":{"value":"X","showTitle":false}}`
+// (与读回来的形状一致)与 `{"Name":"X"}`(顺手写)。对象写法逐字段合并,
+// 未给的 value 从当前图签保留;showTitle/showValue 未给时仍默认 true,
+// 兼容旧行为且避免平台吞 null。
 func schTitleBlockMerge(cfg *appConfig, window string, patch map[string]any) (map[string]any, bool, error) {
 	res, err := requestAction(cfg, "schematic.titleblock.get", window, map[string]any{})
 	if err != nil {
@@ -88,16 +90,16 @@ func schTitleBlockMerge(cfg *appConfig, window string, patch map[string]any) (ma
 	out := make(map[string]any, len(patch))
 	var unknown []string
 	for k, v := range patch {
-		if _, ok := full[k]; !ok {
+		current, ok := full[k]
+		if !ok {
 			unknown = append(unknown, k)
+			continue
 		}
-		value := v
-		if m, isMap := v.(map[string]any); isMap {
-			if inner, has := m["value"]; has {
-				value = inner
-			}
+		field, ferr := tbMergeRequestedField(current, v)
+		if ferr != nil {
+			return nil, false, fmt.Errorf("图签项 %q: %w", k, ferr)
 		}
-		out[k] = map[string]any{"showTitle": true, "showValue": true, "value": value}
+		out[k] = field
 	}
 	if len(unknown) > 0 {
 		return nil, false, fmt.Errorf("这些明细项当前页没有:%s —— 先跑 `easyeda sch titleblock-get` 看可用 key(平台对不认识的项会崩或静默忽略)",
@@ -106,6 +108,44 @@ func schTitleBlockMerge(cfg *appConfig, window string, patch map[string]any) (ma
 	// 只在**当前没显示**时才带 showTitleBlock:图签已经显示还传一次,连接器的
 	// 前后对比会把「本来就是 true」判成「没应用」,于是写成功了却报失败(实测)。
 	return out, !shown, nil
+}
+
+// tbMergeRequestedField 把一项用户 patch 正规化成官方 API 要的三字段形状。
+// 只改显隐时必须保留原 value;否则 map 会被 JS String() 投影成
+// "[object Object]"(本板 POWER_PROBE 真机复现)。
+func tbMergeRequestedField(current, patch any) (map[string]any, error) {
+	cur, _ := current.(map[string]any)
+	out := map[string]any{
+		"showTitle": true,
+		"showValue": true,
+		"value":     cur["value"],
+	}
+	m, structured := patch.(map[string]any)
+	if !structured {
+		out["value"] = patch
+		return out, nil
+	}
+	if len(m) == 0 {
+		return nil, fmt.Errorf("补丁对象为空;至少给 value/showTitle/showValue 之一")
+	}
+	for key := range m {
+		if key != "value" && key != "showTitle" && key != "showValue" {
+			return nil, fmt.Errorf("不支持子字段 %q(只支持 value/showTitle/showValue)", key)
+		}
+	}
+	if value, ok := m["value"]; ok {
+		out["value"] = value
+	}
+	for _, key := range []string{"showTitle", "showValue"} {
+		if raw, ok := m[key]; ok {
+			value, isBool := raw.(bool)
+			if !isBool {
+				return nil, fmt.Errorf("%s 必须是 boolean", key)
+			}
+			out[key] = value
+		}
+	}
+	return out, nil
 }
 
 // warnIfSheetLost 在写图签后回读一次图纸几何:sheet 图元没了就当场报错。
@@ -186,16 +226,31 @@ func tbPatchLanded(cfg *appConfig, window string, patch map[string]any) (bool, [
 		}
 		var miss []string
 		for _, k := range tbRequestedKeys(patch) {
-			want := patch[k]
-			if m, ok := want.(map[string]any); ok {
-				want = m["value"] // 接受 {"Name":{"value":"X"}} 与 {"Name":"X"} 两种写法
-			}
 			cur, _ := full[k].(map[string]any)
-			if cur == nil || fmt.Sprint(cur["value"]) != fmt.Sprint(want) {
+			if !tbFieldMatchesPatch(cur, patch[k]) {
 				miss = append(miss, k)
 			}
 		}
 		return miss, len(miss) == 0, nil
 	})
 	return ok, missing
+}
+
+func tbFieldMatchesPatch(current map[string]any, patch any) bool {
+	if current == nil {
+		return false
+	}
+	m, structured := patch.(map[string]any)
+	if !structured {
+		return fmt.Sprint(current["value"]) == fmt.Sprint(patch)
+	}
+	if value, ok := m["value"]; ok && fmt.Sprint(current["value"]) != fmt.Sprint(value) {
+		return false
+	}
+	for _, key := range []string{"showTitle", "showValue"} {
+		if value, ok := m[key]; ok && current[key] != value {
+			return false
+		}
+	}
+	return true
 }

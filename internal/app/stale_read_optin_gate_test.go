@@ -78,6 +78,8 @@ func (d *gateFakeDaemon) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case req.Action == "pcb.pour.rebuild":
 		d.stale = ""
+	case req.Action == "document.close":
+		d.stale = ""
 	case req.Action == "debug.exec_js" && strings.Contains(fmt.Sprint(req.Payload["code"]), "closeDocument"):
 		d.stale = ""
 	case mutates && req.Action != "pcb.save":
@@ -96,6 +98,11 @@ func (d *gateFakeDaemon) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res := d.result[req.Action]
+	if req.Action == "pcb.save" || req.Action == "schematic.save" {
+		// doc reload now requires the connector's durability proof, not merely
+		// an ok:true envelope. Keep the fake daemon faithful to that contract.
+		res = `{"saved":true}`
+	}
 	if req.Action == "pcb.components.list" {
 		rows := make([]any, 0, len(d.comps))
 		for id, xy := range d.comps {
@@ -295,7 +302,7 @@ func TestPcbClearVerifiedKeepsRemainingCountThroughTheGate(t *testing.T) {
 	d.result["document.current"] = `{}`
 	d.result["document.open"] = `{}`
 	d.result["pcb.save"] = `{}`
-	d.result["debug.exec_js"] = `{}`
+	d.result["document.close"] = `{"closed":true}`
 
 	// document.current 要带 context(reloadDocumentByUUID 靠它拿 tabId/uuid)。
 	mux := http.NewServeMux()

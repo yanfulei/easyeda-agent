@@ -7,8 +7,8 @@
 
 ## 桌面版 vs 网页版 —— 自动开工程能力的边界(先判这一条)
 
-**连接器本身对两者一视同仁**:`.eext` 装进 EasyEDA(桌面或网页都行),后台端口扫描
-`60832-60841`(`0xEDA0`-`0xEDA9`)附着 daemon,附着后所有 `easyeda` typed action **完全一样**。区别只在
+**连接器本身对两者一视同仁**:`.eext` 装进 EasyEDA(桌面或网页都行),后台固定连接
+`60832`(`0xEDA0`)并自愈重连,附着后所有 `easyeda` typed action **完全一样**。区别只在
 **「打开 / 切换工程」这一步能不能自动化**:
 
 | 宿主 | 自动开/切工程 | 说明 |
@@ -129,15 +129,13 @@ profile 里持久化)。
    渲染态没跟上,**别急着让用户重新扫码登录**。
    (开源工程未登录也能打开,所以「工程打开成功」不代表连接器会附着,别用它当判据。)
 
-3. **daemon 重启后连接器不会自己回来,而且 `reload` 救不了 —— 必须关掉 tab 重开。**
-   实测(2026-08-04):daemon 停掉再起来后,连接器持续扫端口但**永远连不上**,
-   `navigate reload` 等 50s 无效;**关掉该 tab、`new_page` 开 `#id=` 直达页,5 秒就连上**。
+3. **daemon 重启后连接器应自动回来,不要先关窗口。** 1.2.11 起默认只重试固定
+   `60832`,使用指数退避 + worker 看门狗;每个 extension activation 有独立 WebSocket id,
+   连续 4 轮注册都无人接受时再轮换新 id。这样同时解决「多激活互踢」和 EasyEDA
+   把旧 id 误判为 active、静默忽略 `register()` 的两种卡死。正常 `make dev` 重启约
+   2~8 秒恢复,长时间停 daemon 后启动也应在一个退避周期内自附着。
 
-   根因:`transport.ts` 的 `WS_ID = 'easyeda-agent'` 是**固定常量**,而
-   `eda.sys_WebSocket.register()` 在同 id 连接仍被 EasyEDA 视为 "active" 时
-   **静默忽略新 url/callback**(该坑代码里早有注释)。daemon 消失留下的半关连接
-   把这个 id 卡住,而这个注册表活得比页面 reload 更久。**同族于**桌面版那条
-   「re-import 不 reload 已开窗口、必须完全退出 EasyEDA」。
+   **只有超出约 30 秒仍未恢复**才跑下面三件套,先分清 daemon / WS 端点 / 页面沙箱。
 
    **诊断三件套**(照顺序做,一次分清 daemon / 网络 / 连接器谁的问题):
    ```
@@ -148,10 +146,11 @@ profile 里持久化)。
         http://127.0.0.1:60832/eda                            # ② WS 端点通? 期望 101
    # ③ 页面里 evaluate: new WebSocket('ws://127.0.0.1:60832/eda') 能 open?
    ```
-   三步全绿却仍 `windows: 0` ⇒ **就是 WS_ID 卡住**,别再 reload,直接关 tab 重开。
-   特征信号:console 里满屏 `WebSocket is closed before the connection is established`,
-   **含本该成功的那个端口**;而 `ERR_CONNECTION_REFUSED` 只是扫到空端口的正常噪音,
-   别被它带偏方向。
+   三步全绿却仍 `windows: 0` ⇒ 先看扩展日志是否持续出现
+   `rotated websocket id` 和新的 `register port=60832`;有轮换却始终无 register 回执,
+   才把「完全退出并重启 EasyEDA」作为平台 socket 注册表的最后恢复手段。默认不再扫
+   60833-60841,所以日志里的 `ERR_CONNECTION_REFUSED` 若指向 60832 就是 daemon/端点
+   真的没起来,不能再当作扫空端口噪音忽略。
 
 ## 2. 热重载连接器(改了 extension/ 之后)
 
@@ -184,7 +183,7 @@ profile 里持久化)。
    - 两个 store 都是 **in-line key**:put(record) 不带 key 参数(带了报 DataError)
 4. navigate reload 页面(#id= 还在,工程随 boot 重开)。若 reload 后 health 仍空但
    页面 window._EXTAPI_SCRIPT_SPACES_ 里有本扩展 uuid = 代码已在跑、只是 WS 尚在
-   端口扫描,再等 ≤60s;裸 /editor(无 #id)会反复报 "Get an illegal project!" 卡 boot
+   固定端口重连,再等 ≤60s;裸 /editor(无 #id)会反复报 "Get an illegal project!" 卡 boot
    ——直接开 #id=<uuid> 直达页
 5. until … grep connectorVersion → 应显示新版本(版本号编译在 bundle 里,
    变了就是新代码在跑的铁证)

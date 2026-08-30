@@ -841,6 +841,7 @@ NOT line up — re-wire the affected pins, then run ` + "`easyeda sch drc`" + ` 
 			RunE: func(cmd *cobra.Command, args []string) error {
 				payload := map[string]any{}
 				var cascadePlan map[string]string // primitiveId → group-member designator
+				var requestedIDs []string
 				if idsRaw != "" {
 					ids, err := parseIDList(idsRaw)
 					if err != nil {
@@ -851,6 +852,7 @@ NOT line up — re-wire the affected pins, then run ` + "`easyeda sch drc`" + ` 
 					if err := schSheetGuard(cfg, window, ids, allowSheet, stderr); err != nil {
 						return err
 					}
+					requestedIDs = ids
 					payload["primitiveIds"] = ids
 					// 缺陷 2(P1):删器件必须级联删组注册,否则位号复用后新件被
 					// 陈旧组吃掉。先于删除解析 id→位号(删完 list 就查不到了)。
@@ -874,6 +876,16 @@ NOT line up — re-wire the affected pins, then run ` + "`easyeda sch drc`" + ` 
 						}
 					}
 					cascadeSchGroupMembership(cfg, window, gone, stderr)
+				}
+				if len(requestedIDs) > 0 {
+					survived := survivedIDSet(res.Result)
+					var gone []string
+					for _, id := range requestedIDs {
+						if !survived[id] {
+							gone = append(gone, id)
+						}
+					}
+					cascadeSchNoteRegistrations(cfg, window, gone, stderr)
 				}
 				// ADR-0004 Decision 5: when a delete response carries a cascaded
 				// cleanup block (component.delete does; renderer is generic), say so.

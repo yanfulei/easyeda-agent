@@ -20,11 +20,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/zhoushoujianwork/easyeda-agent/internal/distribution"
 )
 
 const (
-	// RepoSlug is the GitHub owner/repo the release assets live under.
-	RepoSlug = "zhoushoujianwork/easyeda-agent"
 	// SkillName is the skill slug (dir name under each client's skills/).
 	SkillName = "easyeda-agent"
 	// versionMarker records the installed skill version inside a skill dir.
@@ -39,12 +39,16 @@ var clientOrder = []string{"claude", "codex"}
 // Endpoint builders, overridable in tests to point at an httptest server.
 var (
 	tarballURL = func(version string) string {
-		return fmt.Sprintf("https://github.com/%s/releases/download/v%s/skills.tar.gz", RepoSlug, version)
+		return fmt.Sprintf("https://github.com/%s/releases/download/v%s/skills.tar.gz", RepoSlug(), version)
 	}
 	latestAPIURL = func() string {
-		return fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", RepoSlug)
+		return fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", RepoSlug())
 	}
 )
+
+// RepoSlug is the release channel used by installers, self-update, and
+// connector re-import guidance.
+func RepoSlug() string { return distribution.ReleaseRepo() }
 
 // SkillTarget is one installed (or installable) skill location.
 type SkillTarget struct {

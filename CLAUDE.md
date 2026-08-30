@@ -6,7 +6,7 @@ running inside EasyEDA, which calls the official `eda.*` API.
 
 ```
 skill ──▶ Go CLI/daemon ──WebSocket──▶ connector .eext ──▶ eda.* API
-          (typed actions)   60832-60841   (in EasyEDA Pro)
+          (typed actions)     60832       (in EasyEDA Pro)
 ```
 
 ## 官方插件库调研参考
@@ -58,18 +58,18 @@ on `main` by default (user preference). Don't `git checkout -b`; just commit to
 
 | Path | What |
 |---|---|
-| `cmd/easyeda` + `internal/{app,daemon,protocol}` | Go CLI + daemon. `internal/protocol/actions.go` = the 20 typed actions. Daemon: `/health`, `/eda` (connector WS), `/action`. |
-| `extension/` | TypeScript connector → esbuild → `.eext`. `src/transport.ts` (port-scan + auto-reconnect), `src/actions.ts` (eda.* handlers + `connect_pin`). |
+| `cmd/easyeda` + `internal/{app,daemon,protocol}` | Go CLI + daemon. `internal/protocol/actions.go` is the generated typed-action catalog (`make actions` is authoritative). Daemon: `/health`, `/eda` (connector WS), `/action`. |
+| `extension/` | TypeScript connector → esbuild → `.eext`. `src/transport.ts` (fixed-port + auto-reconnect; configurable port-list escape hatch), `src/actions.ts` (eda.* handlers + `connect_pin`). |
 | `skills/easyeda-agent/` | Merged public skill — short `SKILL.md` router plus `references/` for design flow, schematic, PCB, conventions, canonical data, and `scripts/` for lint/BOM/parts/calibration tools. |
-| `docs/FEATURES.md` | Feature-status inventory (20 actions grouped by capability) + roadmap. |
+| `docs/FEATURES.md` | Feature-status inventory grouped by capability + roadmap. |
 | `docs/pcb-design-rules.md` | PCB 设计规范手册 — 线宽/间距/过孔/布局/走线/铺铜/Mark点/拼板/叠层/DRC 清单，基于 JLC 工艺能力 + IPC-2221。 |
 | `skills/easyeda-agent/SKILL.md` | The user-facing skill. |
 
 ## Dev workflow
 
 **Keep the daemon hot-reloading while you work** (rebuilds + restarts on any `.go`
-change; the connector auto-reconnects because it port-scans 60832-60841 in the
-background):
+change; the connector auto-reconnects to fixed 60832 with worker-watchdog recovery in
+the background):
 
 ```bash
 make dev          # air live-reload of `easyeda daemon` — leave running in a terminal
@@ -111,14 +111,16 @@ skills/easyeda-agent/scripts/lint.sh <project> --save   # full lint + record bas
 ## Release workflow
 
 ```bash
-# 一条命令发版：自动把 connector + CLI 统一到同一版本，交叉编译 5 平台，
-# 打包 skills.tar.gz，创建 GitHub Release 并上传所有 assets。
-make release VERSION=v0.5.1
+# 先同步 CLI / connector / MCP / Skill / DSH bundle 元数据，审查后提交；
+# 正式发布只接受 clean main，并跑全套测试、交叉编译与资产校验。
+make release-sync VERSION=v1.2.11
+git commit ...
+make release VERSION=v1.2.11
 
 # 用户一行安装
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 
-# 装过之后的升级路径（不必再跑脚本）
+# 完整升级重跑同一安装脚本（幂等，含 MCP）；轻量升级才用：
 easyeda update            # CLI 二进制 + skill 目录 → latest
 easyeda update --check    # 只读三方版本表（cli / skill / connector）
 ```
@@ -126,7 +128,8 @@ easyeda update --check    # 只读三方版本表（cli / skill / connector）
 **`easyeda update` 与发版的契约**：`make release` 会生成并上传 `checksums.txt`（裸文件名，
 `internal/selfupdate` 按 release asset 名匹配）——`update` 有它就校验 sha256，没有（旧 release）
 就降级成「跑一次下载的二进制、比对版本号」。**改动 release 资产命名 = 改动自更新的输入**，
-两边要一起改：`Makefile` 的 `release` 目标 ↔ `selfupdate.AssetName`。
+两边要一起改：`Makefile` 的 `release` 目标 ↔ `selfupdate.AssetName`。MCP 由同一 release
+里的 `mcp.tar.gz` 提供,一键安装器负责校验、原子替换并刷新 Codex 注册。
 
 **版本号约定**：CLI、connector 和 skill 始终用同一版本号（`make release` 负责把 `extension.json` **和 `SKILL.md` 的 `metadata.version`** 同步到 VERSION，不需要提前跑 `make eext`）。skill 侧同步脚本是 `scripts/sync-skill-version.py`（`--check` 只校验不写，可单独跑）——**改 frontmatter 时别动 `  version:` 那行的两空格缩进格式**，脚本按它定位。注意与安装态的 `.version` 标记文件区分：那是 `easyeda update` 写在 skill 目录里的运行时标记（`internal/selfupdate`），`metadata.version` 是随包发布、离线可读的声明式元数据，发版后两者同值。`make release` 会自动打 git tag、push 并创建 GitHub Release，**并把 skill 同版本发布到 ClawHub**（best-effort，失败不阻断；重试 `make publish-skill VERSION=…`，需已 `clawhub login`）。ClawHub 版本号不可覆盖；`publish-skill` 必须用绝对路径——clawhub 的 workdir 会被全局配置劫持到 `~/clawd`，相对路径会把旧副本发上去（0.8.1 踩过）。
 

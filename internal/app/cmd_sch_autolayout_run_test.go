@@ -76,7 +76,7 @@ func newAutolayoutTestDaemon(t *testing.T, responder func(int, autolayoutTestCal
 func autolayoutOK(docUUID, resultJSON string) string {
 	context := ""
 	if docUUID != "" {
-		context = fmt.Sprintf(`,"context":{"documentUuid":%q,"documentType":"schematic"}`, docUUID)
+		context = fmt.Sprintf(`,"context":{"projectUuid":"project-1","documentUuid":%q,"documentType":"schematic"}`, docUUID)
 	}
 	return `{"ok":true,"result":` + resultJSON + context + `}`
 }

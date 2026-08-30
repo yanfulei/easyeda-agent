@@ -133,10 +133,9 @@ func daemonFinding(cli, daemon string) versionFinding {
 	return f
 }
 
-// connectorFinding grades the CLI ↔ connector pair: major/minor drift blocks
-// (the connector may simply not have the handler this CLI calls), patch drift
-// warns loudly (the marketplace channel structurally lags, and the fix costs a
-// full EasyEDA relaunch).
+// connectorFinding grades the CLI ↔ connector pair. Release builds ship as one
+// tested unit, so any version drift blocks: a patch can contain queue, save, or
+// export correctness fixes just as easily as a new action.
 func connectorFinding(cli, connector string) versionFinding {
 	f := versionFinding{Component: "connector", Version: strings.TrimSpace(connector)}
 	cliCore, connCore := selfupdate.SemverCore(cli), selfupdate.SemverCore(connector)
@@ -149,15 +148,15 @@ func connectorFinding(cli, connector string) versionFinding {
 		f.Severity = versionSevOK
 		f.Reason = fmt.Sprintf("与 CLI 同版 %s", display(cli))
 	case sameMajorMinor(cliCore, connCore):
-		f.Severity = versionSevWarn
-		f.Reason = fmt.Sprintf("CLI %s ≠ connector %s(仅差 patch)—— 插件市场渠道本就滞后,多半能用,但一旦行为对不上先怀疑这里",
+		f.Severity = versionSevBlock
+		f.Reason = fmt.Sprintf("CLI %s ≠ connector %s(差 patch)—— 稳定模式要求 CLI/daemon/connector 使用同一已测试版本",
 			display(cli), display(connector))
-		f.Fix = fixConnectorStale
+		f.Fix = fixConnectorStale()
 	default:
 		f.Severity = versionSevBlock
 		f.Reason = fmt.Sprintf("CLI %s ≠ connector %s(差 minor 及以上)—— 连接器可能根本没有这版 CLI 要调的 handler,动作会静默走偏",
 			display(cli), display(connector))
-		f.Fix = fixConnectorStale
+		f.Fix = fixConnectorStale()
 	}
 	return f
 }
@@ -169,15 +168,14 @@ const fixDaemonStale = `重启 daemon(它跑的是启动那一刻的构建):
     不需要你先去 kill。
 确认:` + "`easyeda health`" + ` 的 version 应与 ` + "`easyeda version`" + ` 一致。`
 
-const fixConnectorStale = `重装连接器 .eext(同版才严格对齐):
-  1. 下载同版 .eext:https://github.com/` + versionGateRepoSlug + `/releases/latest
+func fixConnectorStale() string {
+	return `重装连接器 .eext(同版才严格对齐):
+  1. 下载同版 .eext:https://github.com/` + selfupdate.RepoSlug() + `/releases/latest
   2. EasyEDA「扩展管理 → 已安装」**先卸载旧的**(uuid 相同,不卸载直接导入会静默失败)
   3. 导入新的 .eext
   4. **完全退出并重启 EasyEDA** —— 重导入不会重载已开窗口,旧窗口会继续跑旧代码并抢 daemon
   (插件市场版可原地自动更新但**滞后**于 CLI;要严格同版走 GitHub Release。)`
-
-// versionGateRepoSlug is the GitHub owner/repo shipping the connector .eext.
-const versionGateRepoSlug = "zhoushoujianwork/easyeda-agent"
+}
 
 // sameMajorMinor reports whether two semver cores share major.minor.
 func sameMajorMinor(a, b string) bool {

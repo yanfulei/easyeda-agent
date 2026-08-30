@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zhoushoujianwork/easyeda-agent"><b>GitHub</b></a> ·
+  <a href="https://github.com/yanfulei/easyeda-agent"><b>GitHub</b></a> ·
   <a href="https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector"><b>立创插件市场</b></a> ·
   <a href="README.en.md">English</a>
 </p>
 
 ![easyeda-agent workflow](docs/assets/easyeda-agent-workflow.svg)
 
-> **当前版本:v1.0.0 —— 原理图功能正式上线。** AI Agent 通过类型化命令操作 EasyEDA Pro,
+> **自 v1.0.0 起原理图功能正式上线。** AI Agent 通过类型化命令操作 EasyEDA Pro,
 > 从一份客户口吻的需求文档出发,原理图全流程(S0–S6:方案书 → 分页 → 分区 → 摆放 →
 > 布线 → 机械门禁 → 交付)已可正式交付;PCB 流程(P0–P10)持续演进中。
 > 真机成图见下方[实战展示](#实战展示一份需求文档--三页原理图正式交付)。
@@ -86,16 +86,16 @@ USB-HUB…这些电路的**内部拓扑是死的**,每次重画等于重趟坑�
 
 ## 安装
 
-> **完整上手 & 使用注意事项见 [快速开始 →](docs/quick-start.md)** —— 四件套
-> (CLI / 连接器 `.eext` / Skill / EasyEDA)的安装、版本对齐、启动 daemon、升级纪律
+> **完整上手 & 使用注意事项见 [快速开始 →](docs/quick-start.md)** —— 核心运行栈
+> (CLI / 连接器 `.eext` / Skill / EasyEDA,以及 Codex 的 MCP 入口)的安装、版本对齐、启动 daemon、升级纪律
 > 与常见卡点速查,一页讲清。下面是精简版。
 
-easyeda-agent 是一套**四件套**,四者需**同版本、同时在位**:CLI/daemon、连接器
-`.eext` 插件、`easyeda-agent` Skill、开启「允许外部交互」的 EasyEDA Pro。**升级时
-三方(CLI + 连接器 + Skill)要一起升到同一版本**,否则 `easyeda daemon health` 会把
-落后的连接器标成 stale。
+easyeda-agent 的 release 资产采用**一个版本号**:CLI/daemon、连接器 `.eext`、
+`easyeda-agent` Skill 和 MCP adapter 同版发布;EasyEDA Pro 是宿主,需开启「允许外部
+交互」。**升级时 CLI + 连接器 + Skill + MCP 应一起升**,否则会丢失新动作或让
+`easyeda daemon health` 把落后的连接器标成 stale。
 
-先装 `easyeda` CLI/daemon,再装 EasyEDA 连接器 —— 两条通道任选:安装器会打印**与 CLI 严格同版**的 GitHub Release `.eext` 下载地址(导入即用),或从[**立创官方插件市场**](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)一键安装(平台可原地自动更新,但市场版本可能滞后 CLI,严格四件套同版时以 Release `.eext` 为准):
+先装 `easyeda` CLI/daemon,再装 EasyEDA 连接器 —— 两条通道任选:安装器会打印**与 CLI 严格同版**的 GitHub Release `.eext` 下载地址(导入即用),或从[**立创官方插件市场**](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)一键安装(平台可原地自动更新,但市场版本可能滞后 CLI,严格同版时以 Release `.eext` 为准):
 
 > **ℹ️ 插件更名说明(2026-08)**:应市场管理规范要求,插件**显示名**改为
 > **EDA Agent Connector**(不再含 "easyeda" 字样)。经与市场管理员确认,内部包名
@@ -103,12 +103,14 @@ easyeda-agent 是一套**四件套**,四者需**同版本、同时在位**:CLI/d
 > 已装用户的原地自动更新不受影响,无需任何操作。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 ```
 
-一键脚本会：安装/更新 `easyeda` CLI/daemon;自动检测已安装的客户端并把 `easyeda-agent` skill 安装/更新到对应目录 —— Codex(`~/.codex/skills/easyeda-agent`)、Claude Code(`~/.claude/skills/easyeda-agent`);打印连接器 `.eext` 导入地址。
+一键脚本可重复执行,会安装/更新 `easyeda` CLI/daemon;自动检测客户端并安装
+`easyeda-agent` skill;检测到 Codex 时还会安装 release 自带的锁定版 MCP bundle,
+幂等注册 `easyeda-agent` MCP;最后打印同版连接器 `.eext` 导入地址。
 
-**装过之后升级不必再跑脚本 —— 用 `easyeda update`:**
+**整套升级仍运行同一条一键命令**(幂等,会同步 MCP)。只升级 CLI + Skill 可用:
 
 ```bash
 easyeda update              # CLI 二进制(sha256 校验 + 原子替换)+ skill 目录 → latest
@@ -126,6 +128,7 @@ dev 构建(git-describe 版本号)默认不覆盖,`--force` 才强升;二进制�
 EASYEDA_INSTALL_SKILLS=codex,claude curl -fsSL .../install.sh | sh  # 指定目标
 EASYEDA_INSTALL_SKILLS=none          curl -fsSL .../install.sh | sh  # 跳过 skill
 EASYEDA_SKILL_PRESERVE=1             curl -fsSL .../install.sh | sh  # 保留本地改动
+EASYEDA_INSTALL_MCP=none             curl -fsSL .../install.sh | sh  # 跳过 MCP
 EASYEDA_VERSION=<vX.Y.Z>              curl -fsSL .../install.sh | sh  # 指定版本(跳过 API 查询)
 ```
 
@@ -140,7 +143,7 @@ gh auth login                 # 等价做法,额度提升到 5000/小时
 EASYEDA_VERSION=<vX.Y.Z> curl -fsSL .../install.sh | sh   # 或者直接锁版本,完全不碰 API
 ```
 
-可用 tag 见 [Releases](https://github.com/zhoushoujianwork/easyeda-agent/releases)。
+可用 tag 见 [Releases](https://github.com/yanfulei/easyeda-agent/releases)。
 
 Skill slug 为 `easyeda-agent`(后缀有意为之,区分于官方 EasyEDA 工具)。只从 registry 装 skill:
 
@@ -158,17 +161,20 @@ clawhub install easyeda-agent
 
 ### 可选:MCP 接入
 
-仓库内的 [`mcp/`](mcp) 是一个本地 stdio MCP 适配层,方便 Codex 等支持 MCP 的
+release 内的 [`mcp/`](mcp) 是一个本地 stdio MCP 适配层,方便 Codex 等支持 MCP 的
 agent 直接发现并调用 `easyeda_*` 工具。它复用现有 `easyeda` CLI/daemon,不会绕过
 typed action、审计、workflow gate 或官方 `eda.*` API;任意 JavaScript 的
 `debug.exec_js` 域不会通过 MCP 暴露。
 
+一键安装器检测到 Codex 时已自动安装并注册。验证:
+
 ```bash
-npm --prefix mcp ci --ignore-scripts
-codex mcp add easyeda-agent \
-  --env EASYEDA_BIN="$(command -v easyeda)" \
-  -- node "$(pwd)/mcp/src/server.mjs"
+codex mcp get easyeda-agent --json
 ```
+
+从源码开发时仍可手动 `npm --prefix mcp ci --ignore-scripts`,再用
+`codex mcp add easyeda-agent --env EASYEDA_BIN=... -- node .../mcp/src/server.mjs`
+覆盖同名配置;该命令本身是幂等更新,不会叠出重复 server。
 
 重启 agent 客户端后即可使用。其他 MCP 客户端使用同一 stdio command/env 配置;
 详细工具清单与开发验证见 [`mcp/README.md`](mcp/README.md)。

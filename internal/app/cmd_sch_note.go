@@ -11,11 +11,10 @@ package app
 // short note per module as part of the layout default — and this command is the
 // typed path that makes that default executable.
 //
-// Implementation note: same situation as `sch zone-draw` — the schematic text
-// API (eda.sch_PrimitiveText, full CRUD) has no typed action, so this goes
-// through the CLI-internal exec_js hatch, with created-id readback verification
-// and an explicit save. Notes are plain text primitives: enumerate them with
-// `sch text-list`, remove with `sch prim-delete --ids`.
+// Implementation note: notes use the connector's typed schematic.text.create
+// action, followed by schematic.text.list verification before any retry. Notes
+// are plain text primitives: enumerate them with `sch text-list`, remove with
+// `sch prim-delete --ids`.
 
 import (
 	"encoding/json"
@@ -35,27 +34,91 @@ const schNoteDefaultFontSize = 10.0
 // against the magenta zone frames and the black circuit.
 const schNoteDefaultColor = "#5A5A5A"
 
-// buildSchNoteJS renders the exec_js that creates one text primitive and
-// returns its id. Pure (unit-testable). The create signature mirrors
-// zone-draw's labels: (x, y, content, rotation, color, fontFamily, fontSize).
-//
-// 文本一律经 json.Marshal 进 JS 字符串字面量 —— `~`、`+/-`、引号、换行、`%`、
-// 反引号全都安全(TestBuildSchNoteJSEscapesSpecialText 钉死)。2026-08-19 E2E
-// 报的「含 ~ / +/- 的说明让 exec_js 挂掉」经审计日志定案为**误诊**:失败载荷
-// 的 JS 完全合法且正常执行,是 eda.sch_PrimitiveText.create 偶发返回 undefined
-// (同一段文本重试即成功;与 zone-draw 注释里「平台偶发吞创建请求」同一病),
-// 修法是下面 RunE 里的 settle+重试,不是转义。
-func buildSchNoteJS(x, y float64, text, color string, fontSize float64) string {
-	content, _ := json.Marshal(text)
-	colorJS, _ := json.Marshal(color)
-	var b strings.Builder
-	b.WriteString("const tx = await eda.sch_PrimitiveText.create(")
-	fmt.Fprintf(&b, "%g, %g, %s, 0, %s, null, %g);\n", x, y, content, colorJS, fontSize)
-	b.WriteString("if (!tx) throw new Error('text create returned undefined');\n")
-	b.WriteString("const tid = tx.getState_PrimitiveId();\n")
-	b.WriteString("if (!tid) { await eda.sch_PrimitiveObject.delete([tx]); throw new Error('text id missing'); }\n")
-	b.WriteString("return { textId: tid };")
-	return b.String()
+// EasyEDA Pro's beta schematic text API rejects closely spaced writes by
+// resolving create() to undefined. Live 3.2.x runs only recovered after roughly
+// 15 seconds; the generic 400 ms settle window is therefore too short here.
+// This delay is used only after a fresh read proves that the failed write did
+// not land, so waiting and resending cannot duplicate a note.
+const schematicTextRetryDelay = 15 * time.Second
+
+func readSchNoteTexts(cfg *appConfig, window, docUUID, phase string) ([]zoneMoveText, error) {
+	res, err := requestAutolayoutAction(cfg, "schematic.text.list", window, nil, docUUID, phase)
+	if err != nil {
+		return nil, err
+	}
+	return parseZoneMoveTexts(res.Result), nil
+}
+
+// findNewSchNote matches only ids absent from the pre-write snapshot. A text
+// already at the same coordinate can therefore never be adopted after a lost
+// response, and an ambiguous multi-match fails closed.
+func findNewSchNote(texts []zoneMoveText, before map[string]bool, content string, x, y float64) (string, int) {
+	var id string
+	count := 0
+	for _, t := range texts {
+		if before[t.ID] || t.Content != content || absF(t.X-x) > zoneAnchorEps || absF(t.Y-y) > zoneAnchorEps {
+			continue
+		}
+		id = t.ID
+		count++
+	}
+	return id, count
+}
+
+// createSchNoteTyped implements verify-before-retry for a mutating typed
+// action. EasyEDA can return no primitive or lose a response after landing; a
+// fresh text-list decides which case occurred before a second send is allowed.
+func createSchNoteTyped(cfg *appConfig, window, docUUID, content, color string, x, y, fontSize float64) (string, error) {
+	beforeTexts, err := readSchNoteTexts(cfg, window, docUUID, "snapshot notes before create")
+	if err != nil {
+		return "", fmt.Errorf("read notes before create: %w", err)
+	}
+	before := make(map[string]bool, len(beforeTexts))
+	for _, t := range beforeTexts {
+		before[t.ID] = true
+	}
+	payload := map[string]any{
+		"x": x, "y": y, "content": content, "rotation": 0,
+		"color": color, "fontSize": fontSize,
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		phase := "create schematic note"
+		if attempt > 0 {
+			phase += " (retry)"
+		}
+		res, werr := requestAutolayoutActionTimed(cfg, "schematic.text.create", window, payload, 30*time.Second, docUUID, phase)
+		if werr == nil {
+			id := asString(res.Result["primitiveId"])
+			if id == "" {
+				return "", fmt.Errorf("schematic.text.create returned no primitiveId: %v", res.Result)
+			}
+			return id, nil
+		}
+		lastErr = werr
+
+		after, rerr := readSchNoteTexts(cfg, window, docUUID, "verify schematic note after failed write")
+		if rerr != nil {
+			return "", fmt.Errorf("%v; landed-check also failed (%v) — refusing to resend", werr, rerr)
+		}
+		id, matches := findNewSchNote(after, before, content, x, y)
+		switch matches {
+		case 1:
+			reportWriteVerified(cfg, window, writeVerdict{
+				action: "schematic.text.create", source: "sch note",
+				returnedOK: false, landed: 1,
+			})
+			return id, nil
+		case 0:
+			if attempt == 0 {
+				time.Sleep(schematicTextRetryDelay)
+				continue
+			}
+		default:
+			return "", fmt.Errorf("%v; landed-check found %d new matching texts — ambiguous, refusing to resend", werr, matches)
+		}
+	}
+	return "", lastErr
 }
 
 // newSchNoteCmd builds `sch note`.
@@ -118,22 +181,11 @@ default is: one short note per module, parked just below/beside its zone frame.
 			for _, wmsg := range warns {
 				fmt.Fprintf(stderr, "warning: %s\n", wmsg)
 			}
-			// 平台偶发吞创建请求:eda.sch_PrimitiveText.create 偶发返回 undefined
-			// (2026-08-19 审计日志定案:同一段文本、连接器活跃、1~5ms 即败,重试
-			// 即成 —— 与 zone-draw 画框同一病同一修法)。失败时半成品不会留在画布
-			// 上(tx undefined = 没建出来;tid 缺失时 JS 已自删),重发等价于第一次。
-			js := buildSchNoteJS(x, y, content, color, fontSize)
-			v, err := execAutolayoutZoneJS(pinnedCfg, win, docUUID, "create schematic note", js)
-			if err != nil {
-				time.Sleep(settleDelay)
-				v, err = execAutolayoutZoneJS(pinnedCfg, win, docUUID, "create schematic note (retry)", js)
-			}
+			// The typed create path snapshots text ids and performs a light read
+			// before retrying, so a lost response cannot duplicate the note.
+			tid, err := createSchNoteTyped(pinnedCfg, win, docUUID, content, color, x, y, fontSize)
 			if err != nil {
 				return err
-			}
-			tid := asString(mnav(v, "textId"))
-			if tid == "" {
-				return fmt.Errorf("note create returned no primitive id — nothing was written (raw: %v)", v)
 			}
 			if err := saveZoneDocument(pinnedCfg, win, docUUID, "save schematic note"); err != nil {
 				return err

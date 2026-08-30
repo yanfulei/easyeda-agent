@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/zhoushoujianwork/easyeda-agent/internal/distribution"
 	"sync"
 	"time"
 
@@ -28,7 +30,10 @@ type Window struct {
 	// connector and daemon report comparable semver (so a stale connector loaded
 	// in an open window is visible), nil when either version is non-semver (dev
 	// builds) and no verdict can be made.
-	ConnectorVersionOK *bool `json:"connectorVersionOk,omitempty"`
+	ConnectorVersionOK    *bool                         `json:"connectorVersionOk,omitempty"`
+	Fingerprints          *protocol.RuntimeFingerprints `json:"fingerprints,omitempty"`
+	FingerprintMatch      *bool                         `json:"fingerprintMatch,omitempty"`
+	FingerprintMismatches []string                      `json:"fingerprintMismatches,omitempty"`
 }
 
 // conn is a single connected connector. The /connect read loop owns reads;
@@ -38,14 +43,15 @@ type conn struct {
 	ws      *websocket.Conn
 	writeMu sync.Mutex
 
-	mu          sync.Mutex
-	windowID    string
-	connVersion string
-	edaVersion  string
-	caps        []string
-	ctx         protocol.Context
-	connectedAt time.Time
-	lastSeen    time.Time
+	mu           sync.Mutex
+	windowID     string
+	connVersion  string
+	fingerprints protocol.RuntimeFingerprints
+	edaVersion   string
+	caps         []string
+	ctx          protocol.Context
+	connectedAt  time.Time
+	lastSeen     time.Time
 
 	pendingMu sync.Mutex
 	pending   map[string]chan *protocol.Response
@@ -65,6 +71,7 @@ func (c *conn) applyRegister(msg protocol.Register, now time.Time) {
 	defer c.mu.Unlock()
 	c.windowID = msg.WindowID
 	c.connVersion = msg.ConnectorVersion
+	c.fingerprints = msg.Fingerprints
 	c.edaVersion = msg.EasyEDAVersion
 	c.caps = msg.Capabilities
 	c.lastSeen = now
@@ -125,7 +132,7 @@ func (c *conn) id() string {
 func (c *conn) snapshot() Window {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return Window{
+	window := Window{
 		WindowID:         c.windowID,
 		ConnectorVersion: c.connVersion,
 		EasyEDAVersion:   c.edaVersion,
@@ -134,6 +141,17 @@ func (c *conn) snapshot() Window {
 		ConnectedAt:      c.connectedAt,
 		LastSeen:         c.lastSeen,
 	}
+	if !c.fingerprints.Empty() {
+		fp := c.fingerprints
+		window.Fingerprints = &fp
+	}
+	return window
+}
+
+func (c *conn) runtimeFingerprints() protocol.RuntimeFingerprints {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fingerprints
 }
 
 func (c *conn) write(ctx context.Context, v any) error {
@@ -452,6 +470,7 @@ func newestExactDocumentDuplicate(matches []Window) (Window, bool) {
 // computed, so /health surfaces a stale connector loaded in an open window.
 func (h *hub) listAnnotated(daemonVersion string) []Window {
 	out := h.list()
+	daemonFingerprints := protocol.CurrentRuntimeFingerprints()
 	// Newest connector semver among connected windows — a daemon-version-
 	// independent reference, so staleness is still flagged when the daemon
 	// version is non-semver (e.g. a `dev` build).
@@ -463,6 +482,10 @@ func (h *hub) listAnnotated(daemonVersion string) []Window {
 	}
 	for i := range out {
 		out[i].ConnectorVersionOK = connectorVersionOK(out[i].ConnectorVersion, daemonVersion, newest)
+		if out[i].Fingerprints != nil {
+			out[i].FingerprintMismatches = protocol.FingerprintMismatches(daemonFingerprints, *out[i].Fingerprints)
+			out[i].FingerprintMatch = protocol.FingerprintMatch(daemonFingerprints, *out[i].Fingerprints)
+		}
 	}
 	return out
 }
@@ -512,11 +535,8 @@ func staleConnectorNotice(connector, daemon string) string {
 	}
 	return fmt.Sprintf("stale connector: v%s < daemon v%s — re-import the connector .eext "+
 		"(uninstall old in 已安装 → import new → FULLY quit & relaunch EasyEDA). "+
-		"Latest .eext: https://github.com/%s/releases/latest", cn, dn, releaseRepoSlug)
+		"Latest .eext: https://github.com/%s/releases/latest", cn, dn, distribution.ReleaseRepo())
 }
-
-// releaseRepoSlug is the GitHub owner/repo that ships the connector .eext.
-const releaseRepoSlug = "zhoushoujianwork/easyeda-agent"
 
 // isCleanRelease reports whether v is a bare release tag (vX.Y.Z with no
 // pre-release/build suffix) — i.e. its semver core is the whole string.

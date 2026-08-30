@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # easyeda-agent installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 set -euo pipefail
 
-REPO="zhoushoujianwork/easyeda-agent"
+REPO="${EASYEDA_RELEASE_REPO:-yanfulei/easyeda-agent}"
+printf '%s' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+  || { printf 'invalid EASYEDA_RELEASE_REPO: %s\n' "$REPO" >&2; exit 1; }
 SKILL_NAME="easyeda-agent"
 # EASYEDA_INSTALL_SKILLS: ""|auto (detect), "none" (skip), or CSV of codex,claude
 INSTALL_SKILLS="${EASYEDA_INSTALL_SKILLS:-}"
 # EASYEDA_SKILL_PRESERVE=1 keeps existing files instead of clean-replacing
 SKILL_PRESERVE="${EASYEDA_SKILL_PRESERVE:-0}"
+# EASYEDA_INSTALL_MCP: auto (register when Codex exists), codex (require it), none
+INSTALL_MCP="${EASYEDA_INSTALL_MCP:-auto}"
+# Stable user-owned location for the release MCP bundle and its locked dependencies.
+MCP_DIR="${EASYEDA_MCP_DIR:-${HOME}/.local/share/easyeda-agent/mcp}"
 # EASYEDA_VERSION=v0.18.2 pins the release and skips the GitHub API lookup entirely
 VERSION="${EASYEDA_VERSION:-}"
 
@@ -17,6 +23,7 @@ info()  { printf '\033[34m[easyeda-agent]\033[0m %s\n' "$*"; }
 ok()    { printf '\033[32m✔\033[0m %s\n' "$*"; }
 warn()  { printf '\033[33m⚠\033[0m %s\n' "$*"; }
 fatal() { printf '\033[31m✘\033[0m %s\n' "$*" >&2; exit 1; }
+CURL_RETRY=(--connect-timeout 10 --retry 3 --retry-delay 1)
 
 # ── resolve latest release ───────────────────────────────────────────────────
 # api.github.com allows only 60 requests/hour per IP unauthenticated, so a shared
@@ -61,11 +68,11 @@ else
   API_URL="https://api.github.com/repos/${REPO}/releases/latest"
   # No -f here: we want the body *and* the status code so the failure can explain itself.
   if [ -n "$API_TOKEN" ]; then
-    API_RESP=$(curl -sSL -w '\n%{http_code}' \
+    API_RESP=$(curl "${CURL_RETRY[@]}" -sSL -w '\n%{http_code}' \
       -H 'Accept: application/vnd.github+json' \
       -H "Authorization: Bearer ${API_TOKEN}" "$API_URL") || API_RESP=""
   else
-    API_RESP=$(curl -sSL -w '\n%{http_code}' \
+    API_RESP=$(curl "${CURL_RETRY[@]}" -sSL -w '\n%{http_code}' \
       -H 'Accept: application/vnd.github+json' "$API_URL") || API_RESP=""
   fi
   API_CODE=$(printf '%s\n' "$API_RESP" | tail -n 1)
@@ -85,8 +92,14 @@ else
   [ -n "$VERSION" ] || fatal "Could not parse a tag_name out of the GitHub API response. Pass EASYEDA_VERSION=<tag> to skip the API."
   info "Latest: ${VERSION}"
 fi
+printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
+  || fatal "Release tag must be vMAJOR.MINOR.PATCH (got ${VERSION})"
 
-BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+BASE_URL="${EASYEDA_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download/${VERSION}}"
+case "$BASE_URL" in
+  http://*|https://*) ;;
+  *) fatal "EASYEDA_RELEASE_BASE_URL must be an http(s) URL (got ${BASE_URL})" ;;
+esac
 
 # ── detect OS + arch ─────────────────────────────────────────────────────────
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -105,42 +118,68 @@ esac
 BINARY_NAME="easyeda_${OS}_${ARCH}"
 
 # ── choose install dir (no sudo required) ────────────────────────────────────
-if [ -w "/usr/local/bin" ]; then
+if [ -n "${EASYEDA_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$EASYEDA_INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+elif [ -w "/usr/local/bin" ]; then
   INSTALL_DIR="/usr/local/bin"
 else
   INSTALL_DIR="${HOME}/.local/bin"
   mkdir -p "$INSTALL_DIR"
 fi
+case "$INSTALL_DIR" in
+  ""|/|"$HOME") fatal "refusing unsafe EASYEDA_INSTALL_DIR: ${INSTALL_DIR}" ;;
+  /*) ;;
+  *) fatal "EASYEDA_INSTALL_DIR must be absolute (got ${INSTALL_DIR})" ;;
+esac
 
 # ── install CLI binary ────────────────────────────────────────────────────────
 info "Downloading ${BINARY_NAME}..."
 BIN_TMP="${INSTALL_DIR}/.easyeda-download.$$"
-curl -fsSL "${BASE_URL}/${BINARY_NAME}" -o "$BIN_TMP" \
+curl "${CURL_RETRY[@]}" -fsSL "${BASE_URL}/${BINARY_NAME}" -o "$BIN_TMP" \
   || { rm -f "$BIN_TMP"; fatal "download failed: ${BASE_URL}/${BINARY_NAME}"; }
 
-# sha256 verification. Best-effort by design: releases published before
-# checksums.txt existed, and hosts without a sha256 tool, just skip it — but a
-# MISMATCH is always fatal (that is the case worth aborting for).
-SHA_CMD=""
+# sha256 verification. Old releases may not have checksums.txt, but every asset
+# in current releases does. A present checksum mismatch is always fatal.
+SHA_TOOL=""
 if command -v sha256sum >/dev/null 2>&1; then
-  SHA_CMD="sha256sum"
+  SHA_TOOL="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
-  SHA_CMD="shasum -a 256"
+  SHA_TOOL="shasum"
 fi
-if [ -n "$SHA_CMD" ] && SUMS=$(curl -fsSL "${BASE_URL}/checksums.txt" 2>/dev/null); then
-  WANT=$(printf '%s\n' "$SUMS" | awk -v n="$BINARY_NAME" '{ f=$2; sub(/^\*/,"",f); if (f==n) { print $1; exit } }')
-  GOT=$($SHA_CMD "$BIN_TMP" | awk '{print $1}')
-  if [ -z "$WANT" ]; then
-    warn "checksums.txt has no entry for ${BINARY_NAME} — skipping verification"
-  elif [ "$WANT" != "$GOT" ]; then
-    rm -f "$BIN_TMP"
-    fatal "checksum mismatch for ${BINARY_NAME} (want ${WANT}, got ${GOT}) — aborted, nothing installed"
+
+SUMS=""
+if [ -n "$SHA_TOOL" ]; then
+  SUMS=$(curl "${CURL_RETRY[@]}" -fsSL "${BASE_URL}/checksums.txt" 2>/dev/null || true)
+fi
+
+asset_sha256() {
+  if [ "$SHA_TOOL" = "sha256sum" ]; then
+    sha256sum "$1" | awk '{print $1}'
   else
-    ok "sha256 verified"
+    shasum -a 256 "$1" | awk '{print $1}'
   fi
-else
-  warn "sha256 verification skipped (no checksums.txt for ${VERSION}, or no sha256 tool)"
-fi
+}
+
+verify_asset() {
+  _path="$1"; _name="$2"
+  if [ -z "$SHA_TOOL" ] || [ -z "$SUMS" ]; then
+    warn "sha256 verification skipped for ${_name} (no checksums.txt or sha256 tool)"
+    return 0
+  fi
+  WANT=$(printf '%s\n' "$SUMS" | awk -v n="$_name" '{ f=$2; sub(/^\*/,"",f); if (f==n) { print $1; exit } }')
+  GOT=$(asset_sha256 "$_path")
+  if [ -z "$WANT" ]; then
+    warn "checksums.txt has no entry for ${_name} — skipping verification"
+  elif [ "$WANT" != "$GOT" ]; then
+    rm -f "$_path"
+    fatal "checksum mismatch for ${_name} (want ${WANT}, got ${GOT})"
+  else
+    ok "sha256 verified: ${_name}"
+  fi
+}
+
+verify_asset "$BIN_TMP" "$BINARY_NAME"
 
 chmod +x "$BIN_TMP"
 mv "$BIN_TMP" "${INSTALL_DIR}/easyeda"
@@ -236,12 +275,100 @@ if [ -z "$TARGETS" ]; then
   info "Skill install skipped (EASYEDA_INSTALL_SKILLS=none)"
 else
   info "Downloading skills.tar.gz..."
-  curl -fsSL "${BASE_URL}/skills.tar.gz" | tar -xzf - -C "$TMP"
+  SKILL_ARCHIVE="${TMP}/skills.tar.gz"
+  curl "${CURL_RETRY[@]}" -fsSL "${BASE_URL}/skills.tar.gz" -o "$SKILL_ARCHIVE" \
+    || fatal "download failed: ${BASE_URL}/skills.tar.gz"
+  verify_asset "$SKILL_ARCHIVE" "skills.tar.gz"
+  tar -xzf "$SKILL_ARCHIVE" -C "$TMP"
   SRC_SKILL="${TMP}/${SKILL_NAME}"
   [ -d "$SRC_SKILL" ] || fatal "skills.tar.gz did not contain ${SKILL_NAME}/"
   printf '%s\n' "$TARGETS" | while IFS= read -r client; do
     [ -n "$client" ] && install_skill_to "$client" "$SRC_SKILL"
   done
+fi
+
+# ── install + register MCP for Codex ─────────────────────────────────────────
+# `codex mcp add` replaces an existing entry with the same name, so rerunning the
+# installer upgrades both the files and registration without duplicate servers.
+MCP_REQUIRED=0
+case "$INSTALL_MCP" in
+  auto)
+    if ! command -v codex >/dev/null 2>&1; then
+      info "MCP install skipped (Codex not detected; EASYEDA_INSTALL_MCP=codex forces it)"
+      INSTALL_MCP="none"
+    fi
+    ;;
+  codex) MCP_REQUIRED=1 ;;
+  none|NONE|None) INSTALL_MCP="none" ;;
+  *) fatal "EASYEDA_INSTALL_MCP must be auto, codex, or none (got ${INSTALL_MCP})" ;;
+esac
+
+if [ "$INSTALL_MCP" != "none" ]; then
+  if ! command -v codex >/dev/null 2>&1; then
+    fatal "EASYEDA_INSTALL_MCP=codex but codex is not in PATH"
+  fi
+  if ! command -v node >/dev/null 2>&1 \
+    || ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>20||(a===20&&b>=17)?0:1)'; then
+    if [ "$MCP_REQUIRED" = 1 ]; then
+      fatal "MCP requires Node.js >=20.17.0"
+    fi
+    warn "Codex detected, but Node.js >=20.17.0 is unavailable; MCP install skipped"
+    INSTALL_MCP="none"
+  fi
+fi
+
+if [ "$INSTALL_MCP" != "none" ]; then
+  case "$MCP_DIR" in
+    ""|/|"$HOME"|"$HOME/") fatal "refusing unsafe EASYEDA_MCP_DIR: ${MCP_DIR}" ;;
+    /*) ;;
+    *) fatal "EASYEDA_MCP_DIR must be absolute (got ${MCP_DIR})" ;;
+  esac
+  info "Downloading mcp.tar.gz..."
+  MCP_ARCHIVE="${TMP}/mcp.tar.gz"
+  curl "${CURL_RETRY[@]}" -fsSL "${BASE_URL}/mcp.tar.gz" -o "$MCP_ARCHIVE" \
+    || fatal "download failed: ${BASE_URL}/mcp.tar.gz"
+  verify_asset "$MCP_ARCHIVE" "mcp.tar.gz"
+
+  MCP_UNPACK="${TMP}/mcp-unpack"
+  mkdir -p "$MCP_UNPACK"
+  tar -xzf "$MCP_ARCHIVE" -C "$MCP_UNPACK"
+  SRC_MCP="${MCP_UNPACK}/mcp"
+  [ -f "${SRC_MCP}/src/server.mjs" ] \
+    || fatal "mcp.tar.gz did not contain mcp/src/server.mjs"
+  [ -d "${SRC_MCP}/node_modules/@modelcontextprotocol/sdk" ] \
+    || fatal "mcp.tar.gz did not contain locked MCP production dependencies"
+  node --check "${SRC_MCP}/src/server.mjs"
+
+  MCP_PARENT=$(dirname "$MCP_DIR")
+  MCP_STAGE="${MCP_PARENT}/.easyeda-agent-mcp.new.$$"
+  MCP_BACKUP="${MCP_PARENT}/.easyeda-agent-mcp.old.$$"
+  mkdir -p "$MCP_PARENT"
+  rm -rf "$MCP_STAGE" "$MCP_BACKUP"
+  cp -R "$SRC_MCP" "$MCP_STAGE"
+  printf '%s\n' "${VERSION#v}" > "${MCP_STAGE}/.version"
+  if [ -e "$MCP_DIR" ] || [ -L "$MCP_DIR" ]; then
+    mv "$MCP_DIR" "$MCP_BACKUP"
+  fi
+  if mv "$MCP_STAGE" "$MCP_DIR"; then
+    rm -rf "$MCP_BACKUP"
+  else
+    [ ! -e "$MCP_BACKUP" ] || mv "$MCP_BACKUP" "$MCP_DIR"
+    fatal "could not install MCP bundle to ${MCP_DIR}"
+  fi
+  ok "MCP bundle installed → ${MCP_DIR}"
+
+  CODEX_BIN=$(command -v codex)
+  NODE_BIN=$(command -v node)
+  if "$CODEX_BIN" mcp add easyeda-agent \
+      --env "EASYEDA_BIN=${INSTALL_DIR}/easyeda" \
+      -- "$NODE_BIN" "${MCP_DIR}/src/server.mjs" \
+      && "$CODEX_BIN" mcp get easyeda-agent --json >/dev/null; then
+    ok "Codex MCP registered → easyeda-agent"
+  elif [ "$MCP_REQUIRED" = 1 ]; then
+    fatal "MCP files installed, but Codex registration failed"
+  else
+    warn "MCP files installed, but Codex registration failed; retry with EASYEDA_INSTALL_MCP=codex"
+  fi
 fi
 
 # ── PATH check ────────────────────────────────────────────────────────────────
@@ -270,7 +397,11 @@ printf '  3. In EasyEDA Pro: 设置 → 允许外部交互 (Allow external inter
 printf '  4. Use the skill in your AI client:\n'
 printf '       /easyeda-agent       (schematic + PCB workflow)\n'
 printf '       Installed for detected clients: Codex (~/.codex/skills) and/or Claude Code (~/.claude/skills)\n\n'
-printf 'Upgrading later? No need to re-run this script:\n'
+if [ "$INSTALL_MCP" != "none" ]; then
+  printf '     Codex MCP: easyeda-agent (registered; start a new Codex session to discover it)\n\n'
+fi
+printf 'Full-stack upgrade (CLI + Skill + MCP) is the same idempotent install command.\n'
+printf 'For a lighter CLI + Skill-only update:\n'
 printf '       easyeda update           # CLI binary + skill dirs → latest\n'
 printf '       easyeda update --check   # report only (cli / skill / connector)\n'
 printf '     (the connector .eext still needs a manual re-import — `update` prints the URL)\n\n'

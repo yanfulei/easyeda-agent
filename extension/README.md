@@ -8,8 +8,8 @@ Skill / CLI -> Go daemon -> EDA Agent Connector -> 官方 eda.* API
 
 一行看懂:Skill 描述专家工作流,Go CLI/daemon 提供有类型、可观测的动作与校验,本连接器把这些 typed actions 桥接到官方 `eda.*` API——它是整个系统中**唯一直接调用 `eda.*` 的组件**,每一步操作最终都落在嘉立创自己开放的插件能力上。
 
-- GitHub 仓库:https://github.com/zhoushoujianwork/easyeda-agent
-- 最新 Release:https://github.com/zhoushoujianwork/easyeda-agent/releases/latest
+- GitHub 仓库:https://github.com/yanfulei/easyeda-agent
+- 最新 Release:https://github.com/yanfulei/easyeda-agent/releases/latest
 
 ## 效果演示
 
@@ -61,7 +61,7 @@ AI 从空白页开始生成原理图——不是生成一张电路图图片,而�
 
 这是一个真实可打包、可导入的 EasyEDA Pro 扩展,刻意保持很薄:
 
-- 本地 WebSocket 传输:端口扫描、握手、注册、上下文同步、心跳、自愈重连;
+- 本地 WebSocket 传输:固定 `60832`、握手、注册、上下文同步、心跳、退避与 id 轮换自愈;
 - typed action 分发:把 daemon 下发的结构化动作映射到官方 `eda.*` 调用;
 - 结果序列化:执行结果、警告、错误、上下文回传 daemon;
 - 产物传输:截图、BOM、网表等二进制结果编码回传。
@@ -73,12 +73,12 @@ AI 从空白页开始生成原理图——不是生成一张电路图图片,而�
 **1. 装本连接器**(两条通道任选):
 
 - 在本市场页面点击「安装」——平台可原地自动更新,最省心;
-- 或从 GitHub Release(https://github.com/zhoushoujianwork/easyeda-agent/releases/latest)侧载 `easyeda-agent-connector.eext`——与 CLI 严格同版。
+- 或从 GitHub Release(https://github.com/yanfulei/easyeda-agent/releases/latest)侧载 `easyeda-agent-connector.eext`——与 CLI 严格同版。
 
-**2. 装 CLI/daemon + Skill**(一行脚本,自动检测 Claude Code / Codex 并装好 Skill):
+**2. 装 CLI/daemon + Skill + MCP**(一行脚本,检测到 Codex 时自动装并幂等注册 MCP):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 ```
 
 **3. 在 EasyEDA 中确认三件事**:
@@ -87,11 +87,13 @@ curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main
 2. 已开启「允许外部交互 / Allow external interaction」——否则连接器的 WebSocket 连不上本地 daemon;
 3. 已启动本地 daemon(`easyeda daemon start`),`easyeda health` 能看到已连接窗口。
 
-**之后升级不必再跑脚本**:`easyeda update` 一键升 CLI + Skill;`easyeda update --check` 只读三方(cli / skill / connector)版本对齐表。
+**完整升级重跑同一脚本**(幂等,会同步 MCP);`easyeda update` 是 CLI + Skill 的轻量升级,
+`easyeda update --check` 只读 cli / skill / connector 对齐表。
 
 ### 版本配套约定
 
-连接器与 CLI 遵循**同一版本号**——四件套(CLI/daemon、连接器、Skill、EasyEDA)需同版本同时在位,落后的连接器会被 `easyeda daemon health` 标成 stale。两条安装通道的取舍:
+CLI/daemon、连接器、Skill、MCP 遵循**同一 release 版本号**;EasyEDA Pro 是宿主。
+落后的连接器会被 `easyeda daemon health` 标成 stale。两条安装通道的取舍:
 
 - **市场版**:平台可原地自动更新,最省心;但市场无发布 API,每版需人工重新提交,**上架版本可能滞后于 CLI**。
 - **GitHub Release 侧载版**:与 CLI **严格同版**,需严格版本对齐时以它为准;代价是无原地自动更新,升级需手动卸载旧版再导入。
@@ -104,8 +106,8 @@ curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main
 
 ## 链接
 
-- GitHub 仓库(架构、路线图、能力矩阵、实战案例):https://github.com/zhoushoujianwork/easyeda-agent
-- Releases(严格同版 `.eext` + CLI 各平台二进制):https://github.com/zhoushoujianwork/easyeda-agent/releases
+- GitHub 仓库(架构、路线图、能力矩阵、实战案例):https://github.com/yanfulei/easyeda-agent
+- Releases(严格同版 `.eext` + CLI 各平台二进制):https://github.com/yanfulei/easyeda-agent/releases
 - 完整实战案例:一份需求文档 -> AI 全自动画完 ESP32-S3 四层板,见仓库 `docs/showcase-esp32-mini.md`
 
 MIT 许可,欢迎 star 与共建电路块库(一次贡献,署名可追,永久收益)。

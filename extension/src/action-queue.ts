@@ -32,9 +32,12 @@
  * 真机实测过这个形态 —— 一次卡死的重调用让接下来 4.5 分钟的
  * place/delete/document.open 全部静默消失(轻读照常,所以看起来「连接器还活着」)。
  * 所以队首必须有截止时间:到点就**放弃它**(不再等),`seqAbandoned++`,记进
- * `abandonedIds` 环形缓冲,队列继续流动。
+ * `abandonedIds` 环形缓冲。只读 handler 放弃后队列继续流动;**写 handler**
+ * 放弃后进入 quarantine:只读诊断仍可流动,后续写(含 autosave)一律拒绝,
+ * 直到原 handler 真正 settle。否则一个晚到写会和后续写交错,产生幽灵修改。
  *
- * 截止时间来自**请求自带的 timeoutMs**(daemon 已经在下发),不是写死的常数:
+ * 截止时间来自**请求的 createdAt + timeoutMs**(daemon 已经在下发),不是从
+ * handler 真正开跑才重新计时,也不是写死的常数。排队时已经过期的请求不得执行:
  * `sch check` / DRC 这类合法长操作能跑 60 秒以上,一个固定 30 秒的门会把它们
  * 全误杀。
  *
@@ -91,11 +94,13 @@ export interface QueueStamp {
 	abandonedIds?: string[];
 }
 
-/** 一次入队的结局。四种互斥,调用方据此构造 response frame。 */
+/** 一次入队的结局。各状态互斥,调用方据此构造 response frame。 */
 export type QueueOutcome<T> =
 	| { status: 'ok'; value: T; stamp: QueueStamp }
 	| { status: 'error'; error: unknown; stamp: QueueStamp }
-	| { status: 'abandoned'; waitedMs: number; stamp: QueueStamp }
+	| { status: 'abandoned'; waitedMs: number; mutates: boolean; writeSensitive: boolean; stamp: QueueStamp }
+	| { status: 'expired'; waitedMs: number; stamp: QueueStamp }
+	| { status: 'quarantined'; blockerId: string; blockerAction?: string; blockedMs: number; stamp: QueueStamp }
 	| { status: 'overflow'; depth: number; stamp: QueueStamp };
 
 export interface QueueTask<T> {
@@ -103,6 +108,14 @@ export interface QueueTask<T> {
 	id: string;
 	/** 请求自带的往返预算(daemon 下发)。<=0 / 缺省 → ABANDON_FALLBACK_MS。 */
 	timeoutMs?: number;
+	/** daemon 接收请求的绝对创建时刻(Date.parse 后的毫秒)。缺省用 submit 时刻。 */
+	createdAtMs?: number;
+	/** 诊断用 action 名,quarantine 回执会点名。 */
+	action?: string;
+	/** catalog 驱动的真实写分类(dryRun 已由 daemon 扣除)。 */
+	mutates?: boolean;
+	/** 写 + 前台文档切换;被放弃写未 settle 时两者都必须隔离。 */
+	writeSensitive?: boolean;
 	/** true = 走旁路,不进 FIFO,不动 seq(见 transport.ts 的旁路名单)。 */
 	bypass?: boolean;
 	run: () => Promise<T>;
@@ -126,6 +139,8 @@ export class ActionQueue {
 	private depth = 0;
 	/** 显式的 promise 链:队首 settle(或被放弃)之前,下一个绝不开跑。 */
 	private tail: Promise<void> = Promise.resolve();
+	/** 被放弃但尚未 settle 的写。存在时后续写绝不执行。 */
+	private quarantine?: { id: string; action?: string; sinceMs: number };
 
 	private readonly maxDepth: number;
 	private readonly fallbackTimeoutMs: number;
@@ -158,16 +173,29 @@ export class ActionQueue {
 		if (task.bypass) {
 			return this.runBypass(task);
 		}
+		const writeSensitive = task.writeSensitive ?? (task.mutates === true);
+		if (writeSensitive && this.quarantine) {
+			return Promise.resolve(this.quarantineOutcome<T>());
+		}
 		if (this.depth >= this.maxDepth) {
 			// 溢出保护:明确拒绝,而不是让积压无限增长。调用方把它翻译成一个
 			// 可读的 error code,调用者于是知道「连接器堵了」而不是「超时了」。
 			return Promise.resolve({ status: 'overflow', depth: this.depth, stamp: this.stamp(false) });
 		}
+		const submittedAtMs = Date.now();
+		const budget = task.timeoutMs && task.timeoutMs > 0 ? task.timeoutMs : this.fallbackTimeoutMs;
+		const createdAtMs = Number.isFinite(task.createdAtMs) ? Number(task.createdAtMs) : submittedAtMs;
+		const scheduled = {
+			...task,
+			writeSensitive,
+			submittedAtMs,
+			deadlineAtMs: createdAtMs + budget + this.graceMs,
+		};
 		this.depth += 1;
 		return new Promise<QueueOutcome<T>>((resolve) => {
 			// 链上每一环都必须**永不 reject**,否则一次失败会把整条链断掉,
 			// 后续动作全部静默消失 —— 那正是这个文件要根治的病。
-			this.tail = this.tail.then(() => this.runHead(task, resolve));
+			this.tail = this.tail.then(() => this.runHead(scheduled, resolve));
 		});
 	}
 
@@ -183,18 +211,27 @@ export class ActionQueue {
 	}
 
 	/** 跑队首一个任务,带截止时间;无论结局如何都 resolve,让链继续流动。 */
-	private async runHead<T>(task: QueueTask<T>, resolve: (outcome: QueueOutcome<T>) => void): Promise<void> {
+	private async runHead<T>(
+		task: QueueTask<T> & { submittedAtMs: number; deadlineAtMs: number },
+		resolve: (outcome: QueueOutcome<T>) => void,
+	): Promise<void> {
 		this.depth -= 1;
-		const budget = task.timeoutMs && task.timeoutMs > 0 ? task.timeoutMs : this.fallbackTimeoutMs;
-		const deadlineMs = budget + this.graceMs;
-		const startedAt = Date.now();
+		const remainingMs = task.deadlineAtMs - Date.now();
+		if (remainingMs <= 0) {
+			resolve({ status: 'expired', waitedMs: Date.now() - task.submittedAtMs, stamp: this.stamp(false) });
+			return;
+		}
+		if (task.writeSensitive && this.quarantine) {
+			resolve(this.quarantineOutcome<T>());
+			return;
+		}
 
 		// 截止时间登记到 deadlines.ts:setTimeout 是快路径,worker tick 的
 		// sweepDeadlines() 是保底路径。**保底路径才是这个闸门真正的时基** ——
 		// 见文件头「放弃闸的时基必须是 worker tick」。
 		let handle: DeadlineHandle | undefined;
 		const abandonSignal = new Promise<{ kind: 'abandoned' }>((res) => {
-			handle = armDeadline(deadlineMs, () => res({ kind: 'abandoned' }));
+			handle = armDeadline(remainingMs, () => res({ kind: 'abandoned' }));
 		});
 
 		// run() 可能**同步抛**(payload 校验之类),那也算一次正常的 settle。
@@ -222,7 +259,25 @@ export class ActionQueue {
 			while (this.abandonedIds.length > ABANDONED_ID_RING) {
 				this.abandonedIds.shift();
 			}
-			resolve({ status: 'abandoned', waitedMs: Date.now() - startedAt, stamp: this.stamp(false) });
+			if (task.writeSensitive) {
+				const state = { id: task.id, action: task.action, sinceMs: Date.now() };
+				this.quarantine = state;
+				// The normalized `running` promise never rejects. Clear only this exact
+				// quarantine generation: a later abandoned write must not be cleared by
+				// an older handler's late settlement.
+				void running.then(() => {
+					if (this.quarantine === state) {
+						this.quarantine = undefined;
+					}
+				});
+			}
+			resolve({
+				status: 'abandoned',
+				waitedMs: Date.now() - task.submittedAtMs,
+				mutates: task.mutates === true,
+				writeSensitive: task.writeSensitive === true,
+				stamp: this.stamp(false),
+			});
 			return;
 		}
 
@@ -234,6 +289,20 @@ export class ActionQueue {
 		else {
 			resolve({ status: 'error', error: outcome.error, stamp: this.stamp(false) });
 		}
+	}
+
+	private quarantineOutcome<T>(): QueueOutcome<T> {
+		const q = this.quarantine;
+		if (!q) {
+			throw new Error('quarantineOutcome called without an active quarantine');
+		}
+		return {
+			status: 'quarantined',
+			blockerId: q.id,
+			blockerAction: q.action,
+			blockedMs: Date.now() - q.sinceMs,
+			stamp: this.stamp(false),
+		};
 	}
 
 	private stamp(unordered: boolean): QueueStamp {

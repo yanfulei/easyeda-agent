@@ -196,6 +196,7 @@ func matchExistingZoneFrame(t zonePartitionTarget, prev *workflow.SchZoneFrames,
 // settle delay.
 type zoneDrawDeps struct {
 	exec   zoneJSExecutor
+	draw   func(phase string, target zonePartitionTarget) (map[string]any, error)
 	survey func() (zoneFrameSurvey, error)
 	sleep  func()
 }
@@ -254,7 +255,7 @@ type zoneDrawOutcome struct {
 //	transport 失败          → 先轻读复核:已落地→收编 id 不重发;确实没落地→
 //	                          settle 后重发一次;复核不出来(读失败/歧义)→不重发。
 func drawOneZoneResilient(d zoneDrawDeps, t zonePartitionTarget, js string, known zoneKnownIDs) zoneDrawOutcome {
-	if js == "" {
+	if d.draw == nil && js == "" {
 		return zoneDrawOutcome{Err: fmt.Errorf("degenerate frame bbox for %q — nothing to draw", t.Title)}
 	}
 	var lastErr error
@@ -263,7 +264,13 @@ func drawOneZoneResilient(d zoneDrawDeps, t zonePartitionTarget, js string, know
 		if attempt > 0 {
 			phase += " (retry)"
 		}
-		v, err := d.exec(phase, js)
+		var v map[string]any
+		var err error
+		if d.draw != nil {
+			v, err = d.draw(phase, t)
+		} else {
+			v, err = d.exec(phase, js)
+		}
 		if err == nil {
 			if asBool(v["ok"]) {
 				rects, texts := asStringSlice(v["rects"]), asStringSlice(v["texts"])
@@ -391,15 +398,38 @@ func runPartitionDrawResilient(cfg *appConfig, window string, opts partitionOpts
 	if err != nil {
 		return err
 	}
+	// Retain the legacy executor only for clearing a stale pre-typed frame
+	// record. New surveys and all new frame writes use typed actions below.
 	exec := func(phase, code string) (map[string]any, error) {
 		return execAutolayoutZoneJS(pinnedCfg, win, docUUID, phase, code)
 	}
 	surveyFn := func() (zoneFrameSurvey, error) {
-		v, serr := exec("survey zone frames (light read)", buildZoneSurveyJS())
+		res, serr := requestAutolayoutAction(pinnedCfg, "schematic.graphics.survey", win, nil, docUUID, "survey zone frames (light read)")
 		if serr != nil {
 			return zoneFrameSurvey{}, serr
 		}
-		return parseZoneFrameSurvey(v), nil
+		return parseZoneFrameSurvey(res.Result), nil
+	}
+	drawFn := func(phase string, t zonePartitionTarget) (map[string]any, error) {
+		res, derr := requestAutolayoutActionTimed(pinnedCfg, "schematic.partition.create", win, map[string]any{
+			"minX": t.Rect.MinX, "minY": t.Rect.MinY,
+			"maxX": t.Rect.MaxX, "maxY": t.Rect.MaxY,
+			"title": t.Title, "titleX": t.TX, "titleY": t.TY,
+			"color": color, "fontSize": t.FontSize,
+		}, 30*time.Second, docUUID, phase)
+		if derr != nil {
+			return nil, derr
+		}
+		rid := asString(res.Result["rectPrimitiveId"])
+		tid := asString(res.Result["textPrimitiveId"])
+		if rid == "" || tid == "" {
+			return nil, fmt.Errorf("schematic.partition.create returned incomplete ids: %v", res.Result)
+		}
+		return map[string]any{
+			"ok":    true,
+			"rects": []any{rid},
+			"texts": []any{tid},
+		}, nil
 	}
 
 	// Read-only planning/validation happens before ANY write, same as before.
@@ -477,8 +507,11 @@ func runPartitionDrawResilient(cfg *appConfig, window string, opts partitionOpts
 	known := knownIDsFromSurvey(sv)
 	deps := zoneDrawDeps{
 		exec:   exec,
+		draw:   drawFn,
 		survey: surveyFn,
-		sleep:  func() { time.Sleep(settleDelay) },
+		// Partition titles use the same rate-limited beta text API as sch note.
+		// The survey above proves a failed pair did not land before this wait.
+		sleep: func() { time.Sleep(schematicTextRetryDelay) },
 	}
 	newFrames := &workflow.SchZoneFrames{At: nowRFC3339()}
 	persist := func() error {
@@ -523,8 +556,12 @@ func runPartitionDrawResilient(cfg *appConfig, window string, opts partitionOpts
 			adopted++
 			// 假失败回传(通道 B):daemon 把那次 exec_js 记成失败了,landed-check
 			// 证明它其实落地了。不回传 = 健康度把「连接器慢」当成「连接器坏」。
+			action := "debug.exec_js"
+			if deps.draw != nil {
+				action = "schematic.partition.create"
+			}
 			reportWriteVerified(pinnedCfg, win, writeVerdict{
-				action: "debug.exec_js", source: "sch zone-draw",
+				action: action, source: "sch zone-draw",
 				returnedOK: false, landed: 1,
 			})
 			fmt.Fprintf(stderr, "zone %q: write reported failure but the light read proved it landed — ids adopted, nothing was resent (假失败定律)\n", t.Title)

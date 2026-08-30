@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zhoushoujianwork/easyeda-agent/internal/protocol"
 )
 
 const (
@@ -25,10 +27,20 @@ const (
 	defaultPortEnd   = 0xeda9 // 60841
 )
 
-// defaultActionTimeout bounds how long the CLI waits for a single /action
-// round-trip before giving up. Most actions return well under a second; a
-// hang here means the connector's underlying eda.* call never settled.
-const defaultActionTimeout = 20 * time.Second
+// defaultActionTimeout is the catalog floor for actions without a specialized
+// budget. Generic dispatch MUST resolve through catalogActionTimeout: saves,
+// DRC, rebinds and manufacturing exports have documented longer tails.
+const defaultActionTimeout = time.Duration(protocol.DefaultActionTimeoutMs) * time.Millisecond
+
+// catalogActionTimeout is the single default resolver used by generic CLI
+// paths. Explicitly timed workflows still win by calling dispatchTimed /
+// requestActionTimed with their own budget.
+func catalogActionTimeout(action string) time.Duration {
+	if spec, ok := docGuardCatalog()[action]; ok && spec.TimeoutMs > 0 {
+		return time.Duration(spec.TimeoutMs) * time.Millisecond
+	}
+	return defaultActionTimeout
+}
 
 // errActionFailed is returned by dispatch when the daemon responds with
 // ok=false. The response body has already been written to stdout so the
@@ -79,6 +91,9 @@ type appConfig struct {
 	// is the mechanism that removes the doc-switch race — a long op (autoLayout)
 	// can no longer scatter the wrong page because the foreground drifted.
 	doc string
+	// advisories is set only by fail-closed composite commands. postAction feeds
+	// it every nested response without changing the normal command surface.
+	advisories *actionAdvisoryCollector
 }
 
 // portRange parses the ports string and returns (start, end, err).
@@ -91,7 +106,7 @@ func (c *appConfig) portRange() (int, int, error) {
 // caller must return that error without printing again). Any other error
 // (daemon not found, network, etc.) is a fresh error the caller may print.
 func dispatch(cfg *appConfig, action, window string, payload any, stdout, stderr io.Writer) error {
-	return dispatchTimed(cfg, action, window, payload, defaultActionTimeout, stdout, stderr)
+	return dispatchTimed(cfg, action, window, payload, catalogActionTimeout(action), stdout, stderr)
 }
 
 // dispatchTimed is dispatch with a caller-chosen round-trip timeout. Use it for
@@ -206,6 +221,12 @@ type actionResult struct {
 	Result    map[string]any `json:"result"`
 	Artifacts []artifactRef  `json:"artifacts"`
 	Context   *actionContext `json:"context"`
+	// Preserve every reliability advisory for composite commands. Human-facing
+	// commands still print these on stderr, but manufacturing/release workflows
+	// must be able to fail closed instead of losing the structured evidence.
+	Warnings         []string `json:"warnings,omitempty"`
+	StaleRisk        string   `json:"staleRisk,omitempty"`
+	ConcurrentWriter string   `json:"concurrentWriter,omitempty"`
 	// Seq is the connector's FIFO ordering evidence carried on this response
 	// (connector ≥ 1.0.3). Known=false means the connector is older and sent no
 	// such fields — callers MUST then fall back to a weaker judgement rather
@@ -222,7 +243,7 @@ type actionResult struct {
 // touching stdout. A non-nil error means the daemon was unreachable or the
 // action returned ok=false (with the connector's error message attached).
 func requestAction(cfg *appConfig, action, window string, payload any) (*actionResult, error) {
-	return requestActionTimed(cfg, action, window, payload, defaultActionTimeout)
+	return requestActionTimed(cfg, action, window, payload, catalogActionTimeout(action))
 }
 
 // requestActionTimed is requestAction with a caller-chosen round-trip timeout,
@@ -253,14 +274,17 @@ func requestActionOnce(cfg *appConfig, action, window string, payload any, timeo
 	}
 
 	var parsed struct {
-		ID        string         `json:"id"`
-		Type      string         `json:"type"`
-		Version   string         `json:"version"`
-		OK        bool           `json:"ok"`
-		Result    map[string]any `json:"result"`
-		Artifacts []artifactRef  `json:"artifacts"`
-		Context   *actionContext `json:"context"`
-		Error     *struct {
+		ID               string         `json:"id"`
+		Type             string         `json:"type"`
+		Version          string         `json:"version"`
+		OK               bool           `json:"ok"`
+		Result           map[string]any `json:"result"`
+		Artifacts        []artifactRef  `json:"artifacts"`
+		Context          *actionContext `json:"context"`
+		Warnings         []string       `json:"warnings"`
+		StaleRisk        string         `json:"staleRisk"`
+		ConcurrentWriter string         `json:"concurrentWriter"`
+		Error            *struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
@@ -268,7 +292,12 @@ func requestActionOnce(cfg *appConfig, action, window string, payload any, timeo
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, fmt.Errorf("decode %s response: %w", action, err)
 	}
-	res := &actionResult{ID: parsed.ID, Type: parsed.Type, Version: parsed.Version, OK: parsed.OK, Result: parsed.Result, Artifacts: parsed.Artifacts, Context: parsed.Context, Seq: parseSeqCounters(respBody)}
+	res := &actionResult{
+		ID: parsed.ID, Type: parsed.Type, Version: parsed.Version, OK: parsed.OK,
+		Result: parsed.Result, Artifacts: parsed.Artifacts, Context: parsed.Context,
+		Warnings: parsed.Warnings, StaleRisk: parsed.StaleRisk,
+		ConcurrentWriter: parsed.ConcurrentWriter, Seq: parseSeqCounters(respBody),
+	}
 	if !parsed.OK {
 		msg := "ok=false"
 		code := ""
@@ -318,7 +347,7 @@ func encodeResultEnvelope(res *actionResult, report any, stdout io.Writer) error
 // so the caller can post-process artifacts. The streamed bytes are unchanged;
 // callers read res.Artifacts for the persisted file path.
 func dispatchCapture(cfg *appConfig, action, window string, payload any, stdout io.Writer) (*actionResult, error) {
-	respBody, err := postAction(cfg, action, window, payload, defaultActionTimeout)
+	respBody, err := postAction(cfg, action, window, payload, catalogActionTimeout(action))
 	if err != nil {
 		return nil, err
 	}
@@ -343,13 +372,15 @@ func dispatchCapture(cfg *appConfig, action, window string, payload any, stdout 
 // healthWindow is the subset of a /health window entry the doc commands need to
 // resolve a routing target.
 type healthWindow struct {
-	WindowID         string `json:"windowId"`
-	ConnectorVersion string `json:"connectorVersion"`
+	WindowID         string    `json:"windowId"`
+	ConnectorVersion string    `json:"connectorVersion"`
+	ConnectedAt      time.Time `json:"connectedAt"`
 	Context          struct {
 		ProjectUUID  string `json:"projectUuid"`
 		ProjectName  string `json:"projectName"`
 		DocumentUUID string `json:"documentUuid"`
 		DocumentType string `json:"documentType"`
+		TabID        string `json:"tabId"`
 	} `json:"context"`
 }
 
@@ -412,6 +443,9 @@ func selectWindow(windows []healthWindow, project, window string) (string, error
 		case 0:
 			return "", fmt.Errorf("no connected window for project %q (run `easyeda daemon health`)", project)
 		default:
+			if newest, ok := newestExactHealthDocumentDuplicate(matches); ok {
+				return newest.WindowID, nil
+			}
 			return "", fmt.Errorf("project %q maps to %d windows — pass --window <id>", project, len(matches))
 		}
 	}
@@ -421,8 +455,40 @@ func selectWindow(windows []healthWindow, project, window string) (string, error
 	case 0:
 		return "", fmt.Errorf("no EasyEDA connector is available")
 	default:
+		if newest, ok := newestExactHealthDocumentDuplicate(windows); ok {
+			return newest.WindowID, nil
+		}
 		return "", fmt.Errorf("%d windows connected — pass --project <name> or --window <id>", len(windows))
 	}
+}
+
+// newestExactHealthDocumentDuplicate collapses duplicate connector activations
+// for one exact EasyEDA document tab. Distinct documents in the same project
+// remain ambiguous and still require --window.
+func newestExactHealthDocumentDuplicate(matches []healthWindow) (healthWindow, bool) {
+	if len(matches) < 2 {
+		return healthWindow{}, false
+	}
+	first := matches[0]
+	if first.Context.ProjectUUID == "" ||
+		first.Context.DocumentUUID == "" ||
+		first.Context.DocumentType == "" ||
+		first.Context.TabID == "" {
+		return healthWindow{}, false
+	}
+	newest := first
+	for _, w := range matches[1:] {
+		if w.Context.ProjectUUID != first.Context.ProjectUUID ||
+			w.Context.DocumentUUID != first.Context.DocumentUUID ||
+			w.Context.DocumentType != first.Context.DocumentType ||
+			w.Context.TabID != first.Context.TabID {
+			return healthWindow{}, false
+		}
+		if w.ConnectedAt.After(newest.ConnectedAt) {
+			newest = w
+		}
+	}
+	return newest, true
 }
 
 // cliClientID identifies this CLI process to the daemon, computed once per
@@ -591,31 +657,115 @@ func docGuardApplies(doc, action string) bool {
 // cached /health snapshot, which is what fooled the hand-rolled checks), and
 // returns an error rather than proceed on the wrong page.
 func ensureActiveDoc(cfg *appConfig, window string) error {
+	_, _, err := ensureActiveDocBinding(cfg, window)
+	return err
+}
+
+// ensureActiveDocBinding switches and confirms cfg.doc, then returns both the
+// concrete window selected by discovery and an exact live target binding for
+// the final action request. The connector checks this binding inside its FIFO,
+// immediately before invoking the handler, closing the switch-then-write race.
+func ensureActiveDocBinding(cfg *appConfig, window string) (*protocol.ExpectedContext, string, error) {
 	if cfg.doc == "" {
-		return nil
+		return nil, window, nil
 	}
-	docs, activeUUID, rw, err := discoverDocs(cfg, window)
+	docs, activeUUID, rw, current, err := discoverDocsWithContext(cfg, window)
 	if err != nil {
-		return fmt.Errorf("--doc guard: %w", err)
+		return nil, "", fmt.Errorf("--doc guard: %w", err)
+	}
+	if err := validateProjectBinding(cfg.project, current); err != nil {
+		return nil, "", fmt.Errorf("--doc guard: %w", err)
 	}
 	target, err := resolveDoc(docs, cfg.doc)
 	if err != nil {
-		return fmt.Errorf("--doc %q: %w", cfg.doc, err)
+		return nil, "", fmt.Errorf("--doc %q: %w", cfg.doc, err)
 	}
 	if activeUUID == target.UUID {
-		return nil
+		binding, err := expectedContextBinding(current, target)
+		if err != nil {
+			return nil, "", fmt.Errorf("--doc %q: %w", cfg.doc, err)
+		}
+		return binding, rw, nil
 	}
 	for i := 0; i < 6; i++ {
 		if _, oerr := requestAction(cfg, "document.open", rw, map[string]any{"uuid": target.UUID}); oerr != nil {
-			return fmt.Errorf("--doc guard: open %s: %w", target.Name, oerr)
+			return nil, "", fmt.Errorf("--doc guard: open %s: %w", target.Name, oerr)
 		}
 		time.Sleep(1200 * time.Millisecond)
 		cur, cerr := requestAction(cfg, "document.current", rw, nil)
 		if cerr == nil && cur.Context != nil && cur.Context.DocumentUUID == target.UUID {
-			return nil
+			if perr := validateProjectBinding(cfg.project, cur.Context); perr != nil {
+				return nil, "", fmt.Errorf("--doc guard: %w", perr)
+			}
+			binding, berr := expectedContextBinding(cur.Context, target)
+			if berr != nil {
+				return nil, "", fmt.Errorf("--doc %q: %w", cfg.doc, berr)
+			}
+			return binding, rw, nil
 		}
 	}
-	return fmt.Errorf("--doc %q: could not confirm it is the active page after retries — refusing to run a mutating action on the wrong page", cfg.doc)
+	return nil, "", fmt.Errorf("--doc %q: could not confirm it is the active page after retries — refusing to run an action on the wrong page", cfg.doc)
+}
+
+func validateProjectBinding(selector string, current *actionContext) error {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil
+	}
+	if current == nil || current.ProjectUUID == "" {
+		return fmt.Errorf("project %q cannot be bound because live project context is missing", selector)
+	}
+	if selector != current.ProjectUUID && selector != current.ProjectName {
+		return fmt.Errorf("project %q does not match the selected window's live project %q (%s)",
+			selector, current.ProjectName, current.ProjectUUID)
+	}
+	return nil
+}
+
+func expectedContextBinding(current *actionContext, target openableDoc) (*protocol.ExpectedContext, error) {
+	if current == nil || current.DocumentUUID != target.UUID {
+		return nil, fmt.Errorf("live document confirmation is missing or changed (wanted %s)", target.UUID)
+	}
+	if current.ProjectUUID == "" {
+		return nil, fmt.Errorf("live project UUID is missing; refusing an unbound document action")
+	}
+	if target.UUID == "" || target.Type == "" {
+		return nil, fmt.Errorf("target document identity is incomplete (uuid=%q type=%q)", target.UUID, target.Type)
+	}
+	if current.DocumentType != "" && current.DocumentType != target.Type {
+		return nil, fmt.Errorf("live document type %q does not match target type %q", current.DocumentType, target.Type)
+	}
+	return &protocol.ExpectedContext{
+		ProjectUUID:  current.ProjectUUID,
+		DocumentUUID: target.UUID,
+		DocumentType: target.Type,
+	}, nil
+}
+
+// actionDocumentType derives the editor kind from the typed action namespace.
+// It deliberately has no user override: a pcb.* action can never authorize a
+// schematic target (or vice versa) by supplying a matching but wrong binding.
+func actionDocumentType(action string) string {
+	switch {
+	case strings.HasPrefix(action, "pcb."):
+		return "pcb"
+	case strings.HasPrefix(action, "schematic."):
+		return "schematic"
+	default:
+		return ""
+	}
+}
+
+func validateActionDocumentType(action string, binding *protocol.ExpectedContext) error {
+	want := actionDocumentType(action)
+	if want == "" || binding == nil {
+		return nil
+	}
+	if binding.DocumentType != want {
+		return fmt.Errorf("action %q requires a %s document, but --doc resolved to %q (%s)",
+			action, want, binding.DocumentUUID, binding.DocumentType)
+	}
+	return nil
 }
 
 // printCascadeCleanup surfaces a delete response's cascaded cleanup (ADR-0004
@@ -776,8 +926,14 @@ func postAction(cfg *appConfig, action, window string, payload any, timeout time
 	// --doc guard: pin the action (mutating OR read — see docGuardApplies) to
 	// the requested page first. Skipped for the guard's own navigation actions
 	// (docGuardExempt) so it never recurses.
+	var expectedContext *protocol.ExpectedContext
 	if docGuardApplies(cfg.doc, action) {
-		if err := ensureActiveDoc(cfg, window); err != nil {
+		var err error
+		expectedContext, window, err = ensureActiveDocBinding(cfg, window)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateActionDocumentType(action, expectedContext); err != nil {
 			return nil, err
 		}
 	}
@@ -788,7 +944,7 @@ func postAction(cfg *appConfig, action, window string, payload any, timeout time
 	}
 
 	if timeout <= 0 {
-		timeout = defaultActionTimeout
+		timeout = catalogActionTimeout(action)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -815,6 +971,9 @@ func postAction(cfg *appConfig, action, window string, payload any, timeout time
 	// this HTTP client times out — instead of both sides hanging to their own
 	// independent deadlines.
 	body["timeoutMs"] = int(timeout / time.Millisecond)
+	if expectedContext != nil {
+		body["expectedContext"] = expectedContext
+	}
 	if window != "" {
 		body["windowId"] = window
 	}
@@ -872,6 +1031,9 @@ func postAction(cfg *appConfig, action, window string, payload any, timeout time
 	}
 	if closeErr != nil {
 		return nil, fmt.Errorf("close response: %w", closeErr)
+	}
+	if cfg.advisories != nil {
+		cfg.advisories.observe(action, respBody)
 	}
 	// Surface a daemon stale-read advisory here — the one choke point all
 	// dispatch paths (dispatch/dispatchCapture/requestAction) share — so every

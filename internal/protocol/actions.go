@@ -14,16 +14,26 @@ const (
 )
 
 type ActionSpec struct {
-	Name         string   `json:"name"`
-	Domain       Domain   `json:"domain"`
-	Phase        int      `json:"phase"`
-	Mutates      bool     `json:"mutates"`
-	NeedsWindow  bool     `json:"needsWindow"`
-	NeedsConfirm bool     `json:"needsConfirm"`
-	Description  string   `json:"description"`
-	Inputs       []string `json:"inputs,omitempty"`
-	Outputs      []string `json:"outputs,omitempty"`
-	VerifyWith   []string `json:"verifyWith,omitempty"`
+	Name    string `json:"name"`
+	Domain  Domain `json:"domain"`
+	Phase   int    `json:"phase"`
+	Mutates bool   `json:"mutates"`
+	// ChangesContext marks actions that switch or close the foreground editor
+	// without changing document contents. They stay read-only for autosave and
+	// workflow purposes, but must be serialized like writes after an abandoned
+	// mutation so a late handler cannot land on another document.
+	ChangesContext bool `json:"changesContext"`
+	NeedsWindow    bool `json:"needsWindow"`
+	NeedsConfirm   bool `json:"needsConfirm"`
+	// TimeoutMs is the recommended end-to-end budget for one invocation. It is
+	// emitted for every action so generic clients (CLI call, MCP, playbooks) do
+	// not silently fall back to one fixed timeout that is too short for saves,
+	// DRC, rebinds, or manufacturing exports.
+	TimeoutMs   int      `json:"timeoutMs"`
+	Description string   `json:"description"`
+	Inputs      []string `json:"inputs,omitempty"`
+	Outputs     []string `json:"outputs,omitempty"`
+	VerifyWith  []string `json:"verifyWith,omitempty"`
 
 	// RequiresGate names a workflow gate that must pass before the daemon
 	// dispatches this action ("routing" = outline_confirmed + pre_route_passed
@@ -36,11 +46,50 @@ type ActionSpec struct {
 	InvalidatesStage string `json:"invalidatesStage,omitempty"`
 }
 
+// DefaultActionTimeoutMs is deliberately conservative: ordinary SDK calls
+// normally return in milliseconds, while a loaded editor can legitimately
+// need tens of seconds. Slow, known long-tail actions are overridden below.
+const DefaultActionTimeoutMs = 60_000
+
+var actionTimeoutOverridesMs = map[string]int{
+	"schematic.rebind.footprint":       120_000,
+	"schematic.rebind.symbol":          120_000,
+	"schematic.component.replace":      120_000,
+	"schematic.component.resolve_lcsc": 120_000,
+	"schematic.drc.check":              120_000,
+	"schematic.check":                  120_000,
+	"schematic.bridgeCheck":            120_000,
+	"schematic.read":                   120_000,
+	"schematic.save":                   120_000,
+	"schematic.export.netlist":         120_000,
+	"schematic.export.image":           120_000,
+	"schematic.export.bom":             120_000,
+	"pcb.component.attrs_backfill":     120_000,
+	"pcb.components.arrange":           120_000,
+	"pcb.manufacturing.snapshot":       120_000,
+	"pcb.drc.check":                    120_000,
+	"pcb.save":                         120_000,
+	"pcb.export.gerber":                120_000,
+	"pcb.export.pick_and_place":        120_000,
+	"pcb.export.bom":                   120_000,
+	"pcb.export.dsn":                   120_000,
+	"pcb.import_autoroute":             120_000,
+}
+
+// ActionTimeoutMs returns the effective catalog budget even for internal
+// daemon-originated calls such as autosave.
+func ActionTimeoutMs(action string) int {
+	if override := actionTimeoutOverridesMs[action]; override > 0 {
+		return override
+	}
+	return DefaultActionTimeoutMs
+}
+
 // GateRouting is the routing gate name used in ActionSpec.RequiresGate.
 const GateRouting = "routing"
 
 func AllActions() []ActionSpec {
-	return []ActionSpec{
+	actions := []ActionSpec{
 		{
 			Name:        "system.health",
 			Domain:      DomainSystem,
@@ -74,14 +123,27 @@ func AllActions() []ActionSpec {
 			Outputs:     []string{"document uuid", "document type", "tab id"},
 		},
 		{
-			Name:        "document.open",
-			Domain:      DomainDocument,
-			Phase:       1,
-			Mutates:     false,
-			NeedsWindow: true,
-			Description: "Open any document (schematic page or PCB) by UUID and activate its editor tab. A generalization of schematic.page.open that works for all document types.",
-			Inputs:      []string{"uuid"},
-			Outputs:     []string{"tab id"},
+			Name:           "document.open",
+			Domain:         DomainDocument,
+			Phase:          1,
+			Mutates:        false,
+			ChangesContext: true,
+			NeedsWindow:    true,
+			Description:    "Open any document (schematic page or PCB) by UUID and activate its editor tab. A generalization of schematic.page.open that works for all document types.",
+			Inputs:         []string{"uuid"},
+			Outputs:        []string{"tab id"},
+		},
+		{
+			Name:           "document.close",
+			Domain:         DomainDocument,
+			Phase:          1,
+			Mutates:        false,
+			ChangesContext: true,
+			NeedsWindow:    true,
+			NeedsConfirm:   true,
+			Description:    "Close one editor tab by tabId through the official EasyEDA API. Callers must save and verify saved:true first; doc reload does this automatically.",
+			Inputs:         []string{"tabId"},
+			Outputs:        []string{"closed", "tabId"},
 		},
 		// ── view (editor canvas, document-agnostic — schematic & PCB) ──────
 		// All map to eda.dmt_EditorControl.* and act on the focused canvas.
@@ -128,14 +190,15 @@ func AllActions() []ActionSpec {
 			Outputs:     []string{"schematic uuid list", "schematic page uuid list"},
 		},
 		{
-			Name:        "schematic.page.open",
-			Domain:      DomainSchematic,
-			Phase:       1,
-			Mutates:     false,
-			NeedsWindow: true,
-			Description: "Open or activate a schematic page by uuid.",
-			Inputs:      []string{"schematicPageUuid"},
-			Outputs:     []string{"tab id", "current document"},
+			Name:           "schematic.page.open",
+			Domain:         DomainSchematic,
+			Phase:          1,
+			Mutates:        false,
+			ChangesContext: true,
+			NeedsWindow:    true,
+			Description:    "Open or activate a schematic page by uuid.",
+			Inputs:         []string{"schematicPageUuid"},
+			Outputs:        []string{"tab id", "current document"},
 		},
 		// ── sheet / page management + 明细表 (title block) ─────────────────
 		// All map to eda.dmt_Schematic.*. NOTE: EasyEDA Pro exposes no
@@ -326,6 +389,17 @@ func AllActions() []ActionSpec {
 			VerifyWith:  []string{"schematic.components.list"},
 		},
 		{
+			Name:        "schematic.text.create",
+			Domain:      DomainSchematic,
+			Phase:       1,
+			Mutates:     true,
+			NeedsWindow: true,
+			Description: "Create one schematic annotation text primitive through the typed connector surface. Used by sch note instead of debug.exec_js; returns the created primitive id for readback and compensation.",
+			Inputs:      []string{"x", "y", "content", "rotation optional", "color optional", "fontName optional", "fontSize optional"},
+			Outputs:     []string{"primitiveId", "content", "x", "y", "rotation", "color", "fontName", "fontSize"},
+			VerifyWith:  []string{"schematic.text.list"},
+		},
+		{
 			Name:        "schematic.text.list",
 			Domain:      DomainSchematic,
 			Phase:       1,
@@ -334,6 +408,27 @@ func AllActions() []ActionSpec {
 			Description: "Read-only list of ALL text primitives on the ACTIVE schematic page (#156) — the typed enumeration that pairs with schematic.primitives.delete to clean up orphaned zone-draw labels without the debug.exec_js escape hatch. Page-lazy-load law applies: only the active page's texts are returned; iterate pages with document.switch. Each entry carries primitiveId/content/x/y/rotation/fontSize/fontName/color/bold/italic.",
 			Inputs:      []string{},
 			Outputs:     []string{"count", "scope (activePage)", "texts[].primitiveId", "texts[].content", "texts[].x", "texts[].y", "texts[].rotation", "texts[].fontSize", "texts[].color"},
+		},
+		{
+			Name:        "schematic.partition.create",
+			Domain:      DomainSchematic,
+			Phase:       1,
+			Mutates:     true,
+			NeedsWindow: true,
+			Description: "Create one data-driven functional partition as a compensated rectangle + title pair. A title failure deletes the rectangle before returning; callers still survey before retrying.",
+			Inputs:      []string{"minX", "minY", "maxX", "maxY", "title", "titleX", "titleY", "color optional", "fontSize optional"},
+			Outputs:     []string{"rectPrimitiveId", "textPrimitiveId", "title", "bbox"},
+			VerifyWith:  []string{"schematic.graphics.survey"},
+		},
+		{
+			Name:        "schematic.graphics.survey",
+			Domain:      DomainSchematic,
+			Phase:       1,
+			Mutates:     false,
+			NeedsWindow: true,
+			Description: "Lightweight typed survey of schematic rectangle ids plus text ids/content/anchors, used to prove whether an annotation write landed before any retry.",
+			Inputs:      []string{},
+			Outputs:     []string{"rects[]", "texts[].id", "texts[].content", "texts[].x", "texts[].y"},
 		},
 		{
 			Name:        "schematic.library.search",
@@ -490,6 +585,41 @@ func AllActions() []ActionSpec {
 			Inputs:      []string{"fileType", "template optional", "columns optional"},
 			Outputs:     []string{"artifact id", "file path", "file type"},
 		},
+		// PCB manufacturing exports are deliberately separate typed actions.
+		// EasyEDA's public API returns each file as a Blob/File and the daemon
+		// already persists arbitrary inline artifacts, so there is no reason to
+		// route these through a UI download dialog. Gerber's default options
+		// include both plated and non-plated drill information in the ZIP.
+		{
+			Name:        "pcb.export.gerber",
+			Domain:      DomainArtifact,
+			Phase:       2,
+			NeedsWindow: true,
+			Description: "Export the active PCB's JLC-compatible Gerber ZIP as an artifact. The default includes plated and non-plated drill information; no order/payment action is performed. The underlying EasyEDA API is beta, so inspect the returned artifact and run PCB DRC/check before manufacturing.",
+			Inputs:      []string{"fileName optional", "colorSilkscreen optional", "unit optional (mm|inch)", "digitalFormat optional", "other optional (drill flags)", "layers optional", "objects optional"},
+			Outputs:     []string{"artifact id", "file path", "file name", "size", "unit", "drillIncluded"},
+			VerifyWith:  []string{"pcb.drc.check", "pcb.report"},
+		},
+		{
+			Name:        "pcb.export.pick_and_place",
+			Domain:      DomainArtifact,
+			Phase:       2,
+			NeedsWindow: true,
+			Description: "Export the active PCB centroid/placement file (CPL / Pick-and-Place) as CSV or XLSX. Defaults to millimeters and CSV for the JLCPCB assembly workflow; this is read-only and never submits an order.",
+			Inputs:      []string{"fileName optional", "fileType optional (csv|xlsx)", "unit optional (mm|mil)"},
+			Outputs:     []string{"artifact id", "file path", "file name", "file type", "unit", "size"},
+			VerifyWith:  []string{"pcb.components.list"},
+		},
+		{
+			Name:        "pcb.export.bom",
+			Domain:      DomainArtifact,
+			Phase:       2,
+			NeedsWindow: true,
+			Description: "Export the active PCB BOM as CSV or XLSX. The caller may pass the native template/filter/statistics/property/columns options; the action does not alter the design or place an order.",
+			Inputs:      []string{"fileName optional", "fileType optional (csv|xlsx)", "template optional", "filterOptions optional", "statistics optional", "property optional", "columns optional"},
+			Outputs:     []string{"artifact id", "file path", "file name", "file type", "size"},
+			VerifyWith:  []string{"pcb.components.list"},
+		},
 		// ─── PCB (Phase 2 — read-only skeleton) ──────────────────────────
 		// Connectivity probe + inspection surface for the upcoming PCB
 		// layout/routing feature. All read-only; mirrors the schematic read
@@ -510,6 +640,21 @@ func AllActions() []ActionSpec {
 			Description: "List placed footprints/components on the active PCB, with layer, coordinates, rotation, lock, optional bbox (rendered extent, for overlap/spacing reasoning), and optional pads.",
 			Inputs:      []string{"layer optional", "includeBBox optional", "includePads optional"},
 			Outputs:     []string{"components[].primitiveId", "components[].designator", "components[].layer", "components[].x", "components[].y", "components[].rotation", "components[].bbox", "components[].pads", "count"},
+		},
+		{
+			Name:        "pcb.manufacturing.snapshot",
+			Domain:      DomainPcb,
+			Phase:       2,
+			NeedsWindow: true,
+			Mutates:     false,
+			Description: "Read one complete, deterministic manufacturing-state snapshot from the active PCB. This fail-closed action rejects missing or malformed SDK inventories instead of treating them as an empty board, and returns normalized JSON suitable for hashing before and after DRC/export operations.",
+			Outputs: []string{
+				"schemaVersion", "complete", "board", "pcb",
+				"components (identity, footprint, placement, side, properties, component pads)",
+				"pads", "lines", "arcs", "polylines", "vias", "pours", "poured (actual fill paths)",
+				"fills", "regions", "strings", "attributes", "images", "objects", "dimensions",
+				"outlineAndCutouts", "layers", "copperLayerCount", "nets", "drcRules",
+			},
 		},
 		{
 			Name:        "pcb.layers.list",
@@ -1328,4 +1473,8 @@ func AllActions() []ActionSpec {
 			Outputs:      []string{"value"},
 		},
 	}
+	for i := range actions {
+		actions[i].TimeoutMs = ActionTimeoutMs(actions[i].Name)
+	}
+	return actions
 }

@@ -205,15 +205,19 @@ func TestStaleReadGate_ReloadAndPourRebuildOpenIt(t *testing.T) {
 
 // TestStaleReadGate_DocReloadItselfIsNeverBlocked is the deadlock check: the ONE
 // remedy the refusal prescribes must be runnable on a refusing window. `doc
-// reload` is a CLI composite of document.current → document.open → pcb.save →
-// debug.exec_js(closeDocument) → document.open → document.current
-// (internal/app/cmd_doc.go reloadDocumentByUUID); if any step were classified as
-// a PCB read the gate would wedge the board permanently.
+// reload PCB1` first discovers the named target, then performs the typed reload:
+// document.current → schematic.pages.list → pcb.documents.list →
+// document.current → document.open → pcb.save → document.close →
+// document.open → document.current. If any step were classified as a stale
+// PCB read the gate would wedge the board permanently.
 func TestStaleReadGate_DocReloadItselfIsNeverBlocked(t *testing.T) {
 	s, _ := gateServer(t)
 	gateMark(s, "pcb.clear_routing", "w1", nil)
 
-	for _, step := range []string{"document.current", "document.open", "pcb.save", "debug.exec_js"} {
+	for _, step := range []string{
+		"document.current", "schematic.pages.list", "pcb.documents.list",
+		"document.open", "pcb.save", "document.close",
+	} {
 		if resp := s.checkStaleRead(gateReq(step, "w1", "ceshi")); resp != nil {
 			t.Fatalf("`doc reload` step %s must never be gated (would deadlock the remedy), got %+v", step, resp.Error)
 		}

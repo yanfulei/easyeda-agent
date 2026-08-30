@@ -3830,6 +3830,9 @@ const schematicSave: Handler = async () => {
 	catch (err) {
 		throw edaError(err, 'Failed to save schematic.');
 	}
+	if (saved !== true) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED, 'Failed to save schematic: eda.sch_Document.save() did not return true.');
+	}
 	return { result: { saved } };
 };
 
@@ -4156,6 +4159,267 @@ const schematicExportBom: Handler = async (payload) => {
 		fallbackMime,
 	);
 	return { result: { artifactId: artifact.id, fileType }, artifacts: [artifact] };
+};
+
+// ─── PCB manufacturing exports ─────────────────────────────────────
+//
+// The public EasyEDA Pro API exposes the PCB manufacturing files as Blob/File
+// values.  Keep these actions read-only and pass the bytes through the same
+// artifact plumbing as schematic exports; the Go daemon persists them under
+// the caller's project directory.  In particular, do not call
+// `placePcbOrder()` here: producing a manufacturing package and submitting an
+// order are separate user decisions.
+
+const PCB_EXPORT_TIMEOUT_MS = 120_000;
+
+const PCB_GERBER_OBJECTS = [
+	'Pad', 'Via', 'Track', 'Text', 'Image', 'Dimension', 'BoardOutline',
+	'BoardCutout', 'CopperFilled', 'SolidRegion', 'FPCStiffener', 'Line',
+	'PlaneZone', 'ComponentProperty', 'ComponentSilkscreen', 'TearDrop',
+] as const;
+
+type PcbGerberObject = typeof PCB_GERBER_OBJECTS[number];
+
+function exportPayloadError(message: string): ActionError {
+	return new ActionError(ErrorCodes.MISSING_PAYLOAD_FIELD, message);
+}
+
+/** Keep artifact names portable and prevent a payload from choosing a path. */
+function safeExportName(raw: string | undefined, fallback: string, extension: string): string {
+	let name = (raw ?? '').trim().replace(/[\\/\0]/g, '_');
+	if (!name) name = fallback;
+	if (!name.toLowerCase().endsWith(extension.toLowerCase())) name += extension;
+	return name;
+}
+
+function stripExtension(name: string, extension: string): string {
+	return name.toLowerCase().endsWith(extension.toLowerCase())
+		? name.slice(0, -extension.length)
+		: name;
+}
+
+function parseExportUnit(
+	payload: Payload,
+	field: string,
+	allowed: readonly string[],
+	defaultValue: string,
+): string {
+	const raw = optionalString(payload, field);
+	const value = (raw ?? defaultValue).trim().toLowerCase();
+	if (!allowed.includes(value)) {
+		throw exportPayloadError(`Unsupported ${field} "${raw ?? ''}". Use one of: ${allowed.join(', ')}.`);
+	}
+	return value;
+}
+
+function parseGerberDigitalFormat(payload: Payload):
+	{ integerNumber: number; decimalNumber: number } | undefined {
+	const raw = payload.digitalFormat;
+	if (raw === undefined) return undefined;
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+		throw exportPayloadError('"digitalFormat" must be an object with integerNumber and decimalNumber.');
+	}
+	const value = raw as Record<string, unknown>;
+	const integerNumber = value.integerNumber;
+	const decimalNumber = value.decimalNumber;
+	if (!Number.isInteger(integerNumber) || !Number.isInteger(decimalNumber)
+		|| (integerNumber as number) < 1 || (integerNumber as number) > 10
+		|| (decimalNumber as number) < 1 || (decimalNumber as number) > 10) {
+		throw exportPayloadError('"digitalFormat" integerNumber/decimalNumber must be integers from 1 to 10.');
+	}
+	return { integerNumber: integerNumber as number, decimalNumber: decimalNumber as number };
+}
+
+function parseGerberOther(payload: Payload): {
+	metallicDrillingInformation: boolean;
+	nonMetallicDrillingInformation: boolean;
+	drillTable: boolean;
+	flyingProbeTestingFile: boolean;
+} {
+	const defaults = {
+		// Drill data belongs in the Gerber ZIP by default.  Without these flags a
+		// board can look complete while the fabricator has no hole files.
+		metallicDrillingInformation: true,
+		nonMetallicDrillingInformation: true,
+		drillTable: true,
+		flyingProbeTestingFile: false,
+	};
+	const raw = payload.other;
+	if (raw === undefined) return defaults;
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+		throw exportPayloadError('"other" must be an object containing Gerber drill flags.');
+	}
+	const value = raw as Record<string, unknown>;
+	const out = { ...defaults };
+	for (const key of Object.keys(out) as Array<keyof typeof out>) {
+		if (value[key] !== undefined) {
+			if (typeof value[key] !== 'boolean') {
+				throw exportPayloadError(`Gerber option "other.${key}" must be boolean.`);
+			}
+			out[key] = value[key] as boolean;
+		}
+	}
+	return out;
+}
+
+function parseGerberLayers(payload: Payload): Array<{ layerId: number; isMirror: boolean }> | undefined {
+	const raw = payload.layers;
+	if (raw === undefined) return undefined;
+	if (!Array.isArray(raw)) throw exportPayloadError('"layers" must be an array of {layerId,isMirror}.');
+	const layers: Array<{ layerId: number; isMirror: boolean }> = [];
+	for (const item of raw) {
+		if (!item || typeof item !== 'object' || Array.isArray(item)) {
+			throw exportPayloadError('Every Gerber layer must be an object with numeric layerId and boolean isMirror.');
+		}
+		const value = item as Record<string, unknown>;
+		if (!Number.isInteger(value.layerId) || typeof value.isMirror !== 'boolean') {
+			throw exportPayloadError('Every Gerber layer must be an object with numeric layerId and boolean isMirror.');
+		}
+		layers.push({ layerId: value.layerId as number, isMirror: value.isMirror });
+	}
+	return layers.length ? layers : undefined;
+}
+
+function parseGerberObjects(payload: Payload): Array<PcbGerberObject> | undefined {
+	const raw = payload.objects;
+	if (raw === undefined) return undefined;
+	const values = typeof raw === 'string' ? [raw] : raw;
+	if (!Array.isArray(values)) throw exportPayloadError('"objects" must be a string or string[].');
+	const allowed = new Set<string>(PCB_GERBER_OBJECTS);
+	const out: Array<PcbGerberObject> = [];
+	for (const item of values) {
+		if (typeof item !== 'string' || !allowed.has(item)) {
+			throw exportPayloadError(`Unsupported Gerber object "${String(item)}".`);
+		}
+		if (!out.includes(item as PcbGerberObject)) out.push(item as PcbGerberObject);
+	}
+	return out.length ? out : undefined;
+}
+
+function fileNameOf(file: Blob, fallback: string): string {
+	const candidate = (file as File).name;
+	return typeof candidate === 'string' && candidate.length > 0 ? candidate : fallback;
+}
+
+async function exportPcbFileArtifact(
+	file: File | undefined,
+	kind: string,
+	fallbackName: string,
+	fallbackMime: string,
+	metadata: Record<string, unknown>,
+): Promise<ActionResult> {
+	if (!file) throw new ActionError(ErrorCodes.EDA_CALL_FAILED, `${kind} export returned no file.`);
+	const name = fileNameOf(file, fallbackName);
+	const artifact = await blobToArtifact(file, kind, name, fallbackMime);
+	return {
+		result: { artifactId: artifact.id, fileName: name, size: file.size, ...metadata },
+		artifacts: [artifact],
+	};
+}
+
+/** Export the standard JLC Gerber ZIP, including drill information by default. */
+const pcbExportGerber: Handler = async (payload) => {
+	const fileName = safeExportName(optionalString(payload, 'fileName'), 'gerber.zip', '.zip');
+	const colorSilkscreen = optionalBoolean(payload, 'colorSilkscreen') ?? false;
+	const unit = parseExportUnit(payload, 'unit', ['mm', 'inch'], 'mm');
+	const digitalFormat = parseGerberDigitalFormat(payload);
+	const other = parseGerberOther(payload);
+	const layers = parseGerberLayers(payload);
+	const objects = parseGerberObjects(payload);
+	let file: File | undefined;
+	try {
+		file = await withTimeout(
+			eda.pcb_ManufactureData.getGerberFile(
+				fileName,
+				colorSilkscreen,
+				unit as Parameters<typeof eda.pcb_ManufactureData.getGerberFile>[2],
+				digitalFormat,
+				other,
+				layers,
+				objects,
+			),
+			PCB_EXPORT_TIMEOUT_MS,
+			`Gerber export did not settle within ${PCB_EXPORT_TIMEOUT_MS}ms. Bring the PCB window to the foreground and retry once.`,
+		);
+	}
+	catch (err) {
+		if (err instanceof ActionError) throw err;
+		throw edaError(err, 'Failed to export Gerber.');
+	}
+	return exportPcbFileArtifact(file, 'pcb_gerber', fileName, 'application/zip', {
+		unit,
+		drillIncluded: other.metallicDrillingInformation || other.nonMetallicDrillingInformation,
+		metallicDrillingInformation: other.metallicDrillingInformation,
+		nonMetallicDrillingInformation: other.nonMetallicDrillingInformation,
+		drillTable: other.drillTable,
+	});
+};
+
+/** Export centroids for assembly (CPL / Pick-and-Place). */
+const pcbExportPickAndPlace: Handler = async (payload) => {
+	const fileType = (optionalString(payload, 'fileType') ?? 'csv').trim().toLowerCase();
+	if (fileType !== 'csv' && fileType !== 'xlsx') {
+		throw exportPayloadError(`Unsupported fileType "${fileType}". Use csv or xlsx.`);
+	}
+	const unit = parseExportUnit(payload, 'unit', ['mm', 'mil'], 'mm');
+	const fileName = safeExportName(optionalString(payload, 'fileName'), `pick-and-place.${fileType}`, `.${fileType}`);
+	let file: File | undefined;
+	try {
+		file = await withTimeout(
+			eda.pcb_ManufactureData.getPickAndPlaceFile(
+				fileName,
+				fileType,
+				unit as Parameters<typeof eda.pcb_ManufactureData.getPickAndPlaceFile>[2],
+			),
+			PCB_EXPORT_TIMEOUT_MS,
+			`Pick-and-Place export did not settle within ${PCB_EXPORT_TIMEOUT_MS}ms. Bring the PCB window to the foreground and retry once.`,
+		);
+	}
+	catch (err) {
+		if (err instanceof ActionError) throw err;
+		throw edaError(err, 'Failed to export Pick-and-Place data.');
+	}
+	const mime = fileType === 'csv'
+		? 'text/csv'
+		: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+	return exportPcbFileArtifact(file, 'pcb_pick_and_place', fileName, mime, { fileType, unit });
+};
+
+/** Export the PCB-side BOM using the native template and column options. */
+const pcbExportBom: Handler = async (payload) => {
+	const fileType = (optionalString(payload, 'fileType') ?? 'csv').trim().toLowerCase();
+	if (fileType !== 'csv' && fileType !== 'xlsx') {
+		throw exportPayloadError(`Unsupported fileType "${fileType}". Use csv or xlsx.`);
+	}
+	const extension = `.${fileType}`;
+	const requestedName = safeExportName(optionalString(payload, 'fileName'), `pcb-bom${extension}`, extension);
+	// The SDK appends fileType itself (`name + fileType`), so remove the suffix
+	// before calling it to avoid `board.csvcsv`.
+	const fileName = stripExtension(requestedName, extension);
+	const template = optionalString(payload, 'template');
+	const filterOptions = payload.filterOptions as Parameters<typeof eda.pcb_ManufactureData.getBomFile>[3] | undefined;
+	const statistics = payload.statistics as Array<string> | undefined;
+	const property = payload.property as Array<string> | undefined;
+	const columns = payload.columns as Parameters<typeof eda.pcb_ManufactureData.getBomFile>[6] | undefined;
+	for (const [field, value] of [['filterOptions', filterOptions], ['statistics', statistics], ['property', property], ['columns', columns]] as const) {
+		if (value !== undefined && !Array.isArray(value)) throw exportPayloadError(`"${field}" must be an array when provided.`);
+	}
+	let file: File | undefined;
+	try {
+		file = await withTimeout(
+			eda.pcb_ManufactureData.getBomFile(fileName, fileType, template, filterOptions, statistics, property, columns),
+			PCB_EXPORT_TIMEOUT_MS,
+			`PCB BOM export did not settle within ${PCB_EXPORT_TIMEOUT_MS}ms. Bring the PCB window to the foreground and retry once.`,
+		);
+	}
+	catch (err) {
+		if (err instanceof ActionError) throw err;
+		throw edaError(err, 'Failed to export PCB BOM.');
+	}
+	const mime = fileType === 'csv'
+		? 'text/csv'
+		: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+	return exportPcbFileArtifact(file, 'pcb_bom', requestedName, mime, { fileType });
 };
 
 // ─── Library search ──────────────────────────────────────────────────
@@ -4746,6 +5010,148 @@ function makeRebindHandler(kind: 'footprint' | 'symbol'): Handler {
 
 const schematicRebindFootprint: Handler = makeRebindHandler('footprint');
 const schematicRebindSymbol: Handler = makeRebindHandler('symbol');
+
+// ─── Schematic annotations: typed create + readback ───────────────────
+
+/**
+ * Create one schematic text primitive through a typed action. This promotes the
+ * former sch-note debug.exec_js path into the connector's audited surface.
+ */
+const schematicTextCreate: Handler = async (payload) => {
+	const x = requireNumber(payload, 'x');
+	const y = requireNumber(payload, 'y');
+	const content = requireString(payload, 'content');
+	const rotation = optionalNumber(payload, 'rotation') ?? 0;
+	const color = optionalString(payload, 'color') ?? '#5A5A5A';
+	const fontName = optionalString(payload, 'fontName') ?? null;
+	const fontSize = optionalNumber(payload, 'fontSize') ?? 10;
+	let text;
+	try {
+		text = await eda.sch_PrimitiveText.create(
+			x, y, content, rotation, color, fontName, fontSize,
+		);
+	}
+	catch (err) {
+		throw edaError(err, 'Failed to create schematic text.');
+	}
+	if (!text) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED, 'schematic text create returned no primitive.');
+	}
+	const primitiveId = text.getState_PrimitiveId();
+	if (!primitiveId) {
+		try { await eda.sch_PrimitiveText.delete(text); }
+		catch { /* best-effort compensation */ }
+		throw new ActionError(ErrorCodes.INVALID_STATE, 'schematic text create returned a primitive without an id.');
+	}
+	return {
+		result: {
+			primitiveId,
+			content,
+			x,
+			y,
+			rotation,
+			color,
+			fontName,
+			fontSize,
+		},
+	};
+};
+
+/**
+ * Create one data-driven functional partition as a rectangle + title. The pair
+ * is compensated together so a missing title cannot strand a frame.
+ */
+const schematicPartitionCreate: Handler = async (payload) => {
+	const minX = requireNumber(payload, 'minX');
+	const minY = requireNumber(payload, 'minY');
+	const maxX = requireNumber(payload, 'maxX');
+	const maxY = requireNumber(payload, 'maxY');
+	const title = requireString(payload, 'title');
+	const titleX = requireNumber(payload, 'titleX');
+	const titleY = requireNumber(payload, 'titleY');
+	const color = optionalString(payload, 'color') ?? '#AA00AA';
+	const fontSize = optionalNumber(payload, 'fontSize') ?? 22;
+	const width = maxX - minX;
+	const height = maxY - minY;
+	if (!(width > 0) || !(height > 0)) {
+		throw new ActionError(
+			ErrorCodes.INVALID_STATE,
+			`partition bbox must have positive width and height; got ${width} x ${height}.`,
+		);
+	}
+
+	const createdIds: string[] = [];
+	const compensate = async () => {
+		if (createdIds.length === 0) return;
+		try { await eda.sch_PrimitiveObject.delete(createdIds); }
+		catch { /* the caller surveys the page before any retry */ }
+	};
+	try {
+		// Schematic rectangles are anchored at their visual top-left on the y-up
+		// canvas, hence (minX,maxY,width,height).
+		const rect = await eda.sch_PrimitiveRectangle.create(
+			minX, maxY, width, height, 0, 0, color, null, 1, 1,
+		);
+		if (!rect) {
+			throw new ActionError(ErrorCodes.EDA_CALL_FAILED, `rectangle create returned no primitive for ${title}.`);
+		}
+		const rectPrimitiveId = rect.getState_PrimitiveId();
+		if (!rectPrimitiveId) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, `rectangle id missing for ${title}.`);
+		}
+		createdIds.push(rectPrimitiveId);
+
+		const text = await eda.sch_PrimitiveText.create(
+			titleX, titleY, title, 0, color, null, fontSize,
+		);
+		if (!text) {
+			throw new ActionError(ErrorCodes.EDA_CALL_FAILED, `title create returned no primitive for ${title}.`);
+		}
+		const textPrimitiveId = text.getState_PrimitiveId();
+		if (!textPrimitiveId) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, `title id missing for ${title}.`);
+		}
+		createdIds.push(textPrimitiveId);
+		return {
+			result: {
+				rectPrimitiveId,
+				textPrimitiveId,
+				title,
+				bbox: { minX, minY, maxX, maxY },
+			},
+		};
+	}
+	catch (err) {
+		await compensate();
+		if (err instanceof ActionError) throw err;
+		throw edaError(err, `Failed to create schematic partition ${title}.`);
+	}
+};
+
+/** Lightweight typed survey used to verify partition writes before retrying. */
+const schematicGraphicsSurvey: Handler = async () => {
+	let rects;
+	let texts;
+	try {
+		rects = await eda.sch_PrimitiveRectangle.getAllPrimitiveId();
+		texts = await eda.sch_PrimitiveText.getAll();
+	}
+	catch (err) {
+		throw edaError(err, 'Failed to survey schematic annotations.');
+	}
+	const textInfo = (Array.isArray(texts) ? texts : []).map(t => ({
+		id: t.getState_PrimitiveId(),
+		content: t.getState_Content(),
+		x: t.getState_X(),
+		y: t.getState_Y(),
+	}));
+	return {
+		result: {
+			rects: Array.isArray(rects) ? rects : [],
+			texts: textInfo,
+		},
+	};
+};
 
 // ─── Text primitives: read-only enumeration (#156) ────────────────────
 
@@ -5895,6 +6301,22 @@ const documentOpen: Handler = async (payload) => {
 	return { result: { tabId, ready } };
 };
 
+/** Close one editor tab through the official typed SDK. */
+const documentClose: Handler = async (payload) => {
+	const tabId = requireString(payload, 'tabId');
+	let closed: boolean;
+	try {
+		closed = await eda.dmt_EditorControl.closeDocument(tabId);
+	}
+	catch (err) {
+		throw edaError(err, 'Failed to close document.');
+	}
+	if (closed !== true) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED, `EasyEDA did not confirm closing tab "${tabId}".`);
+	}
+	return { result: { closed: true, tabId } };
+};
+
 // ─── PCB (Phase 2 — read-only skeleton) ──────────────────────────────
 
 /**
@@ -5965,6 +6387,412 @@ const pcbComponentsList: Handler = async (payload) => {
 	}
 
 	return { result: { components: serialized, count: serialized.length } };
+};
+
+// ─── Manufacturing state snapshot ───────────────────────────────────
+
+/**
+ * Convert SDK-returned plain data into deterministic JSON data. Primitive
+ * objects themselves are serialized through their public getState_* methods;
+ * this helper is only for nested value objects (rules, layers and properties).
+ */
+function manufacturingPlain(value: unknown, label: string): unknown {
+	if (value === undefined || value === null) return value ?? null;
+	if (typeof value === 'string' || typeof value === 'boolean') return value;
+	if (typeof value === 'number') {
+		if (!Number.isFinite(value)) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, `${label} contains a non-finite number.`);
+		}
+		return value;
+	}
+	if (Array.isArray(value)) return value.map((item, i) => manufacturingPlain(item, `${label}[${i}]`));
+	if (typeof value === 'object') {
+		const result: Record<string, unknown> = {};
+		for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+			result[key] = manufacturingPlain((value as Record<string, unknown>)[key], `${label}.${key}`);
+		}
+		return result;
+	}
+	throw new ActionError(ErrorCodes.INVALID_STATE, `${label} contains unsupported ${typeof value} data.`);
+}
+
+async function manufacturingArray<T>(label: string, read: () => Promise<Array<T>>): Promise<Array<T>> {
+	let value: unknown;
+	try { value = await read(); }
+	catch (err) { throw edaError(err, `Manufacturing snapshot could not read ${label}.`); }
+	if (!Array.isArray(value)) {
+		throw new ActionError(
+			ErrorCodes.INVALID_STATE,
+			`Manufacturing snapshot is incomplete: ${label} did not return an array.`,
+		);
+	}
+	return value as Array<T>;
+}
+
+async function manufacturingValue<T>(label: string, read: () => Promise<T>): Promise<T> {
+	try { return await read(); }
+	catch (err) { throw edaError(err, `Manufacturing snapshot could not read ${label}.`); }
+}
+
+function manufacturingId(primitive: { getState_PrimitiveId: () => string }, label: string): string {
+	const id = primitive.getState_PrimitiveId();
+	if (typeof id !== 'string' || id.trim() === '') {
+		throw new ActionError(ErrorCodes.INVALID_STATE, `Manufacturing snapshot ${label} has no primitiveId.`);
+	}
+	return id;
+}
+
+function sortManufacturingRecords<T extends Record<string, unknown>>(
+	items: Array<T>,
+	keys: Array<string> = ['primitiveId', 'id'],
+): Array<T> {
+	return items.sort((a, b) => {
+		const av = keys.map(key => a[key]).find(value => value !== undefined && value !== null);
+		const bv = keys.map(key => b[key]).find(value => value !== undefined && value !== null);
+		if (typeof av === 'number' && typeof bv === 'number') return av - bv;
+		const as = String(av ?? '');
+		const bs = String(bv ?? '');
+		return as < bs ? -1 : as > bs ? 1 : 0;
+	});
+}
+
+function manufacturingPolygonSource(
+	polygon: { getSource: () => TPCB_PolygonSourceArray | Array<TPCB_PolygonSourceArray> } | undefined | null,
+	label: string,
+): unknown {
+	if (!polygon || typeof polygon.getSource !== 'function') {
+		throw new ActionError(ErrorCodes.INVALID_STATE, `Manufacturing snapshot ${label} has no polygon source.`);
+	}
+	const source = polygon.getSource();
+	if (!Array.isArray(source)) {
+		throw new ActionError(ErrorCodes.INVALID_STATE, `Manufacturing snapshot ${label} polygon source is unavailable.`);
+	}
+	return manufacturingPlain(source, `${label}.source`);
+}
+
+/**
+ * Read every official PCB inventory that can change fabrication or assembly
+ * output in one connector FIFO action. Missing inventory is an error, never an
+ * empty-board fallback: Go hashes this whole result before and after release.
+ */
+export const pcbManufacturingSnapshot: Handler = async () => {
+	try {
+		const [
+			componentPrimitives, padPrimitives, linePrimitives, arcPrimitives,
+			polylinePrimitives, viaPrimitives, pourPrimitives, pouredPrimitives,
+			fillPrimitives, regionPrimitives, stringPrimitives, attributePrimitives,
+			imagePrimitives, objectPrimitives, dimensionPrimitives, layerItems,
+			netItems, copperLayerCountRaw, ruleConfigurationNameRaw,
+			ruleConfigurationRaw, netRulesRaw, netByNetRulesRaw, regionRulesRaw,
+			boardInfoRaw, pcbInfoRaw,
+		] = await Promise.all([
+			manufacturingArray('components', () => eda.pcb_PrimitiveComponent.getAll()),
+			manufacturingArray('pads', () => eda.pcb_PrimitivePad.getAll()),
+			manufacturingArray('lines', () => eda.pcb_PrimitiveLine.getAll()),
+			manufacturingArray('arcs', () => eda.pcb_PrimitiveArc.getAll()),
+			manufacturingArray('polylines', () => eda.pcb_PrimitivePolyline.getAll()),
+			manufacturingArray('vias', () => eda.pcb_PrimitiveVia.getAll()),
+			manufacturingArray('pours', () => eda.pcb_PrimitivePour.getAll()),
+			manufacturingArray('poured copper', () => eda.pcb_PrimitivePoured.getAll()),
+			manufacturingArray('fills', () => eda.pcb_PrimitiveFill.getAll()),
+			manufacturingArray('regions', () => eda.pcb_PrimitiveRegion.getAll()),
+			manufacturingArray('strings', () => eda.pcb_PrimitiveString.getAll()),
+			manufacturingArray('attributes', () => eda.pcb_PrimitiveAttribute.getAll()),
+			manufacturingArray('images', () => eda.pcb_PrimitiveImage.getAll()),
+			manufacturingArray('objects', () => eda.pcb_PrimitiveObject.getAll()),
+			manufacturingArray('dimensions', () => eda.pcb_PrimitiveDimension.getAll()),
+			manufacturingArray('layers', () => eda.pcb_Layer.getAllLayers()),
+			manufacturingArray('nets', () => eda.pcb_Net.getAllNets()),
+			manufacturingValue('copper layer count', () => eda.pcb_Layer.getTheNumberOfCopperLayers()),
+			manufacturingValue('DRC rule configuration name', () => eda.pcb_Drc.getCurrentRuleConfigurationName()),
+			manufacturingValue('DRC rule configuration', () => eda.pcb_Drc.getCurrentRuleConfiguration()),
+			manufacturingArray('DRC net rules', () => eda.pcb_Drc.getNetRules()),
+			manufacturingValue('DRC net-by-net rules', () => eda.pcb_Drc.getNetByNetRules()),
+			manufacturingArray('DRC region rules', () => eda.pcb_Drc.getRegionRules()),
+			manufacturingValue('current Board info', () => eda.dmt_Board.getCurrentBoardInfo()),
+			manufacturingValue('current PCB info', () => eda.dmt_Pcb.getCurrentPcbInfo()),
+		]);
+
+		const copperLayerCount = Number(copperLayerCountRaw);
+		if (!Number.isInteger(copperLayerCount) || copperLayerCount < 1) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot has no valid copper layer count.');
+		}
+		if (typeof ruleConfigurationNameRaw !== 'string' || ruleConfigurationNameRaw.trim() === '') {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot has no current DRC rule configuration name.');
+		}
+		if (!ruleConfigurationRaw || typeof ruleConfigurationRaw !== 'object' || Array.isArray(ruleConfigurationRaw)) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot has no current DRC rule configuration.');
+		}
+		if (!netByNetRulesRaw || typeof netByNetRulesRaw !== 'object' || Array.isArray(netByNetRulesRaw)) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot has no DRC net-by-net rule inventory.');
+		}
+		if (boardInfoRaw != null && (typeof boardInfoRaw !== 'object' || Array.isArray(boardInfoRaw))) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot has malformed current Board information.');
+		}
+		if (!pcbInfoRaw || typeof pcbInfoRaw !== 'object' || Array.isArray(pcbInfoRaw)) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot has no current PCB information.');
+		}
+
+		const componentPadInventories = await Promise.all(componentPrimitives.map(async (component) => {
+			const componentId = manufacturingId(component, 'component');
+			let componentPads: unknown;
+			try {
+				componentPads = await eda.pcb_PrimitiveComponent.getAllPinsByPrimitiveId(componentId);
+			}
+			catch (err) {
+				throw edaError(err, `Manufacturing snapshot could not read pads for component ${componentId}.`);
+			}
+			if (!Array.isArray(componentPads)) {
+				throw new ActionError(
+					ErrorCodes.INVALID_STATE,
+					`Manufacturing snapshot is incomplete: component ${componentId} pads did not return an array.`,
+				);
+			}
+			return { componentId, pads: componentPads as Array<PcbPad> };
+		}));
+
+		const serializeManufacturingPad = (pad: Awaited<ReturnType<typeof eda.pcb_PrimitivePad.getAll>>[number] | PcbPad, parent: string | null) => {
+			const primitiveId = manufacturingId(pad, 'pad');
+			return {
+				primitiveId,
+				primitiveType: pad.getState_PrimitiveType(),
+				parentComponentPrimitiveId: parent,
+				padNumber: pad.getState_PadNumber(),
+				net: pad.getState_Net() ?? null,
+				layer: pad.getState_Layer(),
+				x: pad.getState_X(), y: pad.getState_Y(), rotation: pad.getState_Rotation(),
+				pad: manufacturingPlain(pad.getState_Pad() ?? null, `pad ${primitiveId}.shape`),
+				hole: manufacturingPlain(pad.getState_Hole(), `pad ${primitiveId}.hole`),
+				holeOffsetX: pad.getState_HoleOffsetX(), holeOffsetY: pad.getState_HoleOffsetY(),
+				holeRotation: pad.getState_HoleRotation(), metallization: pad.getState_Metallization(),
+				padType: pad.getState_PadType(),
+				specialPad: manufacturingPlain(pad.getState_SpecialPad() ?? null, `pad ${primitiveId}.specialPad`),
+				solderMaskAndPasteMaskExpansion: manufacturingPlain(
+					pad.getState_SolderMaskAndPasteMaskExpansion(), `pad ${primitiveId}.maskExpansion`,
+				),
+				heatWelding: manufacturingPlain(pad.getState_HeatWelding(), `pad ${primitiveId}.heatWelding`),
+				locked: pad.getState_PrimitiveLock(),
+			};
+		};
+		const pads = sortManufacturingRecords([
+			...padPrimitives.map(pad => serializeManufacturingPad(pad, null)),
+			...componentPadInventories.flatMap(inventory =>
+				inventory.pads.map(pad => serializeManufacturingPad(pad, inventory.componentId))),
+		]);
+		const padsByComponent = new Map<string, Array<Record<string, unknown>>>();
+		for (const pad of pads) {
+			const parent = String(pad.parentComponentPrimitiveId ?? '');
+			if (parent !== '') (padsByComponent.get(parent) ?? (padsByComponent.set(parent, []), padsByComponent.get(parent)!)).push(pad);
+		}
+
+		const components = sortManufacturingRecords(componentPrimitives.map((component) => {
+			const primitiveId = manufacturingId(component, 'component');
+			const layer = Number(component.getState_Layer());
+			return {
+				primitiveId,
+				primitiveType: component.getState_PrimitiveType(),
+				component: manufacturingPlain(component.getState_Component() ?? null, `component ${primitiveId}.component`),
+				footprint: manufacturingPlain(component.getState_Footprint() ?? null, `component ${primitiveId}.footprint`),
+				model3D: manufacturingPlain(component.getState_Model3D() ?? null, `component ${primitiveId}.model3D`),
+				layer, side: layer === 1 ? 'top' : layer === 2 ? 'bottom' : 'unknown',
+				x: component.getState_X(), y: component.getState_Y(), rotation: component.getState_Rotation(),
+				locked: component.getState_PrimitiveLock(), addIntoBom: component.getState_AddIntoBom(),
+				designator: component.getState_Designator() ?? null, name: component.getState_Name() ?? null,
+				uniqueId: component.getState_UniqueId() ?? null,
+				manufacturer: component.getState_Manufacturer() ?? null,
+				manufacturerId: component.getState_ManufacturerId() ?? null,
+				supplier: component.getState_Supplier() ?? null,
+				supplierId: component.getState_SupplierId() ?? null,
+				otherProperty: manufacturingPlain(component.getState_OtherProperty() ?? {}, `component ${primitiveId}.otherProperty`),
+				padRefs: manufacturingPlain(component.getState_Pads() ?? [], `component ${primitiveId}.padRefs`),
+				pads: padsByComponent.get(primitiveId) ?? [],
+			};
+		}));
+
+		const lines = sortManufacturingRecords(linePrimitives.map(line => ({
+			primitiveId: manufacturingId(line, 'line'), primitiveType: line.getState_PrimitiveType(),
+			net: line.getState_Net(), layer: line.getState_Layer(),
+			startX: line.getState_StartX(), startY: line.getState_StartY(),
+			endX: line.getState_EndX(), endY: line.getState_EndY(),
+			lineWidth: line.getState_LineWidth(), locked: line.getState_PrimitiveLock(),
+		})));
+		const arcs = sortManufacturingRecords(arcPrimitives.map(arc => ({
+			primitiveId: manufacturingId(arc, 'arc'), primitiveType: arc.getState_PrimitiveType(),
+			net: arc.getState_Net(), layer: arc.getState_Layer(),
+			startX: arc.getState_StartX(), startY: arc.getState_StartY(),
+			endX: arc.getState_EndX(), endY: arc.getState_EndY(), arcAngle: arc.getState_ArcAngle(),
+			lineWidth: arc.getState_LineWidth(), interactiveMode: arc.getState_InteractiveMode(),
+			locked: arc.getState_PrimitiveLock(),
+		})));
+		const polylines = sortManufacturingRecords(polylinePrimitives.map(polyline => {
+			const primitiveId = manufacturingId(polyline, 'polyline');
+			return {
+				primitiveId, primitiveType: polyline.getState_PrimitiveType(), net: polyline.getState_Net(),
+				layer: polyline.getState_Layer(),
+				polygon: manufacturingPolygonSource(polyline.getState_Polygon(), `polyline ${primitiveId}`),
+				lineWidth: polyline.getState_LineWidth(), locked: polyline.getState_PrimitiveLock(),
+			};
+		}));
+		const vias = sortManufacturingRecords(viaPrimitives.map(via => ({
+			primitiveId: manufacturingId(via, 'via'), primitiveType: via.getState_PrimitiveType(),
+			net: via.getState_Net(), x: via.getState_X(), y: via.getState_Y(),
+			holeDiameter: via.getState_HoleDiameter(), diameter: via.getState_Diameter(),
+			viaType: via.getState_ViaType(), designRuleBlindViaName: via.getState_DesignRuleBlindViaName(),
+			solderMaskExpansion: manufacturingPlain(via.getState_SolderMaskExpansion(), 'via.solderMaskExpansion'),
+			locked: via.getState_PrimitiveLock(),
+		})));
+		const pours = sortManufacturingRecords(pourPrimitives.map(pour => {
+			const primitiveId = manufacturingId(pour, 'pour');
+			return {
+				primitiveId, primitiveType: pour.getState_PrimitiveType(), net: pour.getState_Net(),
+				layer: pour.getState_Layer(),
+				polygon: manufacturingPolygonSource(pour.getState_ComplexPolygon(), `pour ${primitiveId}`),
+				fillMethod: pour.getState_PourFillMethod(), preserveSilos: pour.getState_PreserveSilos(),
+				pourName: pour.getState_PourName(), priority: pour.getState_PourPriority(),
+				lineWidth: pour.getState_LineWidth(), locked: pour.getState_PrimitiveLock(),
+			};
+		}));
+		const poured = sortManufacturingRecords(pouredPrimitives.map((item) => {
+			const primitiveId = manufacturingId(item, 'poured copper');
+			const rawFills = item.getState_PourFills();
+			if (!Array.isArray(rawFills)) {
+				throw new ActionError(ErrorCodes.INVALID_STATE, `Manufacturing snapshot poured ${primitiveId} has no pourFills array.`);
+			}
+			const pourFills = sortManufacturingRecords(rawFills.map((fill) => {
+				if (typeof fill.id !== 'string' || fill.id.trim() === '') {
+					throw new ActionError(ErrorCodes.INVALID_STATE, `Manufacturing snapshot poured ${primitiveId} contains a fill without id.`);
+				}
+				return {
+					id: fill.id, lineWidth: fill.lineWidth, fill: fill.fill,
+					path: manufacturingPolygonSource(fill.path, `poured ${primitiveId} fill ${fill.id}`),
+				};
+			}), ['id']);
+			return {
+				primitiveId, primitiveType: item.getState_PrimitiveType(),
+				pourPrimitiveId: item.getState_PourPrimitiveId(), pourFills,
+			};
+		}));
+		const fills = sortManufacturingRecords(fillPrimitives.map(fill => {
+			const primitiveId = manufacturingId(fill, 'fill');
+			return {
+				primitiveId, primitiveType: fill.getState_PrimitiveType(), net: fill.getState_Net() ?? null,
+				layer: fill.getState_Layer(),
+				polygon: manufacturingPolygonSource(fill.getState_ComplexPolygon(), `fill ${primitiveId}`),
+				fillMode: fill.getState_FillMode() ?? null, lineWidth: fill.getState_LineWidth(),
+				locked: fill.getState_PrimitiveLock(),
+			};
+		}));
+		const regions = sortManufacturingRecords(regionPrimitives.map(region => {
+			const primitiveId = manufacturingId(region, 'region');
+			return {
+				primitiveId, primitiveType: region.getState_PrimitiveType(), layer: region.getState_Layer(),
+				polygon: manufacturingPolygonSource(region.getState_ComplexPolygon(), `region ${primitiveId}`),
+				ruleType: manufacturingPlain(region.getState_RuleType(), `region ${primitiveId}.ruleType`),
+				regionName: region.getState_RegionName() ?? null, lineWidth: region.getState_LineWidth(),
+				locked: region.getState_PrimitiveLock(),
+			};
+		}));
+		const strings = sortManufacturingRecords(stringPrimitives.map(string => ({
+			primitiveId: manufacturingId(string, 'string'), primitiveType: string.getState_PrimitiveType(),
+			layer: string.getState_Layer(), x: string.getState_X(), y: string.getState_Y(),
+			text: string.getState_Text(), fontFamily: string.getState_FontFamily(),
+			fontSize: string.getState_FontSize(), lineWidth: string.getState_LineWidth(),
+			alignMode: string.getState_AlignMode(), rotation: string.getState_Rotation(),
+			reverse: string.getState_Reverse(), expansion: string.getState_Expansion(),
+			mirror: string.getState_Mirror(), locked: string.getState_PrimitiveLock(),
+		})));
+		const attributes = sortManufacturingRecords(attributePrimitives.map(attribute => ({
+			primitiveId: manufacturingId(attribute, 'attribute'), primitiveType: attribute.getState_PrimitiveType(),
+			parentPrimitiveId: attribute.getState_ParentPrimitiveId(), layer: attribute.getState_Layer(),
+			x: attribute.getState_X(), y: attribute.getState_Y(), key: attribute.getState_Key(),
+			value: attribute.getState_Value(), keyVisible: attribute.getState_KeyVisible(),
+			valueVisible: attribute.getState_ValueVisible(), fontFamily: attribute.getState_FontFamily(),
+			fontSize: attribute.getState_FontSize(), lineWidth: attribute.getState_LineWidth(),
+			alignMode: attribute.getState_AlignMode(), rotation: attribute.getState_Rotation(),
+			reverse: attribute.getState_Reverse(), expansion: attribute.getState_Expansion(),
+			mirror: attribute.getState_Mirror(), locked: attribute.getState_PrimitiveLock(),
+		})));
+		const images = sortManufacturingRecords(imagePrimitives.map(image => ({
+			primitiveId: manufacturingId(image, 'image'), primitiveType: image.getState_PrimitiveType(),
+			x: image.getState_X(), y: image.getState_Y(),
+			complexPolygon: manufacturingPlain(image.getState_ComplexPolygon(), 'image.complexPolygon'),
+			layer: image.getState_Layer(), width: image.getState_Width(), height: image.getState_Height(),
+			rotation: image.getState_Rotation(), horizonMirror: image.getState_HorizonMirror(),
+			locked: image.getState_PrimitiveLock(),
+		})));
+		const objects = sortManufacturingRecords(objectPrimitives.map(object => ({
+			primitiveId: manufacturingId(object, 'object'), primitiveType: object.getState_PrimitiveType(),
+			layer: object.getState_Layer() ?? null, topLeftX: object.getState_TopLeftX() ?? null,
+			topLeftY: object.getState_TopLeftY() ?? null, binaryData: object.getState_BinaryData(),
+			width: object.getState_Width(), height: object.getState_Height(),
+			rotation: object.getState_Rotation(), mirror: object.getState_Mirror(),
+			fileName: object.getState_FileName(), locked: object.getState_PrimitiveLock(),
+		})));
+		const dimensions = sortManufacturingRecords(dimensionPrimitives.map(dimension => ({
+			primitiveId: manufacturingId(dimension, 'dimension'), primitiveType: dimension.getState_PrimitiveType(),
+			dimensionType: dimension.getState_DimensionType(),
+			coordinateSet: manufacturingPlain(dimension.getState_CoordinateSet(), 'dimension.coordinateSet'),
+			layer: dimension.getState_Layer(), unit: dimension.getState_Unit(),
+			lineWidth: dimension.getState_LineWidth(), precision: dimension.getState_Precision(),
+			textFollow: dimension.getState_TextFollow(), locked: dimension.getState_PrimitiveLock(),
+		})));
+
+		const layers = sortManufacturingRecords(layerItems.map((layer) => {
+			const plain = manufacturingPlain(layer, `layer ${String(layer.id)}`);
+			if (!plain || typeof plain !== 'object' || Array.isArray(plain)) {
+				throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot contains a malformed layer.');
+			}
+			const record = plain as Record<string, unknown>;
+			if (typeof record.id !== 'number' || !Number.isInteger(record.id)) {
+				throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot contains a layer without a numeric id.');
+			}
+			return record;
+		}), ['id']);
+		const nets = sortManufacturingRecords(netItems.map((net, i) => {
+			const plain = manufacturingPlain(net, `net ${i}`);
+			if (!plain || typeof plain !== 'object' || Array.isArray(plain)) {
+				throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot contains a malformed net.');
+			}
+			return plain as Record<string, unknown>;
+		}), ['id', 'net', 'name']);
+		const drcRules = {
+			configurationName: ruleConfigurationNameRaw,
+			configuration: manufacturingPlain(ruleConfigurationRaw, 'drcRules.configuration'),
+			netRules: sortManufacturingRecords(netRulesRaw.map((rule, i) => {
+				const plain = manufacturingPlain(rule, `drcRules.netRules[${i}]`);
+				return plain as Record<string, unknown>;
+			}), ['id', 'name', 'net']),
+			netByNetRules: manufacturingPlain(netByNetRulesRaw, 'drcRules.netByNetRules'),
+			regionRules: sortManufacturingRecords(regionRulesRaw.map((rule, i) => {
+				const plain = manufacturingPlain(rule, `drcRules.regionRules[${i}]`);
+				return plain as Record<string, unknown>;
+			}), ['id', 'name']),
+		};
+		const outlineAndCutouts = {
+			layer: 11,
+			lines: lines.filter(item => Number(item.layer) === 11),
+			arcs: arcs.filter(item => Number(item.layer) === 11),
+			polylines: polylines.filter(item => Number(item.layer) === 11),
+		};
+
+		const result = manufacturingPlain({
+			schemaVersion: 'easyeda.pcb.manufacturing-snapshot/v1',
+			complete: true,
+			board: boardInfoRaw == null ? null : manufacturingPlain(boardInfoRaw, 'board'),
+			pcb: manufacturingPlain(pcbInfoRaw, 'pcb'),
+			components, pads, lines, arcs, polylines, vias, pours, poured, fills, regions,
+			strings, attributes, images, objects, dimensions, outlineAndCutouts,
+			layers, copperLayerCount, nets, drcRules,
+		}, 'manufacturing snapshot');
+		if (!result || typeof result !== 'object' || Array.isArray(result)) {
+			throw new ActionError(ErrorCodes.INVALID_STATE, 'Manufacturing snapshot normalization failed.');
+		}
+		return { result: result as Record<string, unknown> };
+	}
+	catch (err) {
+		if (err instanceof ActionError) throw err;
+		throw edaError(err, 'Failed to build the complete PCB manufacturing snapshot.');
+	}
 };
 
 /**
@@ -9572,6 +10400,9 @@ const pcbSave: Handler = async () => {
 	catch (err) {
 		throw edaError(err, 'Failed to save PCB.');
 	}
+	if (saved !== true) {
+		throw new ActionError(ErrorCodes.EDA_CALL_FAILED, 'Failed to save PCB: eda.pcb_Document.save() did not return true.');
+	}
 	return { result: { saved } };
 };
 
@@ -10803,6 +11634,7 @@ const HANDLERS: Record<string, Handler> = {
 	'project.current': projectCurrent,
 	'document.current': documentCurrent,
 	'document.open': documentOpen,
+	'document.close': documentClose,
 	'view.fit': viewFit,
 	'view.fit_selection': viewFitSelection,
 	'view.zoom': viewZoom,
@@ -10842,9 +11674,13 @@ const HANDLERS: Record<string, Handler> = {
 	'schematic.rebind.symbol': schematicRebindSymbol,
 	'schematic.component.replace': schematicComponentReplace,
 	'schematic.component.resolve_lcsc': schematicComponentResolveLcsc,
+	'schematic.text.create': schematicTextCreate,
 	'schematic.text.list': schematicTextList,
+	'schematic.partition.create': schematicPartitionCreate,
+	'schematic.graphics.survey': schematicGraphicsSurvey,
 	'pcb.documents.list': pcbDocumentsList,
 	'pcb.components.list': pcbComponentsList,
+	'pcb.manufacturing.snapshot': pcbManufacturingSnapshot,
 	'pcb.layers.list': pcbLayersList,
 	'pcb.layers.set_current': pcbLayerSetCurrent,
 	'pcb.layers.visibility': pcbLayerVisibility,
@@ -10911,6 +11747,9 @@ const HANDLERS: Record<string, Handler> = {
 	'pcb.fill.list': pcbFillList,
 	'pcb.fill.delete': pcbFillDelete,
 	'pcb.save': pcbSave,
+	'pcb.export.gerber': pcbExportGerber,
+	'pcb.export.pick_and_place': pcbExportPickAndPlace,
+	'pcb.export.bom': pcbExportBom,
 	'pcb.export.dsn': pcbExportDsn,
 	'pcb.import_autoroute': pcbImportAutoroute,
 	'pcb.snapshot': pcbSnapshot,
@@ -10919,6 +11758,12 @@ const HANDLERS: Record<string, Handler> = {
 	'pcb.outline.clear': pcbOutlineClear,
 	'debug.exec_js': debugExecJs,
 };
+
+// The daemon fingerprints its NeedsWindow action catalog against this exact
+// connector registry. Keep the registry private; expose only a sorted snapshot.
+export function connectorActionNames(): Array<string> {
+	return Object.keys(HANDLERS).sort();
+}
 
 /**
  * Run the handler for an action, attaching best-effort context to the result.

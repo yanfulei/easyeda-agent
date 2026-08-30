@@ -721,6 +721,9 @@ func (r *applyRunner) isReadOnly(s *playbookStep, catalog map[string]protocol.Ac
 
 func (r *applyRunner) policy(s *playbookStep) (timeout time.Duration, retry int, contOnErr bool) {
 	timeout = defaultActionTimeout
+	if s.Action != "" {
+		timeout = catalogActionTimeout(s.Action)
+	}
 	retry = 2 // design: factory default retry for read-only steps
 	if r.pb.Defaults.TimeoutSec != nil {
 		timeout = time.Duration(*r.pb.Defaults.TimeoutSec) * time.Second

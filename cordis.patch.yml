@@ -1,6 +1,6 @@
 # easyeda-agent DSH bundle patch.
 #
-# 安装本包后（`dsh plugin --profile <name> add "github:zhoushoujianwork/easyeda-agent#<tag>"`）
+# 安装本包后（`dsh plugin --profile <name> add "github:yanfulei/easyeda-agent#<tag>"`）
 # 自动生效两件事：
 #   1. easyeda-mcp  —— 桥接仓库自带 stdio MCP server（mcp/src/server.mjs），
 #      工具以 mcp__easyeda__easyeda_* 命名。dsh-mcp-client 是 dsh 安装目录的

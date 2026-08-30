@@ -1,11 +1,28 @@
 {
   "name": "easyeda-agent-dsh",
-  "version": "0.25.1",
+  "version": "1.2.11",
   "private": true,
   "description": "EasyEDA Pro (JLC EDA) automation for DeepSeek Harness: MCP bridge + agent skill bundle",
   "license": "MIT",
+  "files": [
+    "cordis.patch.yml",
+    "mcp/package.json",
+    "mcp/package-lock.json",
+    "mcp/README.md",
+    "mcp/src/",
+    "skills/easyeda-agent/",
+    "!skills/**/__pycache__/**",
+    "!skills/**/*.pyc",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "NOTICE"
+  ],
   "engines": {
     "node": ">=20.17.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
   },
   "dsh": {
     "bundle": {

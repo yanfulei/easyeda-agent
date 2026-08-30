@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zhoushoujianwork/easyeda-agent/internal/protocol"
 )
 
 // Service is the identity string the connector and CLI use to confirm they are
@@ -71,6 +73,10 @@ type Server struct {
 	// instead of burning its full dispatch budget behind a dead head
 	// (queueblock.go).
 	queueBlocks *queueBlockTracker
+
+	// writeLeases serializes the manufacturing release writer against every
+	// other client mutation in the same EasyEDA project.
+	writeLeases *writeLeaseManager
 
 	// clientInflight counts client-issued actions currently forwarded per window,
 	// so the debounced autosave never injects a 20-60s save into the middle of a
@@ -149,6 +155,7 @@ func New(opts Options) *Server {
 		concurrentWrites: newConcurrentGuard(),
 		writeHealth:      newWriteHealthTracker(),
 		queueBlocks:      newQueueBlockTracker(),
+		writeLeases:      newWriteLeaseManager(),
 	}
 	if opts.AutosaveDebounce > 0 {
 		s.autosave = newAutosaver(opts.AutosaveDebounce, s.dispatchSave)
@@ -157,11 +164,12 @@ func New(opts Options) *Server {
 }
 
 type health struct {
-	Service string   `json:"service"`
-	Version string   `json:"version"`
-	Status  string   `json:"status"`
-	Port    int      `json:"port"`
-	Windows []Window `json:"windows"`
+	Service      string                       `json:"service"`
+	Version      string                       `json:"version"`
+	Status       string                       `json:"status"`
+	Port         int                          `json:"port"`
+	Fingerprints protocol.RuntimeFingerprints `json:"fingerprints"`
+	Windows      []Window                     `json:"windows"`
 	// WriteHealth is the rolling per-window forwarded-action failure window
 	// (writehealth.go): degraded=true flags a connector that is failing under
 	// load (REPORT round2 新 3 — clients should insert light reads and verify
@@ -170,6 +178,7 @@ type health struct {
 	// per-action buckets (actions / degradedActions) keep one broken road from
 	// being averaged away. Omitted while no action has been forwarded.
 	WriteHealth map[string]WindowWriteHealth `json:"writeHealth,omitempty"`
+	WriteLeases []protocol.WriteLease        `json:"writeLeases,omitempty"`
 }
 
 // routes builds the HTTP handlers. port is the bound port, reported in /health
@@ -186,16 +195,19 @@ func (s *Server) routes(port int) *http.ServeMux {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(health{
-			Service:     Service,
-			Version:     s.opts.Version,
-			Status:      "ok",
-			Port:        port,
-			Windows:     s.hub.listAnnotated(s.opts.Version),
-			WriteHealth: s.writeHealth.all(),
+			Service:      Service,
+			Version:      s.opts.Version,
+			Status:       "ok",
+			Port:         port,
+			Fingerprints: protocol.CurrentRuntimeFingerprints(),
+			Windows:      s.hub.listAnnotated(s.opts.Version),
+			WriteHealth:  s.writeHealth.all(),
+			WriteLeases:  s.writeLeases.list(),
 		})
 	})
 	mux.HandleFunc("/eda", s.handleConnect)
 	mux.HandleFunc("/action", s.handleAction)
+	mux.HandleFunc("/writelease", s.handleWriteLease)
 	// /writeverify is 通道 B of the write-health metric (writehealth.go): a
 	// command that VERIFIED a write by reading the canvas back posts its verdict
 	// here. Not a typed action on purpose — the verdict arrives after (and often

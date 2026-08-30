@@ -30,10 +30,10 @@ import (
 // Endpoint builders, overridable in tests to point at an httptest server.
 var (
 	binaryURL = func(version, asset string) string {
-		return fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", RepoSlug, version, asset)
+		return fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", RepoSlug(), version, asset)
 	}
 	checksumsURL = func(version string) string {
-		return fmt.Sprintf("https://github.com/%s/releases/download/v%s/checksums.txt", RepoSlug, version)
+		return fmt.Sprintf("https://github.com/%s/releases/download/v%s/checksums.txt", RepoSlug(), version)
 	}
 )
 

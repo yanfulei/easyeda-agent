@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // ── sch note 自动落点:把说明文字当成和器件同级的布局对象 ────────────────────
@@ -101,17 +102,52 @@ func wrapNoteContent(content string, fontSize, maxWidth float64) string {
 	}
 	var out []string
 	for _, ln := range strings.Split(content, "\n") {
-		line, w := make([]rune, 0, len(ln)), 0.0
-		for _, r := range ln {
-			rw := noteRuneWidth(r, fontSize)
-			if w+rw > maxWidth+acOverlapEps && len(line) > 0 {
-				out = append(out, string(line))
-				line, w = line[:0], 0
-			}
-			line = append(line, r)
-			w += rw
+		remaining := []rune(ln)
+		if len(remaining) == 0 {
+			out = append(out, "") // 空行照留:说明的分段是作者的意图
+			continue
 		}
-		out = append(out, string(line)) // 空行照留:说明的分段是作者的意图
+		for len(remaining) > 0 {
+			fit, w := 0, 0.0
+			for fit < len(remaining) {
+				rw := noteRuneWidth(remaining[fit], fontSize)
+				if w+rw > maxWidth+acOverlapEps && fit > 0 {
+					break
+				}
+				w += rw
+				fit++
+			}
+			if fit == len(remaining) {
+				out = append(out, string(remaining))
+				break
+			}
+
+			// Prefer the last word boundary that fits. English prose must not
+			// become "res\nistor" merely because the frame is narrow. CJK and
+			// genuinely overlong tokens retain the deterministic rune fallback.
+			cut, next := fit, fit
+			for i := fit - 1; i >= 0; i-- {
+				if unicode.IsSpace(remaining[i]) {
+					prefixWidth := 0.0
+					for _, r := range remaining[:i] {
+						prefixWidth += noteRuneWidth(r, fontSize)
+					}
+					// A very early boundary would turn a narrow note into a
+					// ragged column of short fragments. Use it only when the
+					// line remains reasonably full; otherwise retain the hard
+					// fallback required for a single overlong token.
+					if i > 0 && prefixWidth >= maxWidth*0.8 {
+						cut, next = i, i+1
+						for next < len(remaining) && unicode.IsSpace(remaining[next]) {
+							next++
+						}
+					}
+					break
+				}
+			}
+			out = append(out, strings.TrimRightFunc(string(remaining[:cut]), unicode.IsSpace))
+			remaining = remaining[next:]
+		}
 	}
 	return strings.Join(out, "\n")
 }

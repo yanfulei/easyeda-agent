@@ -1,30 +1,32 @@
 # 快速开始 & 使用注意事项
 
-easyeda-agent 是一套**四件套**,四者必须**同版本、同时在位**才能端到端工作:
+easyeda-agent 的四个自有 release 组件必须**同版本、同时在位**;EasyEDA Pro 是宿主:
 
 | 部件 | 是什么 | 装在哪 |
 |---|---|---|
 | **CLI / daemon** (`easyeda`) | 掌管 typed action 协议、状态、审计、产物、校验 | 本机 `PATH`(默认 `/usr/local/bin`) |
 | **连接器插件** (`.eext`) | 极薄桥接层,跑在 EasyEDA 内,把动作转成官方 `eda.*` 调用 | EasyEDA Pro「扩展管理」 |
 | **Skill** (`easyeda-agent`) | AI 客户端里的工作流、参考、脚本、规范 | `~/.claude/skills` 和/或 `~/.codex/skills` |
+| **MCP adapter** (`easyeda-agent`) | Codex 等 MCP 客户端的结构化工具入口(可选,推荐 Codex 使用) | `~/.local/share/easyeda-agent/mcp` |
 | **EasyEDA Pro** | 官方编辑器,需开启「允许外部交互」 | 桌面应用 |
 
-> **一句话记牢**:升级不是只升 CLI —— **CLI、连接器 `.eext`、Skill 三者要一起升到同一版本**,
+> **一句话记牢**:升级不是只升 CLI —— **CLI、连接器 `.eext`、Skill、MCP 要一起升到同一 release**,
 > 否则 `daemon health` 会把落后的连接器标成 stale(`connectorVersionOk:false`),动作会打不通。
 
 ---
 
 ## 首次安装(5 步)
 
-### 1. 装 CLI + Skill(一条命令)
+### 1. 装 CLI + Skill + MCP(一条命令)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
 ```
 
 一键脚本会：
 - 安装/更新 `easyeda` CLI/daemon 到 `PATH`;
 - **自动检测已装的 AI 客户端**,把 `easyeda-agent` skill 装到对应目录 —— Codex(`~/.codex/skills/easyeda-agent`)、Claude Code(`~/.claude/skills/easyeda-agent`);
+- 检测到 Codex 时安装带锁定依赖的 MCP bundle,幂等注册 `easyeda-agent` MCP;
 - 打印连接器 `.eext` 的下载地址。
 
 可用环境变量控制 skill 安装目标:
@@ -33,6 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main
 EASYEDA_INSTALL_SKILLS=codex,claude  ... | sh   # 指定目标
 EASYEDA_INSTALL_SKILLS=none          ... | sh   # 跳过 skill(只装 CLI)
 EASYEDA_SKILL_PRESERVE=1             ... | sh   # 升级时保留本地改动
+EASYEDA_INSTALL_MCP=none             ... | sh   # 跳过 MCP 安装/注册
 EASYEDA_VERSION=v0.18.2              ... | sh   # 锁定版本,跳过 GitHub API 查询
 ```
 
@@ -47,12 +50,13 @@ EASYEDA_VERSION=v0.18.2              ... | sh   # 锁定版本,跳过 GitHub API
 easyeda daemon start        # 前台阻塞运行,Ctrl-C 退出;建议单开一个终端常驻
 ```
 
-daemon 会在端口段 `60832-60841`(`0xEDA0`-`0xEDA9`)监听,连接器会自动端口扫描并握手连上。
+daemon 默认只监听固定端口 `60832`(`0xEDA0`),连接器钉住该端口并带退避、自愈重连;
+`60833-60841` 仅保留给显式的非标准多 daemon 配置,默认不扫描。
 
 ### 3. 导入连接器 `.eext`
 
-从 [GitHub Release](https://github.com/zhoushoujianwork/easyeda-agent/releases/latest) 下载
-`easyeda-agent-connector.eext`(**与 CLI 严格同版**),或从[**立创官方插件市场**](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)一键安装(平台可原地自动更新,但**版本可能滞后 CLI** —— 需严格四件套同版时以 GitHub Release 的 `.eext` 为准),然后:
+从 [GitHub Release](https://github.com/yanfulei/easyeda-agent/releases/latest) 下载
+`easyeda-agent-connector.eext`(**与 CLI 严格同版**),或从[**立创官方插件市场**](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)一键安装(平台可原地自动更新,但**版本可能滞后 CLI** —— 需严格同版时以 GitHub Release 的 `.eext` 为准),然后:
 
 > EasyEDA Pro → **扩展管理 → 导入扩展** → 选中 `.eext` 文件
 
@@ -68,25 +72,25 @@ daemon 会在端口段 `60832-60841`(`0xEDA0`-`0xEDA9`)监听,连接器会自动
 /easyeda-agent          # 原理图 + PCB 全流程
 ```
 
-支持 MCP 的客户端还可以选择注册仓库内的 stdio 适配层。MCP 是**可选调用入口**,
+支持 MCP 的客户端还可以使用 release 内的 stdio 适配层。MCP 是**可选调用入口**,
 不是替代 CLI/daemon 或 Skill 的第五套状态;它仍经过同一套 typed action、审计和
 workflow gate。
 
+一键安装器检测到 Codex 时已经完成安装和注册。验证:
+
 ```bash
-git clone https://github.com/zhoushoujianwork/easyeda-agent.git
-cd easyeda-agent
-npm --prefix mcp ci --ignore-scripts
-codex mcp add easyeda-agent \
-  --env EASYEDA_BIN="$(command -v easyeda)" \
-  -- node "$(pwd)/mcp/src/server.mjs"
+codex mcp get easyeda-agent --json
 ```
 
-注册后重启 AI 客户端。可用工具包括连接健康、action 发现、7 个安全 action domain、
+源码开发才需要手工 clone、`npm --prefix mcp ci --ignore-scripts`,再用
+`codex mcp add easyeda-agent ...` 把同名配置覆盖到源码路径;重复 add 不会产生重复 server。
+
+新开一个 AI 客户端会话后即可发现工具。当前至少 19 个工具,包括连接健康、action 发现、安全 action domain、
 电路块和 guarded workflow;MCP 不暴露任意 JavaScript 的 `debug.exec_js`。
 
 ---
 
-## 验证四件套是否对齐
+## 验证运行栈是否对齐
 
 ```bash
 easyeda daemon health
@@ -99,9 +103,13 @@ easyeda daemon health
 
 ---
 
-## 升级注意事项(务必四件套一起升)
+## 升级注意事项(务必同一 release)
 
-1. **`easyeda update`** —— 升级 CLI 二进制 + Skill 目录(装过一次之后的常规路径):
+1. **完整升级重跑一键安装器** —— 同步 CLI、Skill、MCP 且幂等刷新 Codex 注册:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh
+   ```
+   只升级 CLI 二进制 + Skill 目录时可用 `easyeda update`:
    ```bash
    easyeda update            # 下载本平台二进制 → sha256 校验(有 checksums.txt 时) → 原子替换 + 同步 skill
    easyeda update --check    # 只看不改:cli / skill / connector 三方版本一次列清
@@ -109,10 +117,6 @@ easyeda daemon health
    ```
    升完 **daemon 仍在跑旧二进制,要重启 daemon**;命令会提示。
    开发机上的 dev 构建(git-describe 版本号)默认不覆盖 —— 这是有意的,`--force` 才强升。
-   一键脚本仍是**首次安装**(和重装连接器)的路径:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh
-   ```
 2. **重导连接器 `.eext`** —— EasyEDA 按 **uuid 去重**,光 bump 版本号不够:
    先在「已安装」里**卸载旧连接器**,再导入新 `.eext`(uuid 不变,原地更新)。
    *(这步只针对**侧载**的 GitHub Release `.eext`;若连接器是从[立创插件市场](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)装的,平台会原地自动更新 —— 但市场版本可能滞后 CLI,严格同版仍以 Release `.eext` 为准。)*
@@ -140,7 +144,7 @@ easyeda daemon health
   **侧载**(GitHub Release)的连接器 `.eext` **无法**被 daemon 静默替换(sideload 无原地自动更新),
   所以这里只**检测+提示**,重导那步仍需你手动做(见上)。若连接器是从
   [**立创插件市场**](https://jlc-ext.com/item/zhoushoujian/easyeda-agent-connector)装的,
-  平台**可原地自动更新** —— 但市场版本可能滞后 CLI,严格四件套同版仍以 GitHub Release 的 `.eext` 为准。
+  平台**可原地自动更新** —— 但市场版本可能滞后 CLI,严格同版仍以 GitHub Release 的 `.eext` 为准。
 
 ---
 
@@ -150,6 +154,7 @@ easyeda daemon health
 |---|---|---|
 | 动作全部超时、连不上 | 没开「允许外部交互」 | 设置里打开 |
 | 不确定谁落后了 | CLI / skill / 连接器版本不一致 | `easyeda update --check` 一次列清三方 |
+| Codex 看不到新 MCP 工具 | MCP bundle/注册仍指向旧 release,或会话未刷新 | 重跑一键安装器,再新开 Codex 会话 |
 | `connectorVersionOk:false` | `.eext` 落后 / 旧窗口没重启 | 重导 `.eext` + 彻底重启 EasyEDA |
 | 重导 `.eext` 后没生效 | EasyEDA 按 uuid 去重,旧的没卸载 | 「已安装」里先卸载旧的再导入 |
 | `easyeda: command not found` | `PATH` 没含安装目录 | 把 `/usr/local/bin` 加进 `~/.zshrc` |

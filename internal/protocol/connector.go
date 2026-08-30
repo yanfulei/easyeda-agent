@@ -23,9 +23,10 @@ const (
 // connector can confirm it reached an easyeda-agent daemon (not some other local
 // service) before registering.
 type Handshake struct {
-	Type    string `json:"type"`
-	Service string `json:"service"`
-	Version string `json:"version"`
+	Type         string              `json:"type"`
+	Service      string              `json:"service"`
+	Version      string              `json:"version"`
+	Fingerprints RuntimeFingerprints `json:"fingerprints"`
 }
 
 // Ping is a liveness probe; the receiver echoes its ID back in a Pong.
@@ -49,11 +50,12 @@ type Typed struct {
 // Register is the connector's first frame after the WebSocket opens. It
 // declares the EasyEDA window identity and what the connector can do.
 type Register struct {
-	Type             string   `json:"type"`
-	WindowID         string   `json:"windowId"`
-	ConnectorVersion string   `json:"connectorVersion"`
-	EasyEDAVersion   string   `json:"easyedaVersion"`
-	Capabilities     []string `json:"capabilities"`
+	Type             string              `json:"type"`
+	WindowID         string              `json:"windowId"`
+	ConnectorVersion string              `json:"connectorVersion"`
+	EasyEDAVersion   string              `json:"easyedaVersion"`
+	Capabilities     []string            `json:"capabilities"`
+	Fingerprints     RuntimeFingerprints `json:"fingerprints,omitempty"`
 }
 
 // ContextMessage reports the connector's current project/document context. It

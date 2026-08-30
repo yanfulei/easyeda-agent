@@ -1,6 +1,9 @@
 package app
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // 写图签只传**用户点名的项**(2026-08-26 起不再整包回传)。
 //
@@ -32,3 +35,46 @@ func TestSchTitleBlockMerge_OnlySendsRequestedKeys(t *testing.T) {
 	}
 }
 
+func TestTbMergeRequestedFieldHonorsVisibilityAndPreservesValue(t *testing.T) {
+	current := map[string]any{"showTitle": true, "showValue": true, "value": "Power Probe"}
+	got, err := tbMergeRequestedField(current, map[string]any{
+		"showTitle": false,
+		"showValue": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"showTitle": false, "showValue": false, "value": "Power Probe"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("visibility-only patch must preserve value\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestTbMergeRequestedFieldValueAndVisibility(t *testing.T) {
+	got, err := tbMergeRequestedField(
+		map[string]any{"showTitle": true, "showValue": true, "value": "old"},
+		map[string]any{"value": "new", "showTitle": false, "showValue": true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"showTitle": false, "showValue": true, "value": "new"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	if !tbFieldMatchesPatch(got, map[string]any{"value": "new", "showTitle": false, "showValue": true}) {
+		t.Fatal("readback matcher must verify every requested subfield")
+	}
+}
+
+func TestTbMergeRequestedFieldRejectsObjectAsValueTrap(t *testing.T) {
+	for _, patch := range []map[string]any{
+		{},
+		{"showTitle": "false"},
+		{"unknown": true},
+	} {
+		if _, err := tbMergeRequestedField(map[string]any{"value": "old"}, patch); err == nil {
+			t.Fatalf("invalid patch %#v must be rejected before it can become [object Object]", patch)
+		}
+	}
+}

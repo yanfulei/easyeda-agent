@@ -46,7 +46,7 @@ echo "==> 仓库根:        ${REPO_ROOT}"
 # ── 前置检查 ────────────────────────────────────────────────────────────────
 if [[ -z "${EASYEDA_BIN}" ]]; then
   echo "!! 未找到 easyeda CLI，请先安装：" >&2
-  echo "   curl -fsSL https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh | sh" >&2
+  echo "   curl -fsSL https://raw.githubusercontent.com/yanfulei/easyeda-agent/main/install.sh | sh" >&2
   exit 1
 fi
 if [[ ! -f "${MCP_SERVER}" ]]; then
