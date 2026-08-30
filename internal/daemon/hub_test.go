@@ -244,8 +244,11 @@ func connWithDoc(windowID, projectUUID, project, docUUID, docType string) *conn 
 
 func TestRemoveRetiresTheWindowIdentity(t *testing.T) {
 	h := newHub()
-	h.add(connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic"))
-	h.remove("old")
+	old := connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	if !h.remove(old) {
+		t.Fatal("registered connection must be removed")
+	}
 
 	if _, ok := h.windows["old"]; ok {
 		t.Fatal("window must be gone from the live map")
@@ -259,13 +262,37 @@ func TestRemoveRetiresTheWindowIdentity(t *testing.T) {
 	}
 }
 
+func TestRemoveDoesNotEvictReplacementWithSameWindowID(t *testing.T) {
+	h := newHub()
+	old := connWithDoc("same", "p-uuid", "ceshi", "doc-1", "schematic")
+	newer := connWithDoc("same", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	h.add(newer)
+
+	if h.remove(old) {
+		t.Fatal("an old connection must not remove the replacement")
+	}
+	got, ok := h.get("same")
+	if !ok || got != newer {
+		t.Fatalf("replacement was evicted: got (%p,%v), want (%p,true)", got, ok, newer)
+	}
+	if _, ok := h.retired["same"]; ok {
+		t.Fatal("stale close must not retire the replacement's identity")
+	}
+
+	if !h.remove(newer) {
+		t.Fatal("the currently registered connection must be removable")
+	}
+}
+
 func TestResolveRetiredPrefersTheSameDocument(t *testing.T) {
 	// documentUuid survives a refresh (it identifies the page itself), so a
 	// window showing the same document is unambiguously the successor — even
 	// with another window of the same project also connected.
 	h := newHub()
-	h.add(connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic"))
-	h.remove("old")
+	old := connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	h.remove(old)
 	h.add(connWithDoc("new", "p-uuid", "ceshi", "doc-1", "schematic"))
 	h.add(connWithDoc("other", "p-uuid", "ceshi", "doc-2", "pcb"))
 
@@ -281,8 +308,9 @@ func TestResolveRetiredPrefersTheSameDocument(t *testing.T) {
 func TestResolveRetiredFallsBackToAnUnambiguousProjectMatch(t *testing.T) {
 	// The successor may sit on a different page than the one that died.
 	h := newHub()
-	h.add(connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic"))
-	h.remove("old")
+	old := connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	h.remove(old)
 	h.add(connWithDoc("new", "p-uuid", "ceshi", "doc-9", "pcb"))
 
 	id, _, ok := h.resolveRetired("old")
@@ -296,8 +324,9 @@ func TestResolveRetiredRefusesToGuessBetweenTwoWindowsOfTheSameProject(t *testin
 	// could land a mutation on the wrong document, which is worse than an
 	// honest error.
 	h := newHub()
-	h.add(connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic"))
-	h.remove("old")
+	old := connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	h.remove(old)
 	h.add(connWithDoc("a", "p-uuid", "ceshi", "doc-7", "schematic"))
 	h.add(connWithDoc("b", "p-uuid", "ceshi", "doc-8", "pcb"))
 
@@ -308,8 +337,9 @@ func TestResolveRetiredRefusesToGuessBetweenTwoWindowsOfTheSameProject(t *testin
 
 func TestResolveRetiredDoesNotCrossProjects(t *testing.T) {
 	h := newHub()
-	h.add(connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic"))
-	h.remove("old")
+	old := connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	h.remove(old)
 	h.add(connWithDoc("new", "other-uuid", "motobox", "doc-2", "schematic"))
 
 	if id, _, ok := h.resolveRetired("old"); ok {
@@ -319,8 +349,9 @@ func TestResolveRetiredDoesNotCrossProjects(t *testing.T) {
 
 func TestResolveRetiredExpiresAndIsUnknownForFreshIds(t *testing.T) {
 	h := newHub()
-	h.add(connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic"))
-	h.remove("old")
+	old := connWithDoc("old", "p-uuid", "ceshi", "doc-1", "schematic")
+	h.add(old)
+	h.remove(old)
 	h.add(connWithDoc("new", "p-uuid", "ceshi", "doc-1", "schematic"))
 
 	stale := h.retired["old"]
@@ -338,8 +369,9 @@ func TestPruneRetiredHonoursTheCap(t *testing.T) {
 	h := newHub()
 	for i := 0; i < retiredWindowMax+20; i++ {
 		id := fmt.Sprintf("w%03d", i)
-		h.add(connWithDoc(id, "p", "ceshi", "d", "schematic"))
-		h.remove(id)
+		c := connWithDoc(id, "p", "ceshi", "d", "schematic")
+		h.add(c)
+		h.remove(c)
 	}
 	if len(h.retired) > retiredWindowMax {
 		t.Fatalf("retired map grew unbounded: %d entries", len(h.retired))

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -387,6 +388,15 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	defer s.beginClientAction(req.WindowID)()
 	resp, err, _ := forwardWithAdaptiveRetry(ctx, req, target.dispatch, hooks)
 	if err != nil {
+		if errors.Is(err, errDuplicateRequestID) {
+			// A caller reused an id that is still in flight. This is a caller
+			// conflict, not a connector timeout: do not arm queue health or
+			// adaptive retry state, and tell the caller to choose a fresh id.
+			errResp := errorResponse(req.ID, "DUPLICATE_REQUEST_ID", "request id is already in flight", "use a unique request id or wait for the original request to finish")
+			s.audit.Append(fromResponse(started, &req, &errResp))
+			writeJSON(w, http.StatusConflict, errResp)
+			return
+		}
 		// A timed-out mutation may still land after the caller has gone. Arm the
 		// durability safety net now: save is idempotent, and the connector's write
 		// quarantine will refuse/reschedule it until the original handler settles.

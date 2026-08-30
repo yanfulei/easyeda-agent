@@ -41,10 +41,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	ua := r.Header.Get("User-Agent")
 	s.logf("connector %s upgraded (origin=%q ua=%q)", remote, origin, ua)
 	defer func() {
-		s.hub.remove(c.id())
-		// A reconnected window starts with clean rolling write health (same
-		// lifetime rule as the stale-read guard: a reload IS the recovery).
-		s.writeHealth.forget(c.id())
+		// Only the connection currently registered for this id may retire it.
+		// An old socket can close after a replacement has registered the same id;
+		// in that case keep the replacement (and its rolling health) intact.
+		if s.hub.remove(c) {
+			// A reconnected window starts with clean rolling write health (same
+			// lifetime rule as the stale-read guard: a reload IS the recovery).
+			s.writeHealth.forget(c.id())
+		}
 		ws.Close(websocket.StatusNormalClosure, "closing")
 		s.logf("connector %s closed", remote)
 	}()

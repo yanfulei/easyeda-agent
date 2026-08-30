@@ -71,6 +71,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -223,7 +224,6 @@ func responseErrorCode(resp *protocol.Response) string {
 	}
 	return resp.Error.Code
 }
-
 
 // ActionWriteHealth is one action's slice of a window's health — the bucket that
 // keeps "this one road is not working" from being averaged away.
@@ -751,6 +751,12 @@ func forwardWithAdaptiveRetry(ctx context.Context, req protocol.Request, dispatc
 	ok := err == nil && resp != nil && resp.OK
 	if h.observe != nil {
 		h.observe(outcome{Action: req.Action, RequestID: req.ID, OK: ok, Verdict: effectFromResponse(&req, resp), ErrorCode: responseErrorCode(resp)})
+	}
+	// A duplicate request id is a caller-side correlation conflict. The
+	// original request is still in flight, so probing or resending here would
+	// only add work and could make the two responses indistinguishable.
+	if errors.Is(err, errDuplicateRequestID) {
+		return resp, err, false
 	}
 	if ok || !retryableOnFailure[req.Action] {
 		return resp, err, false

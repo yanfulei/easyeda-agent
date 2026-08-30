@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -56,6 +57,12 @@ type conn struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan *protocol.Response
 }
+
+// errDuplicateRequestID is returned when a caller tries to reuse an id while
+// the original request is still waiting for its connector response. Replacing
+// the pending channel would make the two in-flight requests indistinguishable
+// and can deliver a response to the wrong caller.
+var errDuplicateRequestID = errors.New("request id already in flight")
 
 func newConn(ws *websocket.Conn, now time.Time) *conn {
 	return &conn{
@@ -160,18 +167,41 @@ func (c *conn) write(ctx context.Context, v any) error {
 	return wsjson.Write(ctx, c.ws, v)
 }
 
+// registerPending reserves a request id for one in-flight dispatch. Request
+// ids are supplied by callers for correlation and audit, so the daemon must
+// reject a collision instead of silently replacing the waiting channel.
+func (c *conn) registerPending(id string, ch chan *protocol.Response) error {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.pending == nil {
+		c.pending = map[string]chan *protocol.Response{}
+	}
+	if _, exists := c.pending[id]; exists {
+		return fmt.Errorf("%w: %q", errDuplicateRequestID, id)
+	}
+	c.pending[id] = ch
+	return nil
+}
+
+// unregisterPending removes only the reservation installed by the matching
+// dispatch. The identity check prevents an older cleanup path from deleting a
+// newer reservation if the map is ever replaced during recovery.
+func (c *conn) unregisterPending(id string, ch chan *protocol.Response) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if current, ok := c.pending[id]; ok && current == ch {
+		delete(c.pending, id)
+	}
+}
+
 // dispatch sends a request to the connector and waits for the matching response
 // (correlated by request id) or until ctx is done.
 func (c *conn) dispatch(ctx context.Context, req protocol.Request) (*protocol.Response, error) {
 	ch := make(chan *protocol.Response, 1)
-	c.pendingMu.Lock()
-	c.pending[req.ID] = ch
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, req.ID)
-		c.pendingMu.Unlock()
-	}()
+	if err := c.registerPending(req.ID, ch); err != nil {
+		return nil, err
+	}
+	defer c.unregisterPending(req.ID, ch)
 
 	if err := c.write(ctx, req); err != nil {
 		return nil, err
@@ -247,26 +277,36 @@ func (h *hub) add(c *conn) {
 	h.mu.Unlock()
 }
 
-func (h *hub) remove(windowID string) {
+func (h *hub) remove(c *conn) bool {
+	if c == nil {
+		return false
+	}
+	windowID := c.id()
 	if windowID == "" {
-		return
+		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// A reconnect can register a new connection under the same windowId before
+	// the old WebSocket's read loop observes its close. Compare the pointer
+	// before deleting so the old loop cannot remove the live replacement.
+	current, ok := h.windows[windowID]
+	if !ok || current != c {
+		return false
+	}
 	// Snapshot the identity BEFORE dropping the connection — after the delete
 	// there is no way to learn what project/document this id stood for.
-	if c, ok := h.windows[windowID]; ok {
-		w := c.snapshot()
-		h.retired[windowID] = retiredWindow{
-			ProjectUUID:  w.Context.ProjectUUID,
-			ProjectName:  w.Context.ProjectName,
-			DocumentUUID: w.Context.DocumentUUID,
-			DocumentType: w.Context.DocumentType,
-			RetiredAt:    time.Now().UTC(),
-		}
+	w := c.snapshot()
+	h.retired[windowID] = retiredWindow{
+		ProjectUUID:  w.Context.ProjectUUID,
+		ProjectName:  w.Context.ProjectName,
+		DocumentUUID: w.Context.DocumentUUID,
+		DocumentType: w.Context.DocumentType,
+		RetiredAt:    time.Now().UTC(),
 	}
 	delete(h.windows, windowID)
 	h.pruneRetiredLocked()
+	return true
 }
 
 // pruneRetiredLocked drops expired entries, then the oldest ones if still over

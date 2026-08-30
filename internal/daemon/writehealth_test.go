@@ -122,6 +122,25 @@ func TestAdaptiveRetryProbeFailurePassesThroughWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestAdaptiveRetryDuplicateRequestIDDoesNotProbeOrRetry(t *testing.T) {
+	d := &scriptedDispatch{byAction: map[string][]func() (*protocol.Response, error){
+		"document.open":    {give(nil, errDuplicateRequestID)},
+		backoffProbeAction: {give(okResp("dup_probe"), nil)},
+	}}
+	req := protocol.Request{Envelope: protocol.Envelope{ID: "dup", WindowID: "w1"}, Action: "document.open"}
+	resp, err, retried := forwardWithAdaptiveRetry(context.Background(), req, d.fn,
+		adaptiveHooks{sleep: func(time.Duration) { t.Fatal("duplicate request must not sleep") }})
+	if !errors.Is(err, errDuplicateRequestID) {
+		t.Fatalf("error = %v, want errDuplicateRequestID", err)
+	}
+	if resp != nil || retried {
+		t.Fatalf("resp=%+v retried=%v, want nil/false", resp, retried)
+	}
+	if len(d.calls) != 1 || d.calls[0] != "document.open" {
+		t.Fatalf("calls = %v, want only the original action", d.calls)
+	}
+}
+
 // ── 非白名单动作(内容写 / exec_js)绝不 daemon 级重发 ─────────────────────
 
 func TestAdaptiveRetryNeverRetriesNonWhitelistedWrites(t *testing.T) {
