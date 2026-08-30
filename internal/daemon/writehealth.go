@@ -748,15 +748,15 @@ type adaptiveHooks struct {
 //	                        └──探测 OK──▶ settle ──▶ 重发一次(幂等,重发无害)
 func forwardWithAdaptiveRetry(ctx context.Context, req protocol.Request, dispatch dispatchFn, h adaptiveHooks) (*protocol.Response, error, bool) {
 	resp, err := dispatch(ctx, req)
+	// A duplicate request id is a caller-side correlation conflict. The
+	// original request is still in flight, so it is neither a connector-health
+	// sample nor a candidate for probing/resending.
+	if errors.Is(err, errDuplicateRequestID) {
+		return resp, err, false
+	}
 	ok := err == nil && resp != nil && resp.OK
 	if h.observe != nil {
 		h.observe(outcome{Action: req.Action, RequestID: req.ID, OK: ok, Verdict: effectFromResponse(&req, resp), ErrorCode: responseErrorCode(resp)})
-	}
-	// A duplicate request id is a caller-side correlation conflict. The
-	// original request is still in flight, so probing or resending here would
-	// only add work and could make the two responses indistinguishable.
-	if errors.Is(err, errDuplicateRequestID) {
-		return resp, err, false
 	}
 	if ok || !retryableOnFailure[req.Action] {
 		return resp, err, false

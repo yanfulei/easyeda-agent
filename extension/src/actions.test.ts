@@ -2472,6 +2472,65 @@ test('pcb.manufacturing.snapshot changes when track or poured geometry drifts', 
 	}
 });
 
+test('pcb.manufacturing.snapshot retains component-only pad inventory for drill classification', async () => {
+	const stub = installManufacturingSnapshotStub();
+	// The official SDK does not expose component pads through the global pad
+	// inventory. Keep this empty to model the documented contract and prove the
+	// nested component inventory is still serialized into the release snapshot.
+	stub.pcb_PrimitivePad.getAll = async () => [];
+	try {
+		const response: any = await pcbManufacturingSnapshot({});
+		const snapshot = response.result;
+		assert.equal(snapshot.pads.some((pad: any) => pad.parentComponentPrimitiveId === 'component-a'), true);
+		assert.equal(snapshot.pads.some((pad: any) => pad.parentComponentPrimitiveId === 'component-b'), false);
+		assert.deepEqual(
+			snapshot.components.find((component: any) => component.primitiveId === 'component-a').pads.map((pad: any) => pad.primitiveId),
+			['pad-a1', 'pad-a2'],
+		);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('pcb.manufacturing.snapshot normalizes non-finite hole fields on SMD pads', async () => {
+	const stub = installManufacturingSnapshotStub();
+	const smd = manufacturingPad('smd-pad', '1');
+	smd.getState_Hole = () => null;
+	smd.getState_HoleOffsetX = () => Number.NaN;
+	smd.getState_HoleOffsetY = () => Number.POSITIVE_INFINITY;
+	smd.getState_HoleRotation = () => Number.NaN;
+	stub.pcb_PrimitivePad.getAll = async () => [smd];
+	try {
+		const response: any = await pcbManufacturingSnapshot({});
+		const pad = response.result.pads.find((item: any) => item.primitiveId === 'smd-pad');
+		assert.equal(pad.hole, null);
+		assert.equal(pad.holeOffsetX, null);
+		assert.equal(pad.holeOffsetY, null);
+		assert.equal(pad.holeRotation, null);
+		assert.doesNotThrow(() => JSON.stringify(response.result));
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
+test('pcb.manufacturing.snapshot fails closed for non-finite fields on a drilled pad', async () => {
+	const stub = installManufacturingSnapshotStub();
+	const drilled = manufacturingPad('bad-drill', '1');
+	drilled.getState_HoleRotation = () => Number.NaN;
+	stub.pcb_PrimitivePad.getAll = async () => [drilled];
+	try {
+		await assert.rejects(
+			() => pcbManufacturingSnapshot({}),
+			(err: any) => /bad-drill\.holeRotation contains a non-finite/.test(String(err?.message ?? err)),
+		);
+	}
+	finally {
+		delete (globalThis as any).eda;
+	}
+});
+
 const manufacturingFailureCases: Array<{
 	name: string;
 	breakStub: (stub: any) => void;

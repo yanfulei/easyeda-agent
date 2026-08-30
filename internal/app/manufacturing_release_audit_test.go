@@ -64,6 +64,34 @@ func TestParseReleaseManufacturingSnapshotSeparatesPopulationsAndHoleClasses(t *
 	}
 }
 
+func TestParseReleaseManufacturingSnapshotFindsComponentOnlyDrills(t *testing.T) {
+	snapshot := releaseTestSnapshot()
+	components := snapshot["components"].([]any)
+	components = append(components, map[string]any{
+		"primitiveId": "p-j1", "designator": "J1", "layer": float64(1), "addIntoBom": true,
+		"manufacturerId": "HDR-2", "supplierId": "C123", "footprint": map[string]any{"name": "HDR-2P"},
+		"x": float64(100), "y": float64(200), "rotation": float64(0),
+		"pads": []any{
+			map[string]any{"primitiveId": "j1-1", "layer": float64(12), "hole": map[string]any{"diameter": float64(32)}, "metallization": true},
+		},
+	})
+	snapshot["components"] = components
+	// Simulate an SDK build where getAll() returns only free pads and component
+	// pads are available exclusively through getAllPinsByPrimitiveId().
+	snapshot["pads"] = []any{}
+
+	parsed, err := parseReleaseManufacturingSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.NeedsPTH {
+		t.Fatalf("component-only plated hole was missed: %+v", parsed)
+	}
+	if parsed.NeedsNPTH {
+		t.Fatalf("no non-plated hole was present: %+v", parsed)
+	}
+}
+
 func TestAuditReleaseBOMHandlesUTF16GroupedRowsAndValidatesFields(t *testing.T) {
 	components := []releaseComponent{
 		{Designator: "C1", AddIntoBOM: true, Footprint: "C0402", Manufacturer: "CL05B104", Supplier: "C1525"},

@@ -178,7 +178,28 @@ func parseReleaseManufacturingSnapshot(result map[string]any) (*releaseManufactu
 	if len(snapshot.BOMReferences) == 0 {
 		return nil, fmt.Errorf("no component is enabled for BOM export")
 	}
-	for i, item := range result["pads"].([]any) {
+	// The connector currently emits a merged top-level pad inventory, but the
+	// official SDK contract also exposes component pads only through each
+	// component's nested `pads` field. Read both populations so a runtime/API
+	// variation cannot make a live through-hole disappear from the release
+	// drill requirements. Hole classification is boolean, so duplicate records
+	// in a merged inventory are harmless here.
+	allPads := make([]any, 0, len(result["pads"].([]any)))
+	allPads = append(allPads, result["pads"].([]any)...)
+	for componentIndex, item := range rawComponents {
+		component, ok := item.(map[string]any)
+		if !ok {
+			// The component loop above already reports this with the more useful
+			// indexed diagnostic; keep this guard for future refactors.
+			return nil, fmt.Errorf("manufacturing snapshot components[%d] is not an object", componentIndex)
+		}
+		componentPads, ok := component["pads"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("manufacturing snapshot components[%d] has no complete pad inventory", componentIndex)
+		}
+		allPads = append(allPads, componentPads...)
+	}
+	for i, item := range allPads {
 		pad, ok := item.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("manufacturing snapshot pads[%d] is malformed", i)

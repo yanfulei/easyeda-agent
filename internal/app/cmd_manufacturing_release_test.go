@@ -188,6 +188,8 @@ type releaseNegativeOptions struct {
 	mutateSnapshot func(observation int, snapshot map[string]any)
 	checkReport    *pcbCheckReport
 	checkErr       error
+	releaseErr     error
+	stderr         *bytes.Buffer
 }
 
 func runReleaseNegativeHarness(t *testing.T, options releaseNegativeOptions) (error, string, []string) {
@@ -210,7 +212,7 @@ func runReleaseNegativeHarness(t *testing.T, options releaseNegativeOptions) (er
 			return []openableDoc{{UUID: "pcb-uuid", Type: "pcb", Name: "PCB1"}}, "", "w1", nil
 		},
 		acquireLease: func(*appConfig, string, string, string) (string, error) { return "lease-1", nil },
-		releaseLease: func(*appConfig, string) error { return nil },
+		releaseLease: func(*appConfig, string) error { return options.releaseErr },
 		reload:       func(*appConfig, string, string) (string, error) { return "pcb", nil },
 		waitSettle:   func(*appConfig, string, string) bool { return true },
 		request: func(_ *appConfig, action, _ string, _ any, _ time.Duration) (*actionResult, error) {
@@ -262,6 +264,9 @@ func runReleaseNegativeHarness(t *testing.T, options releaseNegativeOptions) (er
 		manufacturingReleaseOptions{outDir: outDir, specPath: specPath, drcTimeout: 30 * time.Second},
 		&stdout, &stderr, rt,
 	)
+	if options.stderr != nil {
+		options.stderr.Write(stderr.Bytes())
+	}
 	return err, outDir, actions
 }
 
@@ -521,6 +526,23 @@ func TestRunManufacturingReleaseAllowsInfoOnlyPCBCheck(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "manifest.json")); err != nil {
 		t.Fatalf("INFO-only release was not published: %v", err)
+	}
+}
+
+func TestRunManufacturingReleaseDoesNotTurnPublishedBundleIntoFailureOnLeaseCleanupError(t *testing.T) {
+	var stderr bytes.Buffer
+	err, outDir, _ := runReleaseNegativeHarness(t, releaseNegativeOptions{
+		releaseErr: errors.New("daemon unavailable"),
+		stderr:     &stderr,
+	})
+	if err != nil {
+		t.Fatalf("published release must remain successful when lease cleanup fails: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outDir, "manifest.json")); statErr != nil {
+		t.Fatalf("published bundle is missing after cleanup warning: %v", statErr)
+	}
+	if !strings.Contains(stderr.String(), "release bundle was published") || !strings.Contains(stderr.String(), "lease cleanup failed") {
+		t.Fatalf("lease cleanup warning was not explicit: %q", stderr.String())
 	}
 }
 

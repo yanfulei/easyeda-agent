@@ -1038,7 +1038,12 @@ function toResponseError(err: unknown): ResponseFrame['error'] {
  * before ActionQueue.submit in handleRequest: synchronous submission is what
  * makes message arrival order equal queue order. */
 async function runBoundAction(request: RequestFrame): Promise<import('./protocol').ActionResult> {
-	if (request.mutates === true) {
+	// Context-changing actions (selection, document/page switches, and exports
+	// that select primitives) can affect the next selection-based operation even
+	// though they do not change document contents.  They must receive the same
+	// runtime fingerprint gate as mutations; otherwise a stale connector can
+	// execute a late context action against an incompatible editor surface.
+	if (request.writeSensitive === true || request.mutates === true) {
 		const missing = missingFingerprintFields(daemonFingerprints);
 		const mismatches = fingerprintMismatches(daemonFingerprints, connectorFingerprints);
 		if (missing.length > 0 || mismatches.length > 0) {

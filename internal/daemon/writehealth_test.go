@@ -141,6 +141,27 @@ func TestAdaptiveRetryDuplicateRequestIDDoesNotProbeOrRetry(t *testing.T) {
 	}
 }
 
+func TestAdaptiveRetryDuplicateRequestIDDoesNotPolluteHealth(t *testing.T) {
+	d := &scriptedDispatch{byAction: map[string][]func() (*protocol.Response, error){
+		"document.open": {give(nil, errDuplicateRequestID)},
+	}}
+	tr := newWriteHealthTracker()
+	records := 0
+	record := func(o outcome) { records++; tr.observe("w1", o) }
+	req := protocol.Request{Envelope: protocol.Envelope{ID: "dup-health", WindowID: "w1"}, Action: "document.open"}
+	_, err, retried := forwardWithAdaptiveRetry(context.Background(), req, d.fn,
+		adaptiveHooks{observe: record})
+	if !errors.Is(err, errDuplicateRequestID) || retried {
+		t.Fatalf("err=%v retried=%v, want duplicate conflict without retry", err, retried)
+	}
+	if records != 0 {
+		t.Fatalf("duplicate request was observed as connector health sample: %d", records)
+	}
+	if got := tr.snapshot("w1"); got.Samples != 0 {
+		t.Fatalf("duplicate request polluted health window: %+v", got)
+	}
+}
+
 // ── 非白名单动作(内容写 / exec_js)绝不 daemon 级重发 ─────────────────────
 
 func TestAdaptiveRetryNeverRetriesNonWhitelistedWrites(t *testing.T) {

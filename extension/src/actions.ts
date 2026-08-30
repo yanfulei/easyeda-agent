@@ -6416,6 +6416,21 @@ function manufacturingPlain(value: unknown, label: string): unknown {
 	throw new ActionError(ErrorCodes.INVALID_STATE, `${label} contains unsupported ${typeof value} data.`);
 }
 
+/**
+ * Optional pad-hole state is represented inconsistently by EasyEDA builds:
+ * SMD pads (which have no hole) may report NaN/Infinity for the numeric hole
+ * fields even though the SDK type says `number`.  Keep the snapshot JSON-safe
+ * without hiding a malformed value on a real drilled pad.  A drilled pad with
+ * a non-finite offset/rotation is fabrication-critical and must still fail
+ * closed through manufacturingPlain's normal INVALID_STATE path.
+ */
+function manufacturingPadOptionalNumber(value: unknown, label: string, hasHole: boolean): number | null {
+	if (value === undefined || value === null) return null;
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	if (!hasHole && typeof value === 'number' && !Number.isFinite(value)) return null;
+	throw new ActionError(ErrorCodes.INVALID_STATE, `${label} contains a non-finite or unsupported number.`);
+}
+
 async function manufacturingArray<T>(label: string, read: () => Promise<Array<T>>): Promise<Array<T>> {
 	let value: unknown;
 	try { value = await read(); }
@@ -6553,6 +6568,9 @@ export const pcbManufacturingSnapshot: Handler = async () => {
 
 		const serializeManufacturingPad = (pad: Awaited<ReturnType<typeof eda.pcb_PrimitivePad.getAll>>[number] | PcbPad, parent: string | null) => {
 			const primitiveId = manufacturingId(pad, 'pad');
+			const rawHole = pad.getState_Hole();
+			const hole = manufacturingPlain(rawHole, `pad ${primitiveId}.hole`);
+			const hasHole = rawHole !== undefined && rawHole !== null;
 			return {
 				primitiveId,
 				primitiveType: pad.getState_PrimitiveType(),
@@ -6562,9 +6580,11 @@ export const pcbManufacturingSnapshot: Handler = async () => {
 				layer: pad.getState_Layer(),
 				x: pad.getState_X(), y: pad.getState_Y(), rotation: pad.getState_Rotation(),
 				pad: manufacturingPlain(pad.getState_Pad() ?? null, `pad ${primitiveId}.shape`),
-				hole: manufacturingPlain(pad.getState_Hole(), `pad ${primitiveId}.hole`),
-				holeOffsetX: pad.getState_HoleOffsetX(), holeOffsetY: pad.getState_HoleOffsetY(),
-				holeRotation: pad.getState_HoleRotation(), metallization: pad.getState_Metallization(),
+				hole,
+				holeOffsetX: manufacturingPadOptionalNumber(pad.getState_HoleOffsetX(), `pad ${primitiveId}.holeOffsetX`, hasHole),
+				holeOffsetY: manufacturingPadOptionalNumber(pad.getState_HoleOffsetY(), `pad ${primitiveId}.holeOffsetY`, hasHole),
+				holeRotation: manufacturingPadOptionalNumber(pad.getState_HoleRotation(), `pad ${primitiveId}.holeRotation`, hasHole),
+				metallization: pad.getState_Metallization(),
 				padType: pad.getState_PadType(),
 				specialPad: manufacturingPlain(pad.getState_SpecialPad() ?? null, `pad ${primitiveId}.specialPad`),
 				solderMaskAndPasteMaskExpansion: manufacturingPlain(

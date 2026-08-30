@@ -200,6 +200,8 @@ func TestForegroundContextActionsAreCataloguedSeparatelyFromMutations(t *testing
 		"document.open":       true,
 		"document.close":      true,
 		"schematic.page.open": true,
+		"schematic.select":    true,
+		"schematic.export.image": true,
 	}
 	for _, action := range AllActions() {
 		if want[action.Name] {

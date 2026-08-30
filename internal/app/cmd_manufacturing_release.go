@@ -259,8 +259,20 @@ func runManufacturingReleaseWithRuntime(cfg *appConfig, opts manufacturingReleas
 	if err != nil {
 		return fmt.Errorf("acquire manufacturing write lease: %w", err)
 	}
+	published := false
 	defer func() {
 		if releaseErr := rt.releaseLease(&pinned, leaseID); releaseErr != nil {
+			// Once the directory has been atomically renamed into place, the
+			// manufacturing result is durable. Do not turn a cleanup failure into
+			// a command failure: callers may otherwise repeat the release and
+			// create duplicate manufacturing revisions. Keep the failure visible so
+			// the lease can be inspected or allowed to expire.
+			if published {
+				if stderr != nil {
+					fmt.Fprintf(stderr, "warning: release bundle was published, but manufacturing write lease cleanup failed: %v\n", releaseErr)
+				}
+				return
+			}
 			if retErr == nil {
 				retErr = fmt.Errorf("release manufacturing write lease: %w", releaseErr)
 			} else {
@@ -495,6 +507,7 @@ func runManufacturingReleaseWithRuntime(cfg *appConfig, opts manufacturingReleas
 	if err != nil {
 		return err
 	}
+	published = true
 	return writeJSON(stdout, map[string]any{
 		"ok":             true,
 		"releaseDir":     finalDir,
