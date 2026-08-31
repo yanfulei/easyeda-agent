@@ -119,6 +119,21 @@ func TestAuditReleaseBOMHandlesUTF16GroupedRowsAndValidatesFields(t *testing.T) 
 	}
 }
 
+func TestParseReleaseCSVPreservesBlankMiddleFields(t *testing.T) {
+	data := releaseTestCSV(t, releaseCSVUTF16LE, '\t', [][]string{
+		{"No.", "Quantity", "Comment", "Designator", "Footprint", "Value", "Manufacturer Part", "Manufacturer", "Supplier Part", "Supplier"},
+		{"4", "2", "KF301-5.0-2P", "J1,J2", "CONN-TH_P5.00_KF301-5.0-2P", "", "KF301-5.0-2P", "KEFA(科发)", "C474881", "LCSC"},
+	})
+	table, err := parseReleaseCSVTable(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := table.Records[table.Header+1]
+	if len(row) != 10 || row[5] != "" || row[6] != "KF301-5.0-2P" || row[8] != "C474881" {
+		t.Fatalf("blank Value column shifted the BOM row: len=%d row=%q", len(row), row)
+	}
+}
+
 func TestAuditReleaseBOMFailsClosedOnRequiredFieldsAndPopulationDrift(t *testing.T) {
 	components := []releaseComponent{
 		{Designator: "C1", AddIntoBOM: true, Footprint: "C0402", Manufacturer: "MPN-C1", Supplier: "C1525"},

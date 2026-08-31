@@ -261,7 +261,12 @@ func parseReleaseCSVTable(data []byte) (*releaseCSVTable, error) {
 		reader := csv.NewReader(strings.NewReader(text))
 		reader.Comma = comma
 		reader.FieldsPerRecord = -1
-		reader.TrimLeadingSpace = true
+		// Keep empty fields in their declared column positions. EasyEDA's BOM
+		// legitimately leaves Value blank for connectors/LEDs; csv.Reader's
+		// TrimLeadingSpace treats the tab after that blank as whitespace and
+		// collapses the field, shifting Manufacturer Part/Supplier Part left by
+		// one column. Every consumer trims cells explicitly after parsing.
+		reader.TrimLeadingSpace = false
 		records, err := reader.ReadAll()
 		if err != nil {
 			lastErr = err
